@@ -75,6 +75,7 @@ contract SanctionsOracleMirror is AccessControl {
         onlyRole(SANCTIONS_UPDATER_ROLE)
     {
         for (uint256 i = 0; i < addrs.length;) {
+            if (addrs[i] == address(0)) revert ZeroAddress();
             _sanctioned[addrs[i]] = true;
             unchecked { i++; }
         }
@@ -88,6 +89,7 @@ contract SanctionsOracleMirror is AccessControl {
         onlyRole(SANCTIONS_UPDATER_ROLE)
     {
         for (uint256 i = 0; i < addrs.length;) {
+            if (addrs[i] == address(0)) revert ZeroAddress();
             _sanctioned[addrs[i]] = false;
             unchecked { i++; }
         }

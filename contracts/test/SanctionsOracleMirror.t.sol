@@ -120,6 +120,24 @@ contract SanctionsOracleMirrorTest is Test {
         oracle.addToSanctionsList(empty);
     }
 
+    function test_addToSanctionsList_zeroAddress_reverts() public {
+        address[] memory addrs = new address[](2);
+        addrs[0] = sanctioned1;
+        addrs[1] = address(0);
+        vm.prank(updater);
+        vm.expectRevert(SanctionsOracleMirror.ZeroAddress.selector);
+        oracle.addToSanctionsList(addrs);
+    }
+
+    function test_removeFromSanctionsList_zeroAddress_reverts() public {
+        address[] memory addrs = new address[](2);
+        addrs[0] = sanctioned1;
+        addrs[1] = address(0);
+        vm.prank(updater);
+        vm.expectRevert(SanctionsOracleMirror.ZeroAddress.selector);
+        oracle.removeFromSanctionsList(addrs);
+    }
+
     function test_addToSanctionsList_idempotent() public {
         address[] memory addrs = new address[](1);
         addrs[0] = sanctioned1;
