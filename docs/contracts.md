@@ -1,0 +1,299 @@
+# Smart Contracts
+
+Foundry manages compilation and testing. The token stack is platform-written on top of
+OpenZeppelin upgradeable contracts with a read-only Chainalysis sanctions oracle.
+
+## Contract inventory
+
+| Contract | File | Origin | Upgrade | Purpose |
+|----------|------|--------|---------|---------|
+| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; Chainalysis sanctions oracle |
+| `IssuanceManager` | `contracts/IssuanceManager.sol` | Platform (MIT) | UUPS | AP whitelist; mint (subscribe) and burn (redeem) gate |
+| `TokenFactory` | `contracts/TokenFactory.sol` | Platform (MIT) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series; wires roles atomically |
+| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (MIT) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
+| `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (MIT) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
+| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the Chainalysis on-chain oracle |
+| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Production sanctions oracle for L2 chains (e.g. Mantle) where Chainalysis has no deployment; keeper-fed mirror of the OFAC SDN list; identical interface to the real Chainalysis oracle |
+
+---
+
+## Architecture
+
+```
+TokenFactory (Ownable2Step — owner = TimelockController 48h)
+    │  deployToken(name, symbol, isin, maturityTimestamp, operator, issuanceMgr, navFeedOwner)
+    │
+    ├─ ERC1967Proxy ──▶ GyldBondToken impl   (UUPS, ERC-7201 storage)
+    │     │  initialize(name, symbol, isin, maturity, factory, factory, sanctionsList)
+    │     │
+    │     ├─ MINTER_ROLE + BURNER_ROLE → IssuanceManager
+    │     ├─ PAUSER_ROLE               → operator
+    │     └─ DEFAULT_ADMIN_ROLE        → factory.owner() = TimelockController
+    │
+    └─ KaleidoscopeNAVFeed (Ownable — owner = navFeedOwner / KMS signer)
+
+IssuanceManager (ERC1967Proxy ──▶ impl, UUPS, ERC-7201 storage)
+    │  initialize(defaultAdmin, issuer)
+    │  defaultAdmin should be a TimelockController
+    │
+    ├─ ISSUER_ROLE          → platform MPC / Fordefi wallet
+    ├─ WHITELIST_ADMIN_ROLE → ops multisig
+    └─ REGISTRAR_ROLE       → TokenFactory (granted by factory at deployToken time)
+
+KaleidoscopeNAVFeed  ←── owner calls updateAnswer(int256)
+    └─▶ NAVFeedForwarder ──▶ setUpstreamOracle()
+              └─▶ DeFi protocols (Morpho, Aave, etc.)
+
+Chainalysis on-chain oracle (read-only, mainnet: 0x40C57923924B5c5c5455c48D93317139ADDaC8fb)
+    └─▶ GyldBondToken._requireAccess()  ← Ethereum mainnet
+
+SanctionsOracleMirror (L2 chains — e.g. Mantle — where Chainalysis has no deployment)
+    ├─ SANCTIONS_UPDATER_ROLE → keeper bot (polls OFAC SDN every 4h, writes deltas)
+    ├─ DEFAULT_ADMIN_ROLE     → compliance ops multisig
+    └─▶ GyldBondToken._requireAccess()  ← identical interface; same fail-closed behaviour
+```
+
+---
+
+## GyldBondToken
+
+Standard ERC-20 per bond series. **Token balances are fixed units of bond ownership —
+one token represents one unit of the underlying bond.**
+
+Value accrual (coupons, NAV appreciation) is reflected exclusively in the paired
+`KaleidoscopeNAVFeed` oracle. Token balances only change through `mint` (subscription)
+and `burn` (redemption). There is no on-chain rebasing or multiplier mechanism.
+
+### Balance model
+
+```
+balanceOf(account) = exactly what was minted to account minus what was burned
+totalSupply()      = sum of all balances (exact, no rounding)
+```
+
+When a coupon arrives from the broker, the backend records it in `LedgerRepo` and
+pushes an updated NAV price to the `KaleidoscopeNAVFeed`. The token balance is
+unchanged. DeFi protocols compute portfolio value as `balanceOf × NAV price`.
+
+### Roles
+
+| Role | Holder | Capability |
+|------|--------|-----------|
+| `DEFAULT_ADMIN_ROLE` | TimelockController (prod) | Grant/revoke all roles; authorize UUPS upgrades |
+| `MINTER_ROLE` | IssuanceManager only | `mint(address to, uint256 amount)` |
+| `BURNER_ROLE` | IssuanceManager only | `burn(address from, uint256 amount)` |
+| `PAUSER_ROLE` | Ops multisig | `pause()` / `unpause()` |
+
+### Compliance
+
+All secondary transfers (`transfer`, `transferFrom`) check sender, receiver, **and spender**
+(transferFrom) against the Chainalysis on-chain sanctions oracle.
+
+The check is **fail-closed** — if the oracle call itself reverts (e.g., oracle down),
+the transfer reverts. No role or owner bypasses this check for secondary transfers.
+
+Mint and burn skip the oracle check. IssuanceManager pre-screens APs off-chain before calling.
+
+Sanctioned addresses are frozen in place by the oracle — all transfers to/from them revert automatically. No on-chain recovery function exists; platform escalates off-chain if legal action requires token movement.
+
+### Bond metadata (on-chain, immutable after initialize)
+
+| Field | Getter | Example |
+|-------|--------|---------|
+| `isin()` | `string` | `"US912797KR72"` |
+| `maturityTimestamp()` | `uint256` | `1788739200` (2028-09-06) |
+
+### Storage layout
+
+ERC-7201 namespace `gyld.GyldBondToken`  
+Slot: `0x0fe35ba304a016e79d78a184eb899c1e21310138e0bfe9a54648a2dfe0da0d00`
+
+### Upgradeability
+
+`_authorizeUpgrade` is gated by `DEFAULT_ADMIN_ROLE`. In production DEFAULT_ADMIN is
+a `TimelockController`, so upgrades enforce the 48h delay.
+
+---
+
+## IssuanceManager
+
+Single gate for primary issuance and redemption of all Gyld bond series.
+
+### Mint (subscribe) flow
+
+```
+1. Backend confirms USDC received from whitelisted AP source.
+2. Backend calls subscribe(token, recipient, amount)
+3. IssuanceManager checks: registeredTokens[token] && whitelisted[recipient] && amount > 0
+4. Calls token.mint(recipient, amount)  [has MINTER_ROLE]
+5. Emits Subscribed(token, recipient, amount)
+```
+
+### Redeem flow
+
+```
+1. AP transfers bond tokens to IssuanceManager address.
+2. Backend confirms receipt + whitelisted identity.
+3. Backend calls redeem(token, beneficiary, amount)
+4. IssuanceManager checks: registeredTokens[token] && whitelisted[beneficiary]
+5. Calls token.burn(address(this), amount)  [has BURNER_ROLE]
+6. Emits Redeemed(token, beneficiary, amount)
+7. Backend sends USDC/USD to customer off-chain.
+```
+
+### Roles
+
+| Role | Holder | Capability |
+|------|--------|-----------|
+| `DEFAULT_ADMIN_ROLE` | TimelockController (prod) | Grant/revoke roles; authorize UUPS upgrades |
+| `ISSUER_ROLE` | Platform MPC / Fordefi wallet | `subscribe()`, `redeem()` |
+| `WHITELIST_ADMIN_ROLE` | Ops | `addToWhitelist()`, `removeFromWhitelist()`, `addToWhitelistBatch()` |
+| `REGISTRAR_ROLE` | TokenFactory | `registerToken()`, `deregisterToken()` |
+
+### Storage layout
+
+ERC-7201 namespace `gyld.IssuanceManager`  
+Slot: `0xc8552dd465c7174389604c2ad1f48bf21d46f65ee8d42bbd0456923afc111000`
+
+---
+
+## TokenFactory
+
+Deployment adapter. Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed)` pair
+per bond instrument and wires roles atomically in a single transaction.
+
+### deployToken flow
+
+```
+deployToken(name, symbol, isin, maturityTimestamp, operator, issuanceMgr, navFeedOwner)
+    │
+    ├─ Deploy GyldBondToken proxy (CREATE2, salt = keccak256("token" ++ keccak256(isin ++ chainId)))
+    │       calls initialize(name, symbol, isin, maturityTimestamp, factory, factory, sanctionsList)
+    │
+    ├─ Grant MINTER_ROLE + BURNER_ROLE    → issuanceMgr
+    ├─ Grant PAUSER_ROLE → operator
+    ├─ Grant DEFAULT_ADMIN_ROLE          → factory.owner() (TimelockController in prod)
+    ├─ Revoke PAUSER_ROLE from factory
+    ├─ Revoke DEFAULT_ADMIN_ROLE from factory  (factory self-revokes; holds no permanent power)
+    │
+    ├─ Deploy KaleidoscopeNAVFeed (owner = navFeedOwner, desc = "<symbol> / USD NAV")
+    │
+    ├─ IssuanceManager.registerToken(token)    [factory holds REGISTRAR_ROLE]
+    │
+    └─ emit TokenDeployed(token, navFeed, issuanceMgr)
+```
+
+### Address determinism
+
+Token addresses are deterministic before deployment:
+
+```solidity
+bondSalt   = keccak256(abi.encodePacked(isin, block.chainid))
+tokenSalt  = keccak256(abi.encodePacked("token", bondSalt))
+```
+
+Use `factory.predictTokenAddress(name, symbol, isin, maturityTimestamp)` to compute the token
+address before calling `deployToken`.
+
+### Governance
+
+The factory `owner` should be a `TimelockController` (48h minimum delay in production).
+`deployToken` is `onlyOwner` — new bond series require a timelocked governance vote.
+
+### Role cleanup — automatic
+
+`_wireRoles` self-revokes `DEFAULT_ADMIN_ROLE` and `PAUSER_ROLE` from the factory at the
+end of every `deployToken` call. After deployment the factory holds **no permissions** on
+any token it has created. No manual cleanup is required.
+
+---
+
+## KaleidoscopeNAVFeed
+
+Platform push oracle. Owner (KMS signer) calls `updateAnswer(int256)` once per market day.
+Implements `AggregatorV3Interface` for DeFi protocol compatibility.
+
+**Formula:** `NAV per token = (bonds_held × bond_price_usd) / tokens_outstanding` — 8 decimals.
+
+**Safety constraints:**
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MAX_STALENESS` | 36 hours | Reads revert if price not refreshed — covers weekend gap |
+| `MIN_UPDATE_INTERVAL` | 1 hour | Prevents key-compromise rapid oscillation |
+| `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | Single-update deviation cap after first push |
+
+See `docs/blockchain-status.md` for the full rationale on `MAX_STALENESS` and the weekend gap problem.
+
+---
+
+## NAVFeedForwarder
+
+Permanent DeFi-facing oracle address. Delegates all reads to a swappable upstream oracle.
+Owner calls `setUpstreamOracle(address)` to upgrade the data source without redeploying DeFi markets.
+
+**Upgrade path:**
+
+| Phase | Upstream | When |
+|-------|----------|------|
+| 1 | `KaleidoscopeNAVFeed` (platform push) | Launch |
+| 2 | RedStone Classic feed | Weeks after launch |
+| 3 | Chainlink NAVLink feed | Institutional grade |
+
+---
+
+## Deployment scripts
+
+| Script | Purpose |
+|--------|---------|
+| `script/DeployDevNet.s.sol` | Full stack to Anvil or Hoodi — deploys impl contracts, proxies, MockSanctionsList, 3 dev bond tokens |
+| `script/DeployTimelock.s.sol` | Deploys TimelockController, transfers factory ownership + IssuanceManager DEFAULT_ADMIN |
+| `script/DeployNAVFeed.s.sol` | Standalone NAVFeed + Forwarder deployment |
+| `script/DeployMockUSDC.s.sol` | Mock USDC for local dev |
+
+### DeployDevNet example
+
+```bash
+anvil &
+forge script contracts/script/DeployDevNet.s.sol \
+  --rpc-url http://127.0.0.1:8545 \
+  --broadcast \
+  --private-key ANVIL_TEST_KEY_REDACTED
+```
+
+Outputs `EVM_FACTORY_ADDRESS`, `EVM_ISSUANCE_MANAGER`, `TOKEN_CAT`, `TOKEN_C`, `TOKEN_KO`.
+
+---
+
+## Test suite
+
+```
+contracts/test/
+├── IssuanceManager.t.sol           — 30 tests  (subscribe, redeem, whitelist, registry, role isolation, UUPS)
+├── TokenFactory.t.sol              — 48 tests  (deploy, roles, mint, burn, pause, sanctions compliance, CREATE2 predict; includes GyldBondTokenUnitTest suite)
+├── KaleidoscopeNAVFeed.t.sol       — 36 tests  (updateAnswer, deviation, staleness, round ID)
+├── NAVFeedForwarder.t.sol          — 22 tests  (delegation, upgrade scenario, access control)
+├── Timelock.t.sol                  — 15 tests  (48h delay enforcement, cancel, IssuanceManager admin wiring)
+├── GyldBondToken.invariants.t.sol  — 14 tests  (3 invariants + 11 fuzz tests — plain ERC20 supply accounting + sanctions)
+└── SanctionsOracleMirror.t.sol    — 25 tests  (constructor, add/remove, events, access control, role management, fuzz round-trip)
+```
+
+Foundry commands:
+
+```sh
+forge build               # compile
+forge test                # run all tests
+forge test -v             # with event logs
+forge test --match-contract IssuanceManager   # single suite
+forge coverage            # coverage report
+```
+
+`foundry.toml` remappings:
+
+```toml
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+```
