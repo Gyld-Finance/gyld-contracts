@@ -141,9 +141,29 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     // ── Redemption ────────────────────────────────────────────────────────────
 
     /// @notice Burn `amount` tokens from this contract's balance to settle a redemption.
-    /// @dev    The AP must first transfer their tokens to this contract's address. The
-    ///         backend confirms receipt and whitelisted status before calling. Off-chain
-    ///         USDC payment to the AP follows after this call succeeds.
+    ///
+    /// @dev    Custody window — intentional two-step design:
+    ///
+    ///         Step 1 (AP): The AP transfers bond tokens to this contract's address.
+    ///                      That ERC-20 Transfer event is the on-chain commitment signal.
+    ///
+    ///         Step 2 (backend): The off-chain event listener detects the Transfer,
+    ///                      confirms the AP's identity and whitelist status, then calls
+    ///                      this function to burn the tokens and records the obligation
+    ///                      to send USDC off-chain.
+    ///
+    ///         Tokens held by this contract during the window are inert — the contract
+    ///         has no withdraw(), transfer(), or rescue() function, so they cannot be
+    ///         extracted without REDEEMER_ROLE calling redeem().  A rogue REDEEMER_ROLE
+    ///         key could burn tokens for a wrong beneficiary address, but cannot redirect
+    ///         the off-chain USDC payment — that settlement is handled by a separate
+    ///         backend service keyed to the beneficiary recorded in the Redeemed event.
+    ///         The beneficiary must also be whitelisted, limiting the blast radius of a
+    ///         compromised key to addresses already KYC-approved.
+    ///
+    ///         Atomicity is not required because value does not move on-chain at redemption
+    ///         time — USDC is sent off-chain after this call succeeds.
+    ///
     /// @param token       A registered GyldBondToken proxy address.
     /// @param beneficiary Whitelisted AP who sent the tokens (recorded in event for audit trail).
     /// @param amount      Token amount to burn. Must not exceed this contract's token balance.
