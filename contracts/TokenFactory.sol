@@ -59,6 +59,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     error EmptyIsin();
     error IsinAlreadyDeployed(string isin);
     error MissingRegistrarRole(address factory, address issuanceManager);
+    error ProxyDeployFailed();
 
     event TokenDeployed(
         address indexed token,
@@ -90,12 +91,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         uint256 maturityTimestamp
     ) external view returns (address) {
         bytes32 salt = _tokenSalt(_bondSalt(isin));
-        bytes memory initCode = abi.encodePacked(
-            type(ERC1967Proxy).creationCode,
-            abi.encode(bondTokenLogic, _tokenProxyInitData(name, symbol, isin, maturityTimestamp))
-        );
         return address(uint160(uint256(keccak256(
-            abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(initCode))
+            abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(_tokenInitCode(name, symbol, isin, maturityTimestamp)))
         ))));
     }
 
@@ -150,14 +147,16 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
             address(this)
         )) revert MissingRegistrarRole(address(this), issuanceManager);
 
-        // Deploy GyldBondToken proxy (UUPS). Factory is temporary DEFAULT_ADMIN + PAUSER.
-        // sanctionsList is the read-only Chainalysis oracle — no internal blocklist.
-        token = address(
-            new ERC1967Proxy{salt: _tokenSalt(isinKey)}(
-                bondTokenLogic,
-                _tokenProxyInitData(name, symbol, isin, maturityTimestamp)
-            )
-        );
+        // Deploy GyldBondToken proxy via assembly CREATE2 using the same _tokenInitCode
+        // helper that predictTokenAddress hashes — both paths are identical by construction.
+        bytes memory ic = _tokenInitCode(name, symbol, isin, maturityTimestamp);
+        bytes32 tokenSalt = _tokenSalt(isinKey);
+        address deployedToken;
+        assembly {
+            deployedToken := create2(0, add(ic, 0x20), mload(ic), tokenSalt)
+        }
+        if (deployedToken == address(0)) revert ProxyDeployFailed();
+        token = deployedToken;
 
         _wireRoles(token, issuanceManager, operator);
 
@@ -208,18 +207,19 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         return keccak256(abi.encodePacked("token", bondSalt_));
     }
 
-    /// ABI-encoded initialize() calldata for a new GyldBondToken proxy.
-    /// Shared by deployToken (passed to new ERC1967Proxy) and predictTokenAddress
-    /// (included in the CREATE2 initcode hash) so both compute the same address.
-    function _tokenProxyInitData(
+    /// Full CREATE2 initcode for a GyldBondToken proxy.
+    /// Shared by deployToken (deployed via assembly create2) and predictTokenAddress
+    /// (hashed for address prediction) so both paths are identical by construction.
+    function _tokenInitCode(
         string memory name,
         string memory symbol,
         string memory isin,
         uint256 maturityTimestamp
     ) internal view returns (bytes memory) {
-        return abi.encodeCall(
+        bytes memory tokenInit = abi.encodeCall(
             GyldBondToken.initialize,
             (name, symbol, isin, maturityTimestamp, address(this), address(this), sanctionsList)
         );
+        return abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(bondTokenLogic, tokenInit));
     }
 }
