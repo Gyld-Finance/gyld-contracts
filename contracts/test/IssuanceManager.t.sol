@@ -244,6 +244,12 @@ contract IssuanceManagerTest is Test {
         mgr.deregisterToken(address(token));
     }
 
+    function test_deregisterToken_zeroAddress_reverts() public {
+        vm.prank(registrar);
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        mgr.deregisterToken(address(0));
+    }
+
     // ── Subscribe ─────────────────────────────────────────────────────────────
 
     function test_subscribe_success() public {

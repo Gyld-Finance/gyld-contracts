@@ -217,6 +217,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     ///         and primary issuance is permanently closed.
     /// @param token GyldBondToken proxy address to deregister.
     function deregisterToken(address token) external onlyRole(REGISTRAR_ROLE) {
+        if (token == address(0)) revert ZeroAddress();
         _getStorage().registeredTokens[token] = false;
         emit TokenDeregistered(token);
     }
