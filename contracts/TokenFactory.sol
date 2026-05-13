@@ -163,7 +163,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
             (name, symbol, isin, maturityTimestamp, address(this), address(this), sanctionsList)
         );
         token = address(
-            new ERC1967Proxy{salt: keccak256(abi.encodePacked("token", _bondSalt(isin)))}(
+            new ERC1967Proxy{salt: keccak256(abi.encodePacked("token", isinKey))}(
                 bondTokenLogic,
                 tokenInit
             )
