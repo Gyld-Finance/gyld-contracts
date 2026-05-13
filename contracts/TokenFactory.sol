@@ -134,7 +134,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         address issuanceManager,
         address navFeedOwner
     ) external onlyOwner nonReentrant returns (address token, address navFeed, address forwarder) {
-        if (operator == address(0))       revert ZeroAddress();
+        if (operator == address(0) || operator == address(this)) revert ZeroAddress();
         if (issuanceManager == address(0)) revert ZeroAddress();
         if (navFeedOwner == address(0))    revert ZeroAddress();
         if (bytes(isin).length == 0)       revert EmptyIsin();

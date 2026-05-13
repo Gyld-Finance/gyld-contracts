@@ -288,6 +288,11 @@ contract TokenFactoryTest is Test {
         assertTrue(t.hasRole(t.PAUSER_ROLE(), operator));
     }
 
+    function test_deployToken_operatorIsFactory_reverts() public {
+        vm.expectRevert(TokenFactory.ZeroAddress.selector);
+        factory.deployToken("X", "X", "XX0000000001", 0, address(factory), address(issuanceMgr), navFeedOwner);
+    }
+
     function test_deployToken_factoryHasNoMintBurnRoles() public {
         (address token,,) = _deploy();
         GyldBondToken t = GyldBondToken(token);
