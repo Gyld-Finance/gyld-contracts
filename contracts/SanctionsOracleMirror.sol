@@ -30,8 +30,6 @@ contract SanctionsOracleMirror is AccessControl {
     // Identical events to the real Chainalysis oracle for tooling compatibility.
     event SanctionedAddressesAdded(address[] addrs);
     event SanctionedAddressesRemoved(address[] addrs);
-    event SanctionedAddress(address indexed addr);
-    event NonSanctionedAddress(address indexed addr);
 
     error ZeroAddress();
     error CannotRenounceAdminRole();
@@ -53,18 +51,6 @@ contract SanctionsOracleMirror is AccessControl {
     /// @notice Returns true if `addr` is on the sanctions list.
     function isSanctioned(address addr) public view returns (bool) {
         return _sanctioned[addr];
-    }
-
-    /// @notice Same as isSanctioned but emits a per-address event.
-    ///         Nonpayable (state-changing) to match the real oracle's signature.
-    ///         Prefer isSanctioned() for gas efficiency in read-only contexts.
-    function isSanctionedVerbose(address addr) public returns (bool) {
-        if (_sanctioned[addr]) {
-            emit SanctionedAddress(addr);
-            return true;
-        }
-        emit NonSanctionedAddress(addr);
-        return false;
     }
 
     // ── Keeper write interface (SANCTIONS_UPDATER_ROLE) ───────────────────────

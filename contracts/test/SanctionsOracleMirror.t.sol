@@ -7,8 +7,6 @@ import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
 contract SanctionsOracleMirrorTest is Test {
     event SanctionedAddressesAdded(address[] addrs);
     event SanctionedAddressesRemoved(address[] addrs);
-    event SanctionedAddress(address indexed addr);
-    event NonSanctionedAddress(address indexed addr);
 
     SanctionsOracleMirror oracle;
 
@@ -193,26 +191,6 @@ contract SanctionsOracleMirrorTest is Test {
 
         assertFalse(oracle.isSanctioned(sanctioned1));
         assertTrue(oracle.isSanctioned(sanctioned2)); // untouched
-    }
-
-    // ── isSanctionedVerbose ───────────────────────────────────────────────────
-
-    function test_isSanctionedVerbose_emitsSanctionedEvent() public {
-        address[] memory addrs = new address[](1);
-        addrs[0] = sanctioned1;
-        vm.prank(updater); oracle.addToSanctionsList(addrs);
-
-        vm.expectEmit(true, false, false, false, address(oracle));
-        emit SanctionedAddress(sanctioned1);
-        bool result = oracle.isSanctionedVerbose(sanctioned1);
-        assertTrue(result);
-    }
-
-    function test_isSanctionedVerbose_emitsNonSanctionedEvent() public {
-        vm.expectEmit(true, false, false, false, address(oracle));
-        emit NonSanctionedAddress(clean);
-        bool result = oracle.isSanctionedVerbose(clean);
-        assertFalse(result);
     }
 
     // ── role management (DEFAULT_ADMIN_ROLE) ──────────────────────────────────
