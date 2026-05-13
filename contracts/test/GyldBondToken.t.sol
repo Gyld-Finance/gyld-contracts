@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
-import {MockSanctionsList} from "../MockSanctionsList.sol";
+import {MockSanctionsList} from "./MockSanctionsList.sol";
 
 // ── V2 stub for upgrade test ──────────────────────────────────────────────────
 

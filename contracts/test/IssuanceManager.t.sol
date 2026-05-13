@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
-import {MockSanctionsList} from "../MockSanctionsList.sol";
+import {MockSanctionsList} from "./MockSanctionsList.sol";
 
 contract IssuanceManagerTest is Test {
     // Mirror events for vm.expectEmit (Solidity 0.8.20 doesn't support ContractName.Event syntax)

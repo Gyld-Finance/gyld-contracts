@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Script, console} from "forge-std/Script.sol";
-import {MockSanctionsList} from "../MockSanctionsList.sol";
+import {MockSanctionsList} from "../test/MockSanctionsList.sol";
 
 contract DeployMockSanctionsList is Script {
     function run() external {

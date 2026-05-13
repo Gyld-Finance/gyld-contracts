@@ -5,7 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
-import {MockSanctionsList} from "../MockSanctionsList.sol";
+import {MockSanctionsList} from "../test/MockSanctionsList.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
 

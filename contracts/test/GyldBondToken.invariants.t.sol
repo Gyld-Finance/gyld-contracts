@@ -6,7 +6,7 @@ import {CommonBase} from "forge-std/Base.sol";
 import {StdCheats} from "forge-std/StdCheats.sol";
 import {StdUtils} from "forge-std/StdUtils.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {MockSanctionsList} from "../MockSanctionsList.sol";
+import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
