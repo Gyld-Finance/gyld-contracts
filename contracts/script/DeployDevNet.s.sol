@@ -128,9 +128,12 @@ contract DeployDevNet is Script {
 
         console.log("ISSUANCE_MANAGER=%s", address(issuanceMgr));
 
-        // 5. Sanctions oracle: use real Chainalysis on mainnet, MockSanctionsList on devnet.
+        // 5. Sanctions oracle: use SANCTIONS_LIST env var if set; otherwise deploy
+        //    MockSanctionsList on devnet. Blocked on mainnet — wiring a platform-controlled
+        //    mock would silently defeat the compliance model.
         address sanctionsOracle = _envOrDefault("SANCTIONS_LIST", address(0));
         if (sanctionsOracle == address(0)) {
+            require(block.chainid != 1, "DeployDevNet: set SANCTIONS_LIST=<chainalysis_address> on mainnet");
             MockSanctionsList mock = new MockSanctionsList();
             sanctionsOracle = address(mock);
             console.log("MOCK_SANCTIONS_ADDRESS=%s", sanctionsOracle);
