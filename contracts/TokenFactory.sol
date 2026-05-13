@@ -182,11 +182,11 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         // navFeed directly and has no control over the forwarder pointer.
         forwarder = address(new NAVFeedForwarder(navFeed, owner()));
 
-        IssuanceManager(issuanceManager).registerToken(token);
         _deployedIsins[isinKey] = true;
         navFeedOf[token]        = navFeed;
         forwarderOf[token]      = forwarder;
         emit TokenDeployed(token, navFeed, forwarder, issuanceManager);
+        IssuanceManager(issuanceManager).registerToken(token);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
