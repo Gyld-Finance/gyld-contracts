@@ -83,6 +83,7 @@ contract NAVFeedForwarder is Ownable2Step {
     ///                     + latestAnswer(). Passing address(0) reverts.
     function setUpstreamOracle(address newUpstream) external onlyOwner {
         if (newUpstream == address(0)) revert UpstreamCannotBeZero();
+        if (newUpstream == address(this)) revert InvalidOracle(newUpstream);
         // Verify the address implements the oracle interface before storing.
         // Uses decimals() — a pure view that never reverts for business-logic
         // reasons (unlike latestRoundData which reverts when no price is set yet).

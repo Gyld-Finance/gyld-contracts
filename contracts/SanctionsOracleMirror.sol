@@ -34,6 +34,7 @@ contract SanctionsOracleMirror is AccessControl {
     event NonSanctionedAddress(address indexed addr);
 
     error ZeroAddress();
+    error CannotRenounceAdminRole();
 
     constructor(address admin, address updater) {
         if (admin == address(0) || updater == address(0)) revert ZeroAddress();
@@ -80,6 +81,11 @@ contract SanctionsOracleMirror is AccessControl {
             unchecked { i++; }
         }
         emit SanctionedAddressesAdded(addrs);
+    }
+
+    function renounceRole(bytes32 role, address callerConfirmation) public override {
+        if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
+        super.renounceRole(role, callerConfirmation);
     }
 
     /// @notice Remove addresses from the sanctions list.
