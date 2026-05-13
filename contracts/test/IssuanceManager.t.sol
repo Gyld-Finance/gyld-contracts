@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IssuanceManager} from "../IssuanceManager.sol";
+import {GyldBondToken} from "../GyldBondToken.sol";
+import {MockSanctionsList} from "../MockSanctionsList.sol";
+
+contract IssuanceManagerTest is Test {
+    // Mirror events for vm.expectEmit (Solidity 0.8.20 doesn't support ContractName.Event syntax)
+    event AddressWhitelisted(address indexed account);
+    event AddressRemovedFromWhitelist(address indexed account);
+    event TokenRegistered(address indexed token);
+    event TokenDeregistered(address indexed token);
+    event Subscribed(address indexed token, address indexed recipient, uint256 amount);
+    event Redeemed(address indexed token, address indexed beneficiary, uint256 amount);
+
+    IssuanceManager mgr;
+    GyldBondToken   token;
+    MockSanctionsList mockSanctions;
+
+    address admin          = address(0xA0);
+    address subscriber     = address(0xA1); // SUBSCRIBER_ROLE — mint path MPC wallet
+    address redeemer       = address(0xA4); // REDEEMER_ROLE   — burn path MPC wallet
+    address whitelistAdmin = address(0xA2);
+    address registrar      = address(0xA3);
+    address ap             = address(0xAB);
+    address outsider       = address(0xFF);
+
+    function setUp() public {
+        IssuanceManager impl = new IssuanceManager();
+        mgr = IssuanceManager(address(new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(IssuanceManager.initialize, (admin, subscriber, redeemer))
+        )));
+
+        // Cache role bytes before pranking — prank is consumed by the first external call,
+        // which would otherwise be the WHITELIST_ADMIN_ROLE() getter, not grantRole.
+        bytes32 whitelistAdminRole = mgr.WHITELIST_ADMIN_ROLE();
+        bytes32 registrarRole      = mgr.REGISTRAR_ROLE();
+        vm.prank(admin); mgr.grantRole(whitelistAdminRole, whitelistAdmin);
+        vm.prank(admin); mgr.grantRole(registrarRole, registrar);
+
+        mockSanctions = new MockSanctionsList();
+        GyldBondToken tokenImpl = new GyldBondToken();
+        token = GyldBondToken(address(new ERC1967Proxy(
+            address(tokenImpl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Test Bond", "TBOND", "US000000TEST", 0,
+                address(this),
+                address(this),
+                address(mockSanctions)
+            ))
+        )));
+
+        token.grantRole(token.MINTER_ROLE(), address(mgr));
+        token.grantRole(token.BURNER_ROLE(), address(mgr));
+
+        vm.prank(registrar); mgr.registerToken(address(token));
+        vm.prank(whitelistAdmin); mgr.addToWhitelist(ap);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    function _subscribeAp(uint256 amount) internal {
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, amount);
+    }
+
+    function _apSendsToMgr(uint256 amount) internal {
+        // ap transfers tokens to mgr (simulating redemption initiation)
+        vm.prank(ap);
+        token.transfer(address(mgr), amount);
+    }
+
+    // ── Initializer guards ────────────────────────────────────────────────────
+
+    function test_initialize_zeroDefaultAdmin_reverts() public {
+        IssuanceManager impl2 = new IssuanceManager();
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        new ERC1967Proxy(
+            address(impl2),
+            abi.encodeCall(IssuanceManager.initialize, (address(0), subscriber, redeemer))
+        );
+    }
+
+    function test_initialize_zeroSubscriber_reverts() public {
+        IssuanceManager impl2 = new IssuanceManager();
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        new ERC1967Proxy(
+            address(impl2),
+            abi.encodeCall(IssuanceManager.initialize, (admin, address(0), redeemer))
+        );
+    }
+
+    function test_initialize_zeroRedeemer_reverts() public {
+        IssuanceManager impl2 = new IssuanceManager();
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        new ERC1967Proxy(
+            address(impl2),
+            abi.encodeCall(IssuanceManager.initialize, (admin, subscriber, address(0)))
+        );
+    }
+
+    // ── Whitelist management ──────────────────────────────────────────────────
+
+    function test_addToWhitelist_success() public {
+        address newAp = address(0xBB);
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(newAp);
+        assertTrue(mgr.whitelisted(newAp));
+    }
+
+    function test_addToWhitelist_emitsEvent() public {
+        address newAp = address(0xBB);
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressWhitelisted(newAp);
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(newAp);
+    }
+
+    function test_addToWhitelist_zeroAddress_reverts() public {
+        vm.prank(whitelistAdmin);
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        mgr.addToWhitelist(address(0));
+    }
+
+    function test_addToWhitelist_onlyWhitelistAdmin_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.addToWhitelist(address(0xBB));
+    }
+
+    function test_removeFromWhitelist_success() public {
+        vm.prank(whitelistAdmin);
+        mgr.removeFromWhitelist(ap);
+        assertFalse(mgr.whitelisted(ap));
+    }
+
+    function test_removeFromWhitelist_emitsEvent() public {
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressRemovedFromWhitelist(ap);
+        vm.prank(whitelistAdmin);
+        mgr.removeFromWhitelist(ap);
+    }
+
+    function test_removeFromWhitelist_onlyWhitelistAdmin_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.removeFromWhitelist(ap);
+    }
+
+    function test_removeFromWhitelist_zeroAddress_reverts() public {
+        vm.prank(whitelistAdmin);
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        mgr.removeFromWhitelist(address(0));
+    }
+
+    function test_addToWhitelistBatch_success() public {
+        address a1 = address(0x01);
+        address a2 = address(0x02);
+        address a3 = address(0x03);
+        address[] memory batch = new address[](3);
+        batch[0] = a1; batch[1] = a2; batch[2] = a3;
+
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressWhitelisted(a1);
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressWhitelisted(a2);
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressWhitelisted(a3);
+
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelistBatch(batch);
+
+        assertTrue(mgr.whitelisted(a1));
+        assertTrue(mgr.whitelisted(a2));
+        assertTrue(mgr.whitelisted(a3));
+    }
+
+    function test_addToWhitelistBatch_zeroAddress_reverts() public {
+        address[] memory batch = new address[](3);
+        batch[0] = address(0x01);
+        batch[1] = address(0);
+        batch[2] = address(0x03);
+        vm.prank(whitelistAdmin);
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        mgr.addToWhitelistBatch(batch);
+    }
+
+    function test_addToWhitelistBatch_emptyArray_succeeds() public {
+        address[] memory empty = new address[](0);
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelistBatch(empty); // no-op, must not revert
+    }
+
+    // ── Token registry ────────────────────────────────────────────────────────
+
+    function test_registerToken_success() public {
+        GyldBondToken tokenImpl2 = new GyldBondToken();
+        GyldBondToken token2 = GyldBondToken(address(new ERC1967Proxy(
+            address(tokenImpl2),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Bond 2", "B2", "US000000TST2", 0,
+                address(this), address(this), address(mockSanctions)
+            ))
+        )));
+
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit TokenRegistered(address(token2));
+
+        vm.prank(registrar);
+        mgr.registerToken(address(token2));
+
+        assertTrue(mgr.registeredTokens(address(token2)));
+    }
+
+    function test_registerToken_zeroAddress_reverts() public {
+        vm.prank(registrar);
+        vm.expectRevert(IssuanceManager.ZeroAddress.selector);
+        mgr.registerToken(address(0));
+    }
+
+    function test_registerToken_onlyRegistrar_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.registerToken(address(token));
+    }
+
+    function test_deregisterToken_success() public {
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit TokenDeregistered(address(token));
+
+        vm.prank(registrar);
+        mgr.deregisterToken(address(token));
+
+        assertFalse(mgr.registeredTokens(address(token)));
+    }
+
+    function test_deregisterToken_onlyRegistrar_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.deregisterToken(address(token));
+    }
+
+    // ── Subscribe ─────────────────────────────────────────────────────────────
+
+    function test_subscribe_success() public {
+        uint256 amount = 100e18;
+
+        vm.expectEmit(true, true, false, true, address(mgr));
+        emit Subscribed(address(token), ap, amount);
+
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, amount);
+
+        assertEq(token.balanceOf(ap), amount);
+    }
+
+    function test_subscribe_unregisteredToken_reverts() public {
+        address fakeToken = address(0xDEAD);
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.subscribe(fakeToken, ap, 1e18);
+    }
+
+    function test_subscribe_nonWhitelistedRecipient_reverts() public {
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.subscribe(address(token), outsider, 1e18);
+    }
+
+    function test_subscribe_zeroAmount_reverts() public {
+        vm.prank(subscriber);
+        vm.expectRevert(IssuanceManager.ZeroAmount.selector);
+        mgr.subscribe(address(token), ap, 0);
+    }
+
+    function test_subscribe_onlySubscriber_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    function test_subscribe_multipleTokens() public {
+        GyldBondToken tokenImpl2 = new GyldBondToken();
+        GyldBondToken token2 = GyldBondToken(address(new ERC1967Proxy(
+            address(tokenImpl2),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Bond 2", "B2", "US000000TST2", 0,
+                address(this), address(this), address(mockSanctions)
+            ))
+        )));
+        token2.grantRole(token2.MINTER_ROLE(), address(mgr));
+        token2.grantRole(token2.BURNER_ROLE(), address(mgr));
+        vm.prank(registrar); mgr.registerToken(address(token2));
+
+        vm.prank(subscriber); mgr.subscribe(address(token),  ap, 100e18);
+        vm.prank(subscriber); mgr.subscribe(address(token2), ap, 200e18);
+
+        assertEq(token.balanceOf(ap),  100e18);
+        assertEq(token2.balanceOf(ap), 200e18);
+    }
+
+    // ── Redeem ────────────────────────────────────────────────────────────────
+
+    function test_redeem_success() public {
+        uint256 amount = 80e18;
+        _subscribeAp(amount);
+        _apSendsToMgr(amount);
+
+        vm.expectEmit(true, true, false, true, address(mgr));
+        emit Redeemed(address(token), ap, amount);
+
+        vm.prank(redeemer);
+        mgr.redeem(address(token), ap, amount);
+
+        assertEq(token.balanceOf(address(mgr)), 0);
+        assertEq(token.totalSupply(), 0);
+    }
+
+    function test_redeem_unregisteredToken_reverts() public {
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.redeem(address(0xDEAD), ap, 1e18);
+    }
+
+    function test_redeem_nonWhitelistedBeneficiary_reverts() public {
+        _subscribeAp(10e18);
+        _apSendsToMgr(10e18);
+
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.redeem(address(token), outsider, 10e18);
+    }
+
+    function test_redeem_zeroAmount_reverts() public {
+        vm.prank(redeemer);
+        vm.expectRevert(IssuanceManager.ZeroAmount.selector);
+        mgr.redeem(address(token), ap, 0);
+    }
+
+    function test_redeem_onlyRedeemer_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.redeem(address(token), ap, 1e18);
+    }
+
+    function test_redeem_insufficientBalance_reverts() public {
+        _subscribeAp(50e18);
+        _apSendsToMgr(50e18);
+
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.redeem(address(token), ap, 100e18);
+    }
+
+
+    // ── Role isolation ────────────────────────────────────────────────────────
+
+    /// Core M-1 regression: subscriber cannot call redeem, redeemer cannot call subscribe.
+    /// A compromised mint key cannot burn; a compromised burn key cannot mint.
+    function test_subscriber_cannotRedeem() public {
+        _subscribeAp(50e18);
+        _apSendsToMgr(50e18);
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.redeem(address(token), ap, 50e18);
+    }
+
+    function test_redeemer_cannotSubscribe() public {
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    function test_subscriber_cannotManageWhitelist() public {
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.addToWhitelist(address(0xCC));
+    }
+
+    function test_redeemer_cannotManageWhitelist() public {
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.addToWhitelist(address(0xCC));
+    }
+
+    function test_whitelistAdmin_cannotSubscribe() public {
+        vm.prank(whitelistAdmin);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    function test_registrar_cannotSubscribe() public {
+        vm.prank(registrar);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    // ── Additional redeem / whitelist / registry tests ────────────────────────
+
+    function test_redeem_partialAmount_succeeds() public {
+        uint256 total = 100e18;
+        uint256 half = 50e18;
+        _subscribeAp(total);
+        _apSendsToMgr(total);
+
+        vm.prank(redeemer);
+        mgr.redeem(address(token), ap, half);
+
+        // mgr still holds the unredeemed half
+        assertEq(token.balanceOf(address(mgr)), half);
+        // only half was burned
+        assertEq(token.totalSupply(), half);
+    }
+
+    function test_addToWhitelist_idempotent_emitsEventAgain() public {
+        // ap is already whitelisted in setUp; adding again should emit the event again
+        vm.expectEmit(true, false, false, false, address(mgr));
+        emit AddressWhitelisted(ap);
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(ap);
+        // still whitelisted
+        assertTrue(mgr.whitelisted(ap));
+    }
+
+    function test_deregisterToken_twice_isIdempotent() public {
+        vm.prank(registrar); mgr.deregisterToken(address(token));
+        assertFalse(mgr.registeredTokens(address(token)));
+
+        // second deregister must not revert
+        vm.prank(registrar); mgr.deregisterToken(address(token));
+        assertFalse(mgr.registeredTokens(address(token)));
+    }
+
+    function test_registrar_cannotRedeem() public {
+        _subscribeAp(10e18);
+        _apSendsToMgr(10e18);
+
+        vm.prank(registrar);
+        vm.expectRevert();
+        mgr.redeem(address(token), ap, 10e18);
+    }
+
+    function testFuzz_subscribe_redeem_roundTrip(uint256 amount) public {
+        amount = bound(amount, 1e18, 1_000_000e18);
+
+        _subscribeAp(amount);
+        _apSendsToMgr(amount);
+
+        vm.prank(redeemer);
+        mgr.redeem(address(token), ap, amount);
+
+        assertEq(token.totalSupply(), 0);
+        assertEq(token.balanceOf(address(mgr)), 0);
+    }
+
+    // ── UUPS upgrade ──────────────────────────────────────────────────────────
+
+    function test_unauthorizedUpgrade_reverts() public {
+        IssuanceManager newImpl = new IssuanceManager();
+        vm.prank(outsider);
+        vm.expectRevert();
+        mgr.upgradeToAndCall(address(newImpl), "");
+    }
+
+    // ── renounceRole guard ────────────────────────────────────────────────────
+
+    function test_renounceRole_defaultAdmin_reverts() public {
+        // Cache role bytes before pranking — getter call would consume the prank/expectRevert.
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE();
+        vm.prank(admin);
+        vm.expectRevert(IssuanceManager.CannotRenounceAdminRole.selector);
+        mgr.renounceRole(adminRole, admin);
+    }
+
+    function test_renounceRole_nonAdminRole_succeeds() public {
+        bytes32 whitelistAdminRole = mgr.WHITELIST_ADMIN_ROLE();
+        vm.prank(admin); mgr.grantRole(whitelistAdminRole, admin);
+        assertTrue(mgr.hasRole(whitelistAdminRole, admin));
+
+        vm.prank(admin);
+        mgr.renounceRole(whitelistAdminRole, admin);
+        assertFalse(mgr.hasRole(whitelistAdminRole, admin));
+    }
+
+    // ── registerToken interface validation (GYL-298) ──────────────────────────
+
+    function test_registerToken_nonContractAddress_reverts() public {
+        address eoa = address(0xEEEE);
+        vm.prank(registrar);
+        vm.expectRevert();
+        mgr.registerToken(eoa);
+    }
+
+    function test_registerToken_wrongContract_reverts() public {
+        // MockSanctionsList has no MINTER_ROLE() — not a GyldBondToken
+        address wrongContract = address(new MockSanctionsList());
+        vm.prank(registrar);
+        vm.expectRevert();
+        mgr.registerToken(wrongContract);
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    function test_redeem_reentrantCall_reverts() public {
+        ReentrantToken rtoken = new ReentrantToken(address(mgr));
+
+        // Register the malicious token (needs MINTER_ROLE probe to pass)
+        vm.prank(registrar);
+        mgr.registerToken(address(rtoken));
+
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(ap);
+
+        // Arm the reentrant token with redeemer + beneficiary so it can attempt
+        // the re-entry call with valid arguments.
+        rtoken.arm(redeemer, ap, 1e18);
+
+        // The burn() call on rtoken will attempt to re-enter redeem() — the
+        // ReentrancyGuard must reject the second call.
+        vm.prank(redeemer);
+        vm.expectRevert();
+        mgr.redeem(address(rtoken), ap, 1e18);
+    }
+
+    function test_subscribe_reentrantCall_reverts() public {
+        ReentrantToken rtoken = new ReentrantToken(address(mgr));
+
+        vm.prank(registrar);
+        mgr.registerToken(address(rtoken));
+
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(ap);
+
+        rtoken.armMint(subscriber, ap, 1e18);
+
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.subscribe(address(rtoken), ap, 1e18);
+    }
+}
+
+/// @dev Malicious token that attempts to re-enter IssuanceManager on burn() or mint().
+contract ReentrantToken {
+    IssuanceManager private immutable _mgr;
+
+    // redeem re-entry params
+    address private _redeemer;
+    address private _beneficiary;
+    uint256 private _redeemAmount;
+    bool    private _armRedeem;
+
+    // subscribe re-entry params
+    address private _subscriber;
+    address private _mintRecipient;
+    uint256 private _mintAmount;
+    bool    private _armMint;
+
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    constructor(address mgr) { _mgr = IssuanceManager(mgr); }
+
+    function arm(address redeemer_, address beneficiary_, uint256 amount_) external {
+        _redeemer = redeemer_; _beneficiary = beneficiary_; _redeemAmount = amount_;
+        _armRedeem = true;
+    }
+
+    function armMint(address subscriber_, address recipient_, uint256 amount_) external {
+        _subscriber = subscriber_; _mintRecipient = recipient_; _mintAmount = amount_;
+        _armMint = true;
+    }
+
+    function burn(address, uint256) external {
+        if (_armRedeem) {
+            _armRedeem = false;
+            vm.prank(_redeemer);
+            _mgr.redeem(address(this), _beneficiary, _redeemAmount);
+        }
+    }
+
+    function mint(address, uint256) external {
+        if (_armMint) {
+            _armMint = false;
+            vm.prank(_subscriber);
+            _mgr.subscribe(address(this), _mintRecipient, _mintAmount);
+        }
+    }
+}
+
+// Forge cheatcode interface needed inside ReentrantToken
+interface Vm { function prank(address) external; }
+Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
