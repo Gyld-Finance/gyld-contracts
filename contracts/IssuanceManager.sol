@@ -134,6 +134,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         if (!_getStorage().registeredTokens[token]) revert UnregisteredToken(token);
         if (!_getStorage().whitelisted[recipient])   revert NotWhitelisted(recipient);
         if (amount == 0)                             revert ZeroAmount();
+        // nonReentrant: defense-in-depth; mint/burn are role-gated with no untrusted callbacks
         IGyldBondToken(token).mint(recipient, amount);
         emit Subscribed(token, recipient, amount);
     }
@@ -175,6 +176,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         if (!_getStorage().registeredTokens[token])    revert UnregisteredToken(token);
         if (!_getStorage().whitelisted[beneficiary])   revert NotWhitelisted(beneficiary);
         if (amount == 0)                               revert ZeroAmount();
+        // nonReentrant: defense-in-depth; mint/burn are role-gated with no untrusted callbacks
         IGyldBondToken(token).burn(address(this), amount);
         emit Redeemed(token, beneficiary, amount);
     }
