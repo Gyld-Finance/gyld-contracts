@@ -83,7 +83,6 @@ Full architecture and role documentation: **`docs/contracts.md`**
 
 **DEFAULT_ADMIN_ROLE is wired to `factory.owner()`** — the `TimelockController` in production.
 
-**IssuanceManager custody window:** `retrieveTokens(address token, address to, uint256 amount)` (DEFAULT_ADMIN_ROLE, 48h TimelockController delay) rescues tokens stuck in the redemption custody window. See [`docs/decisions/issuance-manager-custody-window.md`](decisions/issuance-manager-custody-window.md) for full rationale and operator runbook.
 `_wireRoles` self-revokes both `DEFAULT_ADMIN_ROLE` and `PAUSER_ROLE` from the factory at the
 end of `deployToken`. No manual cleanup needed; the factory holds no permissions after deploy.
 
