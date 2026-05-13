@@ -26,7 +26,7 @@ contract GyldBondTokenTest is Test {
 
     address admin    = address(0xA0); // DEFAULT_ADMIN_ROLE on token + mgr
     address operator = address(0xA1); // PAUSER_ROLE on token
-    address issuer   = address(0xA2); // ISSUER_ROLE on mgr
+    address issuer   = address(0xA2); // SUBSCRIBER_ROLE + REDEEMER_ROLE on mgr
     address ap       = address(0xAB); // Authorised Participant (whitelisted)
 
     // Known private key — vm.addr(HOLDER_PK) is the corresponding address.
@@ -146,7 +146,7 @@ contract GyldBondTokenTest is Test {
     // Gap 2 — subscribe / redeem when the token is paused
     // ═════════════════════════════════════════════════════════════════════════
 
-    /// subscribe() must revert when the token is paused — even with valid ISSUER_ROLE.
+    /// subscribe() must revert when the token is paused — even with valid SUBSCRIBER_ROLE.
     /// This is the emergency brake: a compromised issuer key cannot mint after ops pauses.
     function test_subscribe_whenPaused_reverts() public {
         vm.prank(operator);
@@ -157,7 +157,7 @@ contract GyldBondTokenTest is Test {
         mgr.subscribe(address(token), ap, 100e18);
     }
 
-    /// redeem() must revert when the token is paused — even with valid ISSUER_ROLE.
+    /// redeem() must revert when the token is paused — even with valid REDEEMER_ROLE.
     function test_redeem_whenPaused_reverts() public {
         // First get tokens into mgr's custody (normal redemption initiation).
         vm.prank(issuer);

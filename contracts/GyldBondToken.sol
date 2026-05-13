@@ -180,8 +180,8 @@ contract GyldBondToken is
 
     // ── Mint / Burn (MINTER_ROLE / BURNER_ROLE only) ──────────────────────────
     // whenNotPaused IS enforced — a paused contract stops all token movement including
-    // primary issuance. This ensures a compromised ISSUER_ROLE key cannot mint or burn
-    // after the ops multisig has triggered an emergency pause.
+    // primary issuance. This ensures a compromised SUBSCRIBER_ROLE or REDEEMER_ROLE key
+    // cannot mint or burn after the ops multisig has triggered an emergency pause.
     // Sanctions oracle is NOT checked here. IssuanceManager pre-screens APs off-chain.
 
     /// Mint `amount` tokens to `to`.

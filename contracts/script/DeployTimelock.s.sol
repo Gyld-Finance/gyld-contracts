@@ -86,7 +86,7 @@ contract DeployTimelock is Script {
         // ── IssuanceManager DEFAULT_ADMIN ─────────────────────────────────────
         // When provided, grant DEFAULT_ADMIN_ROLE on the IssuanceManager to the
         // timelock, then immediately revoke it from the deployer. This ensures all
-        // role grants (ISSUER_ROLE, WHITELIST_ADMIN_ROLE) and UUPS upgrades require
+        // role grants (SUBSCRIBER_ROLE, REDEEMER_ROLE, WHITELIST_ADMIN_ROLE) and UUPS upgrades require
         // the timelock delay, with no parallel bypass path.
         if (issuanceManagerAddress != address(0)) {
             IssuanceManager im = IssuanceManager(issuanceManagerAddress);

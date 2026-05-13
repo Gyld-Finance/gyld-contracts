@@ -16,7 +16,7 @@ interface IGyldBondToken {
 /// Design:
 ///   - Only whitelisted Authorised Participant (AP) addresses may be minted to or redeemed from.
 ///   - This contract holds MINTER_ROLE and BURNER_ROLE on every registered GyldBondToken.
-///   - The platform backend (ISSUER_ROLE) calls subscribe/redeem after confirming USDC receipt
+///   - The platform backend (SUBSCRIBER_ROLE/REDEEMER_ROLE) calls subscribe/redeem after confirming USDC receipt
 ///     or token receipt off-chain. The smart contract enforces whitelist compliance on-chain.
 ///
 /// Mint flow:
