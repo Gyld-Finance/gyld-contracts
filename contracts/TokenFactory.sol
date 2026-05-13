@@ -89,20 +89,14 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         string memory isin,
         uint256 maturityTimestamp
     ) external view returns (address) {
-        bytes32 bondSalt  = _bondSalt(isin);
-        bytes32 tokenSalt = keccak256(abi.encodePacked("token", bondSalt));
-        bytes memory tokenInit = abi.encodeCall(
-            GyldBondToken.initialize,
-            (name, symbol, isin, maturityTimestamp, address(this), address(this), sanctionsList)
-        );
+        bytes32 salt = _tokenSalt(_bondSalt(isin));
         bytes memory initCode = abi.encodePacked(
             type(ERC1967Proxy).creationCode,
-            abi.encode(bondTokenLogic, tokenInit)
+            abi.encode(bondTokenLogic, _tokenProxyInitData(name, symbol, isin, maturityTimestamp))
         );
-        bytes32 hash = keccak256(
-            abi.encodePacked(bytes1(0xff), address(this), tokenSalt, keccak256(initCode))
-        );
-        return address(uint160(uint256(hash)));
+        return address(uint160(uint256(keccak256(
+            abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(initCode))
+        ))));
     }
 
     /// @notice Deploy a GyldBondToken proxy, KaleidoscopeNAVFeed, and NAVFeedForwarder
@@ -158,14 +152,10 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
 
         // Deploy GyldBondToken proxy (UUPS). Factory is temporary DEFAULT_ADMIN + PAUSER.
         // sanctionsList is the read-only Chainalysis oracle — no internal blocklist.
-        bytes memory tokenInit = abi.encodeCall(
-            GyldBondToken.initialize,
-            (name, symbol, isin, maturityTimestamp, address(this), address(this), sanctionsList)
-        );
         token = address(
-            new ERC1967Proxy{salt: keccak256(abi.encodePacked("token", isinKey))}(
+            new ERC1967Proxy{salt: _tokenSalt(isinKey)}(
                 bondTokenLogic,
-                tokenInit
+                _tokenProxyInitData(name, symbol, isin, maturityTimestamp)
             )
         );
 
@@ -210,5 +200,26 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// on two different chains (e.g. Ethereum mainnet vs Base).
     function _bondSalt(string memory isin_) internal view returns (bytes32) {
         return keccak256(abi.encodePacked(isin_, block.chainid));
+    }
+
+    /// CREATE2 salt for a token proxy: keccak256("token" ++ bondSalt).
+    /// Shared by deployToken and predictTokenAddress so the two can never drift.
+    function _tokenSalt(bytes32 bondSalt_) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("token", bondSalt_));
+    }
+
+    /// ABI-encoded initialize() calldata for a new GyldBondToken proxy.
+    /// Shared by deployToken (passed to new ERC1967Proxy) and predictTokenAddress
+    /// (included in the CREATE2 initcode hash) so both compute the same address.
+    function _tokenProxyInitData(
+        string memory name,
+        string memory symbol,
+        string memory isin,
+        uint256 maturityTimestamp
+    ) internal view returns (bytes memory) {
+        return abi.encodeCall(
+            GyldBondToken.initialize,
+            (name, symbol, isin, maturityTimestamp, address(this), address(this), sanctionsList)
+        );
     }
 }
