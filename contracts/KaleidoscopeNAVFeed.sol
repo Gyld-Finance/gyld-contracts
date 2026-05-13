@@ -26,7 +26,9 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///      Safety constraints:
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
-///        - MAX_STALENESS:           reads revert if price is older than 36 hours
+///        - MAX_STALENESS:           threshold for isFresh() monitoring view;
+///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
+///                                   so DeFi integrations work over weekends and holidays
 ///
 /// @custom:security-contact security@gyld.fi
 
@@ -68,9 +70,11 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     /// Human-readable description (e.g. "TLT / USD NAV").
     string private _description;
 
-    /// Maximum age of a price before latestRoundData() reverts.
-    /// 36 hours: covers weekends + US market holidays (no NAV on those days).
-    uint256 public constant MAX_STALENESS = 36 hours;
+    /// Staleness threshold used by isFresh() for backend monitoring.
+    /// 96 hours: covers 3-day US holiday weekends (~87 h gap) with a buffer.
+    /// latestRoundData() does NOT revert when this is exceeded — consumers
+    /// receive the last known NAV, matching the Chainlink / Ondo Finance model.
+    uint256 public constant MAX_STALENESS = 96 hours;
 
     /// Minimum time between consecutive updateAnswer() calls.
     /// Prevents rapid price oscillation from a compromised updater key.
@@ -165,7 +169,7 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         uint80 answeredInRound
     ) {
         if (_rid != _roundId) revert HistoricalRoundsNotStored(_rid, _roundId);
-        _requireFresh();
+        if (_updatedAt == 0) revert NoPriceSet();
         return (_roundId, _latestAnswer, _updatedAt, _updatedAt, _roundId);
     }
 
@@ -176,7 +180,7 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         uint256 updatedAt,
         uint80 answeredInRound
     ) {
-        _requireFresh();
+        if (_updatedAt == 0) revert NoPriceSet();
         return (_roundId, _latestAnswer, _updatedAt, _updatedAt, _roundId);
     }
 
@@ -185,14 +189,18 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     /// @notice Returns the latest answer. Provided for Aave V3 oracle compatibility
     ///         which calls latestAnswer() via the older AggregatorInterface.
     function latestAnswer() external view returns (int256) {
-        _requireFresh();
+        if (_updatedAt == 0) revert NoPriceSet();
         return _latestAnswer;
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────────
+    // ── Monitoring ────────────────────────────────────────────────────────────
 
-    function _requireFresh() internal view {
-        if (_updatedAt == 0) revert NoPriceSet();
-        if (block.timestamp - _updatedAt > MAX_STALENESS) revert PriceStale(_updatedAt, block.timestamp);
+    /// @notice Returns true if the last price update is within MAX_STALENESS.
+    ///         Use this in backend alerting to detect a stuck KMS signer.
+    ///         DeFi read functions (latestRoundData, latestAnswer) never revert
+    ///         on staleness — they always return the last known NAV.
+    function isFresh() external view returns (bool) {
+        if (_updatedAt == 0) return false;
+        return block.timestamp - _updatedAt <= MAX_STALENESS;
     }
 }

@@ -237,20 +237,32 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(answeredInRound, roundId);
     }
 
-    function test_latestRoundData_revertsWhenStale() public {
+    function test_latestRoundData_returnsLastPriceWhenStale() public {
+        // latestRoundData never reverts on staleness — returns last known NAV
+        // so DeFi integrations (Morpho, Aave) work over weekends and holidays.
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + THIRTY_SIX_HOURS + 1);
-        vm.expectRevert();
-        feed.latestRoundData();
-    }
-
-    function test_latestRoundData_notStaleAtExactBoundary() public {
-        vm.prank(owner);
-        feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + THIRTY_SIX_HOURS);
+        vm.warp(block.timestamp + 97 hours); // past 96h MAX_STALENESS
         (, int256 answer,,,) = feed.latestRoundData();
         assertEq(answer, ANSWER);
+    }
+
+    function test_isFresh_trueBeforeStaleness() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        vm.warp(block.timestamp + 95 hours);
+        assertTrue(feed.isFresh());
+    }
+
+    function test_isFresh_falseAfterStaleness() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        vm.warp(block.timestamp + 97 hours);
+        assertFalse(feed.isFresh());
+    }
+
+    function test_isFresh_falseWhenNoPriceSet() public view {
+        assertFalse(feed.isFresh());
     }
 
     function test_latestRoundData_recoversAfterNewUpdate() public {
@@ -279,12 +291,11 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.latestAnswer(), ANSWER);
     }
 
-    function test_latestAnswer_revertsWhenStale() public {
+    function test_latestAnswer_returnsLastPriceWhenStale() public {
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + THIRTY_SIX_HOURS + 1);
-        vm.expectRevert();
-        feed.latestAnswer();
+        vm.warp(block.timestamp + 97 hours);
+        assertEq(feed.latestAnswer(), ANSWER);
     }
 
     // ── version ───────────────────────────────────────────────────────────────

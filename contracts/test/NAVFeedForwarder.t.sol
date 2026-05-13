@@ -142,11 +142,11 @@ contract NAVFeedForwarderTest is Test {
         assertEq(forwarder.description(), "TLT / USD NAV v2");
     }
 
-    function test_forwarder_propagatesStaleRevert() public {
-        // If upstream goes stale, forwarder propagates the revert.
-        vm.warp(block.timestamp + 36 hours + 1);
-        vm.expectRevert();
-        forwarder.latestRoundData();
+    function test_forwarder_returnsLastPriceWhenStale() public {
+        // Forwarder returns last known price over weekends/holidays — no stale revert.
+        vm.warp(block.timestamp + 97 hours);
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, ANSWER_V1);
     }
 
     function test_forwarder_propagatesNoPriceRevert() public {
