@@ -54,6 +54,7 @@ contract DeployTimelock is Script {
 
         uint256 delay = DEFAULT_DELAY;
         try vm.envUint("TIMELOCK_DELAY_SECONDS") returns (uint256 d) {
+            require(block.chainid != 1 || d >= 48 hours, "DeployTimelock: delay < 48 h on mainnet");
             delay = d;
         } catch {}
 
