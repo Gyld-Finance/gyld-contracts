@@ -37,8 +37,8 @@ import {IssuanceManager} from "../IssuanceManager.sol";
 ///
 /// After broadcasting, the multisig must complete the two-step ownership hand-off
 /// for the factory by scheduling and executing factory.acceptOwnership() via the timelock.
-/// If ISSUANCE_MANAGER_ADDRESS was set, the deployer also needs to revoke its own
-/// DEFAULT_ADMIN_ROLE from the IssuanceManager (schedule via timelock to avoid lockout).
+/// If ISSUANCE_MANAGER_ADDRESS was set, the deployer's DEFAULT_ADMIN_ROLE is revoked
+/// atomically in the same transaction — no manual follow-up step is required.
 contract DeployTimelock is Script {
     uint256 constant DEFAULT_DELAY = 48 hours;
 
