@@ -253,7 +253,7 @@ contract DeployDevNet is Script {
         console.log("  (TOKEN_CAT, TOKEN_C, TOKEN_KO logged above)");
         console.log("  EVM_RPC_URL=http://127.0.0.1:8545");
         console.log("  EVM_CHAIN_ID=31337");
-        console.log("  PRIVKEY_SIGNING_KEY=ANVIL_TEST_KEY_REDACTED");
+        console.log("  PRIVKEY_SIGNING_KEY=<anvil-account-private-key>");
         console.log("  CHAINALYSIS_SANCTIONS_CONTRACT=%s", factory.sanctionsList());
     }
 
