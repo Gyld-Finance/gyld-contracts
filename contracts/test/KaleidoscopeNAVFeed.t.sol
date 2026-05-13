@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
 
 contract KaleidoscopeNAVFeedTest is Test {
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+    event EmergencyUpdaterSet(address indexed previous, address indexed newUpdater);
+    event EmergencyAnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+
     KaleidoscopeNAVFeed feed;
-    address owner    = address(0xA1);
-    address stranger = address(0xB2);
-    address newOwner = address(0xC3);
+    address owner            = address(0xA1);
+    address stranger         = address(0xB2);
+    address newOwner         = address(0xC3);
+    address emergencyUpdater = address(0xE4);
 
     uint256 constant THIRTY_SIX_HOURS  = 36 hours;
     uint256 constant ONE_HOUR          = 1 hours;
@@ -443,6 +447,232 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.prank(owner);
         vm.expectRevert();
         feed.updateAnswer(ANSWER);
+    }
+
+    // ── setEmergencyUpdater ───────────────────────────────────────────────────
+
+    function test_setEmergencyUpdater_ownerSetsAddress() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        assertEq(feed.emergencyUpdater(), emergencyUpdater);
+    }
+
+    function test_setEmergencyUpdater_nonOwnerReverts() public {
+        vm.prank(stranger);
+        vm.expectRevert();
+        feed.setEmergencyUpdater(emergencyUpdater);
+    }
+
+    function test_setEmergencyUpdater_zeroAddressDisablesPath() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.setEmergencyUpdater(address(0));
+        assertEq(feed.emergencyUpdater(), address(0));
+    }
+
+    function test_setEmergencyUpdater_emitsEvent() public {
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, false);
+        emit EmergencyUpdaterSet(address(0), emergencyUpdater);
+        feed.setEmergencyUpdater(emergencyUpdater);
+    }
+
+    function test_setEmergencyUpdater_emitsEventWithPreviousAddress() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, false);
+        emit EmergencyUpdaterSet(emergencyUpdater, newOwner);
+        feed.setEmergencyUpdater(newOwner);
+    }
+
+    // ── emergencyUpdateAnswer — access control ────────────────────────────────
+
+    function test_emergencyUpdateAnswer_strangerReverts() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(stranger);
+        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
+        feed.emergencyUpdateAnswer(ANSWER);
+    }
+
+    function test_emergencyUpdateAnswer_ownerCannotCallDirectly() public {
+        // owner is not the emergency updater — different keys by design
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
+        feed.emergencyUpdateAnswer(ANSWER);
+    }
+
+    function test_emergencyUpdateAnswer_revertsWhenPathDisabled() public {
+        // emergencyUpdater never set — address(0) — nobody can call
+        vm.prank(stranger);
+        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
+        feed.emergencyUpdateAnswer(ANSWER);
+    }
+
+    // ── emergencyUpdateAnswer — bypasses guards ───────────────────────────────
+
+    function test_emergencyUpdateAnswer_bypassesInterval() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+
+        // no warp — still within MIN_UPDATE_INTERVAL
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER_PLUS_SMALL); // succeeds without waiting 1h
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, ANSWER_PLUS_SMALL);
+    }
+
+    function test_emergencyUpdateAnswer_bypassesDeviationUp() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER); // $95.42
+
+        // 50% up — way beyond MAX_PRICE_DEVIATION_BPS
+        int256 bigMove = (ANSWER * 150) / 100;
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(bigMove);
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, bigMove);
+    }
+
+    function test_emergencyUpdateAnswer_bypassesDeviationDown() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER); // $95.42
+
+        // 50% down — way beyond MAX_PRICE_DEVIATION_BPS
+        int256 bigDrop = ANSWER / 2;
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(bigDrop);
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, bigDrop);
+    }
+
+    // ── emergencyUpdateAnswer — validation ───────────────────────────────────
+
+    function test_emergencyUpdateAnswer_zeroReverts() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(emergencyUpdater);
+        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
+        feed.emergencyUpdateAnswer(0);
+    }
+
+    function test_emergencyUpdateAnswer_negativeReverts() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(emergencyUpdater);
+        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
+        feed.emergencyUpdateAnswer(-1);
+    }
+
+    // ── emergencyUpdateAnswer — state ─────────────────────────────────────────
+
+    function test_emergencyUpdateAnswer_storesAnswer() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER);
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, ANSWER);
+    }
+
+    function test_emergencyUpdateAnswer_updatesTimestamp() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.warp(1000);
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER);
+        (,,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(updatedAt, 1000);
+    }
+
+    function test_emergencyUpdateAnswer_incrementsRoundId() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);           // round 1
+
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER);  // round 2
+        (uint80 roundId,,,,) = feed.latestRoundData();
+        assertEq(roundId, 2);
+    }
+
+    // ── emergencyUpdateAnswer — event ─────────────────────────────────────────
+
+    function test_emergencyUpdateAnswer_emitsEmergencyEvent() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.warp(1000);
+        vm.prank(emergencyUpdater);
+        vm.expectEmit(true, true, false, true);
+        emit EmergencyAnswerUpdated(ANSWER, 1, 1000);
+        feed.emergencyUpdateAnswer(ANSWER);
+    }
+
+    function test_emergencyUpdateAnswer_doesNotEmitAnswerUpdated() public {
+        // EmergencyAnswerUpdated and AnswerUpdated are distinct — monitoring
+        // rules must watch both but they never fire in the same call.
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.recordLogs();
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        // Only one event emitted; its topic[0] must be EmergencyAnswerUpdated, not AnswerUpdated
+        assertEq(logs.length, 1);
+        assertEq(logs[0].topics[0], keccak256("EmergencyAnswerUpdated(int256,uint256,uint256)"));
+    }
+
+    // ── Trapped-price scenario — the root cause of this feature ───────────────
+
+    /// A fat-finger pushes a price 9.9 % below correct value (within deviation band,
+    /// so it is accepted). The correct price is now 10.97 % above the wrong price —
+    /// beyond MAX_PRICE_DEVIATION_BPS, so normal updateAnswer is blocked.
+    /// emergencyUpdateAnswer corrects it in one call with no waiting period.
+    function test_emergencyUpdateAnswer_solvesTrappedPriceScenario() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+
+        int256 correctPrice = 9_500_000_000; // $95.00
+        int256 wrongPrice   = 8_560_000_000; // $85.60 — 9.89% below $95.00
+
+        // Step 1: push correct NAV at t=1000 (first update, no deviation check)
+        vm.warp(1000);
+        vm.prank(owner);
+        feed.updateAnswer(correctPrice);
+
+        // Step 2: fat-finger pushes $85.60 at t=4600 (+1 h) — 9.89% below $95.00,
+        // just within MAX_PRICE_DEVIATION_BPS — accepted
+        vm.warp(4600);
+        vm.prank(owner);
+        feed.updateAnswer(wrongPrice);
+
+        // Step 3: normal correction at t=8200 (+1 h) — ($95.00 - $85.60) / $85.60 = 10.98%
+        // exceeds MAX_PRICE_DEVIATION_BPS from the wrong baseline — BLOCKED
+        vm.warp(8200);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector,
+                correctPrice,
+                wrongPrice
+            )
+        );
+        feed.updateAnswer(correctPrice);
+
+        // Step 4: emergency path restores correct price immediately
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(correctPrice);
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, correctPrice);
     }
 
 }

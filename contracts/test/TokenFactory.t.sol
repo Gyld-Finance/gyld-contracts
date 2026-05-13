@@ -768,20 +768,16 @@ contract GyldBondTokenUnitTest is Test {
         token.transferFrom(alice, bob, 100e18);
     }
 
-    function test_noSanctionsList_transferSucceeds() public {
+    function test_initialize_zeroSanctionsList_reverts() public {
         GyldBondToken impl = new GyldBondToken();
-        GyldBondToken t = GyldBondToken(address(new ERC1967Proxy(
+        vm.expectRevert(GyldBondToken.ZeroAddress.selector);
+        new ERC1967Proxy(
             address(impl),
             abi.encodeCall(GyldBondToken.initialize, (
                 "No Oracle Bond", "NOBOND", "US000000NONE", 0,
                 admin, pauser, address(0)
             ))
-        )));
-        bytes32 minterRole = t.MINTER_ROLE();
-        vm.prank(admin); t.grantRole(minterRole, minter);
-        vm.prank(minter); t.mint(alice, 1000e18);
-        vm.prank(alice); t.transfer(bob, 200e18);
-        assertEq(t.balanceOf(bob), 200e18);
+        );
     }
 
     // ── setSanctionsList ──────────────────────────────────────────────────────

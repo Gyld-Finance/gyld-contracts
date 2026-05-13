@@ -36,7 +36,8 @@ IssuanceManager (ERC1967Proxy ──▶ impl, UUPS, ERC-7201 storage)
     │  initialize(defaultAdmin, issuer)
     │  defaultAdmin should be a TimelockController
     │
-    ├─ ISSUER_ROLE          → platform MPC / Fordefi wallet
+    ├─ SUBSCRIBER_ROLE      → platform MPC / Fordefi wallet (mint path)
+    ├─ REDEEMER_ROLE        → platform MPC / Fordefi wallet (burn path)
     ├─ WHITELIST_ADMIN_ROLE → ops multisig
     └─ REGISTRAR_ROLE       → TokenFactory (granted by factory at deployToken time)
 
@@ -146,7 +147,8 @@ Single gate for primary issuance and redemption of all Gyld bond series.
 | Role | Holder | Capability |
 |------|--------|-----------|
 | `DEFAULT_ADMIN_ROLE` | TimelockController (prod) | Grant/revoke roles; authorize UUPS upgrades |
-| `ISSUER_ROLE` | Platform MPC / Fordefi wallet | `subscribe()`, `redeem()` |
+| `SUBSCRIBER_ROLE` | Platform MPC / Fordefi wallet (mint) | `subscribe()` |
+| `REDEEMER_ROLE` | Platform MPC / Fordefi wallet (burn) | `redeem()` |
 | `WHITELIST_ADMIN_ROLE` | Ops | `addToWhitelist()`, `removeFromWhitelist()`, `addToWhitelistBatch()` |
 | `REGISTRAR_ROLE` | TokenFactory | `registerToken()`, `deregisterToken()` |
 
@@ -219,11 +221,29 @@ Implements `AggregatorV3Interface` for DeFi protocol compatibility.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `MAX_STALENESS` | 36 hours | Reads revert if price not refreshed — covers weekend gap |
-| `MIN_UPDATE_INTERVAL` | 1 hour | Prevents key-compromise rapid oscillation |
+| `MAX_STALENESS` | 96 hours | Monitoring threshold for `isFresh()`. Reads do NOT revert on staleness — returns last known NAV (Chainlink/Ondo model). Covers 3-day US holiday weekends. |
+| `MIN_UPDATE_INTERVAL` | 1 hour | Prevents rapid price oscillation from a compromised KMS key |
 | `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | Single-update deviation cap after first push |
 
-See `docs/blockchain-status.md` for the full rationale on `MAX_STALENESS` and the weekend gap problem.
+**Emergency price correction:**
+
+If a wrong price is pushed within the 10 % band, `MIN_UPDATE_INTERVAL` and
+`MAX_PRICE_DEVIATION_BPS` together can make the correction unreachable in one step
+(the correct value is > 10 % from the wrong baseline). `emergencyUpdateAnswer` bypasses
+both guards for exactly this scenario.
+
+| Function | Caller | Bypasses |
+|----------|--------|---------|
+| `updateAnswer(int256)` | owner (KMS signer) | — |
+| `emergencyUpdateAnswer(int256)` | `emergencyUpdater` (Gnosis Safe multisig) | `MIN_UPDATE_INTERVAL` + `MAX_PRICE_DEVIATION_BPS` |
+
+**Key separation is mandatory.** The `emergencyUpdater` must be a different key from the
+KMS owner. `MAX_PRICE_DEVIATION_BPS` exists specifically to limit damage from a compromised
+KMS key — if both functions shared the same key that protection would be removed.
+Set via `setEmergencyUpdater(address)` (onlyOwner). Pass `address(0)` to disable the path.
+
+`emergencyUpdateAnswer` emits `EmergencyAnswerUpdated` (not `AnswerUpdated`) so monitoring
+rules can alert on any use. Every use should trigger an immediate ops review.
 
 ---
 

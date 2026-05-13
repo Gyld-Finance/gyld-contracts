@@ -111,16 +111,14 @@ contract GyldBondToken is
         __AccessControl_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
-        if (defaultAdmin == address(0) || pauser == address(0)) revert ZeroAddress();
+        if (defaultAdmin == address(0) || pauser == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
         GyldBondTokenStorage storage $ = _getStorage();
         $.isin = isin_;
         $.maturityTimestamp = maturityTimestamp_;
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
         _grantRole(PAUSER_ROLE, pauser);
-        if (sanctionsList_ != address(0)) {
-            $.sanctionsList = ISanctionsList(sanctionsList_);
-            emit SanctionsListUpdated(sanctionsList_);
-        }
+        $.sanctionsList = ISanctionsList(sanctionsList_);
+        emit SanctionsListUpdated(sanctionsList_);
     }
 
     // ── Getters ───────────────────────────────────────────────────────────────
@@ -233,11 +231,10 @@ contract GyldBondToken is
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    /// Fail-closed: reverts if the Chainalysis oracle itself reverts (e.g., oracle down).
+    /// Fail-closed: reverts if `account` is sanctioned, or if the oracle call itself reverts.
+    /// sanctionsList is always non-zero after initialize (enforced there and in setSanctionsList).
     function _requireAccess(address account) internal view {
         ISanctionsList sl = _getStorage().sanctionsList;
-        if (address(sl) != address(0)) {
-            if (sl.isSanctioned(account)) revert AccountSanctioned(account);
-        }
+        if (address(sl) != address(0) && sl.isSanctioned(account)) revert AccountSanctioned(account);
     }
 }

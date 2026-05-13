@@ -88,6 +88,14 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     /// Denominator for basis-point arithmetic (1 bps = 1 / 10_000).
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
+    // ── Emergency updater ─────────────────────────────────────────────────────
+
+    /// Address authorised to call emergencyUpdateAnswer().
+    /// Should be a Gnosis Safe multisig — a DIFFERENT key from the KMS owner so
+    /// a compromised KMS key cannot bypass the deviation / interval guards.
+    /// address(0) means the emergency path is disabled.
+    address private _emergencyUpdater;
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error AnswerMustBePositive();
@@ -96,11 +104,19 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     error HistoricalRoundsNotStored(uint80 requested, uint80 current);
     error NoPriceSet();
     error PriceStale(uint256 updatedAt, uint256 currentTime);
+    error NotEmergencyUpdater();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
     /// Standard Chainlink event emitted on every price update.
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+
+    /// Emitted when the emergency updater address is changed.
+    event EmergencyUpdaterSet(address indexed previous, address indexed newUpdater);
+
+    /// Emitted by emergencyUpdateAnswer() — distinct from AnswerUpdated so
+    /// monitoring rules can alert on any emergency use.
+    event EmergencyAnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -108,6 +124,23 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     /// @param desc          Human-readable description, e.g. "TLT / USD NAV".
     constructor(address initialOwner, string memory desc) Ownable(initialOwner) {
         _description = desc;
+    }
+
+    // ── Emergency updater management ─────────────────────────────────────────
+
+    /// @notice Returns the current emergency updater address.
+    function emergencyUpdater() external view returns (address) {
+        return _emergencyUpdater;
+    }
+
+    /// @notice Set or clear the emergency updater address.
+    /// @dev    Must be a Gnosis Safe multisig — a different key from the KMS
+    ///         owner. A compromised KMS key must not be able to call
+    ///         emergencyUpdateAnswer. Pass address(0) to disable the path.
+    function setEmergencyUpdater(address newUpdater) external onlyOwner {
+        address previous = _emergencyUpdater;
+        _emergencyUpdater = newUpdater;
+        emit EmergencyUpdaterSet(previous, newUpdater);
     }
 
     // ── Price update ──────────────────────────────────────────────────────────
@@ -139,6 +172,22 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         _latestAnswer = answer;
         _updatedAt = block.timestamp;
         emit AnswerUpdated(answer, _roundId, block.timestamp);
+    }
+
+    /// @notice Correct a wrong NAV without the normal interval / deviation guards.
+    /// @dev    Use only when a bad price is stuck — e.g. a fat-finger within the
+    ///         10 % band that makes the correct price unreachable in one step.
+    ///         Caller must be the emergencyUpdater (set via setEmergencyUpdater).
+    ///         Emits EmergencyAnswerUpdated, NOT AnswerUpdated — keep both event
+    ///         types in your monitoring rules so any emergency use pages on-call.
+    ///         Every use should trigger an immediate ops review.
+    function emergencyUpdateAnswer(int256 answer) external {
+        if (msg.sender != _emergencyUpdater) revert NotEmergencyUpdater();
+        if (answer <= 0) revert AnswerMustBePositive();
+        _roundId += 1;
+        _latestAnswer = answer;
+        _updatedAt = block.timestamp;
+        emit EmergencyAnswerUpdated(answer, _roundId, block.timestamp);
     }
 
     // ── AggregatorV3Interface ─────────────────────────────────────────────────
