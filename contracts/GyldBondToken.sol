@@ -198,10 +198,19 @@ contract GyldBondToken is
 
     // ── Compliance management ─────────────────────────────────────────────────
 
+    /// @notice Replace the sanctions oracle with a new implementation.
+    /// @dev    Fail-closed by design: zero-address is explicitly rejected. Disabling the
+    ///         oracle entirely is not permitted — a token with no oracle would silently skip
+    ///         all sanctions checks, which is a greater compliance risk than a frozen token.
+    ///
+    ///         Emergency path if the current oracle is compromised: deploy a new oracle
+    ///         contract (e.g. SanctionsOracleMirror) and call this function with the new
+    ///         address. The oracle is replaced, not removed.
+    ///
+    ///         The candidate address is probed via staticcall before storing — rejects EOAs,
+    ///         wrong contracts, and stubs that don't implement ISanctionsList.
     function setSanctionsList(address newSanctionsList) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newSanctionsList == address(0)) revert ZeroAddress();
-        // Probe the address before storing — rejects EOAs, wrong contracts, and stubs
-        // that don't implement ISanctionsList. Same pattern as registerToken() in IssuanceManager.
         (bool ok, bytes memory data) = newSanctionsList.staticcall(
             abi.encodeWithSignature("isSanctioned(address)", address(0))
         );
