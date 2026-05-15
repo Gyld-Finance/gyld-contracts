@@ -13,6 +13,9 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
+[etherscan]
+sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
+
 [fuzz]
 runs = 10000
 
