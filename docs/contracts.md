@@ -142,6 +142,17 @@ Single gate for primary issuance and redemption of all Gyld bond series.
 7. Backend sends USDC/USD to customer off-chain.
 ```
 
+### Whitelist population — KYC bridge
+
+Addresses enter the whitelist only after KYC approval. The `WHITELIST_ADMIN_ROLE`
+holder (ops multisig) calls `addToWhitelist(wallet)` once the user's
+`token_recipient_address` is known and their `KycCase` is in the `APPROVED` state.
+This is a manual operational step — KYC approval in the backend database does **not**
+automatically update the on-chain whitelist.
+
+See the **KYC approval → on-chain whitelist** section in `docs/architecture.md`
+for the full trigger conditions, timing, and removal procedure.
+
 ### Roles
 
 | Role | Holder | Capability |
@@ -149,8 +160,19 @@ Single gate for primary issuance and redemption of all Gyld bond series.
 | `DEFAULT_ADMIN_ROLE` | TimelockController (prod) | Grant/revoke roles; authorize UUPS upgrades |
 | `SUBSCRIBER_ROLE` | Platform MPC / Fordefi wallet (mint) | `subscribe()` |
 | `REDEEMER_ROLE` | Platform MPC / Fordefi wallet (burn) | `redeem()` |
-| `WHITELIST_ADMIN_ROLE` | Ops | `addToWhitelist()`, `removeFromWhitelist()`, `addToWhitelistBatch()` |
+| `WHITELIST_ADMIN_ROLE` | Ops multisig (prod); deployer EOA (dev/Hoodi) | `addToWhitelist()`, `removeFromWhitelist()`, `addToWhitelistBatch()` |
 | `REGISTRAR_ROLE` | TokenFactory | `registerToken()`, `deregisterToken()` |
+
+`WHITELIST_ADMIN_ROLE` is **not** granted during `initialize()` — it must be
+assigned explicitly after deployment by whoever holds `DEFAULT_ADMIN_ROLE` at
+that point (the deployer EOA, before ownership is handed to the TimelockController).
+`DeployDevNet.s.sol` grants it to the deployer EOA (or `WHITELIST_ADMIN` env var)
+for local dev / Hoodi convenience.
+
+`addToWhitelistBatch(addresses[])` is the preferred path when activating a
+cohort of KYC-approved users at once (e.g. after a batch KYC review session).
+Use `addToWhitelist(address)` for single activations. Both revert atomically
+if any address in the call is `address(0)`.
 
 ### Storage layout
 

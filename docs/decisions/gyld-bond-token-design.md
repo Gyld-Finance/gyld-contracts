@@ -658,3 +658,6 @@ institutional AP model.
 | How is double-burn / replay prevented? | `LedgerRepo` idempotency — every deposit tx hash is stored as `external_ref`; backend exits early if it has already processed that hash. |
 | Is the `beneficiary` parameter enforced on-chain? | Partially — must be a whitelisted AP (on-chain). The amount is not linked to that AP's specific deposit (backend responsibility). |
 | Should a `pendingRedemption` mapping be added to IssuanceManager? | **No.** Would require APs to call `deposit()` instead of plain ERC-20 transfer — a UX breaking change not warranted for institutional APs. |
+| **Whitelist** | |
+| How does an address get onto the whitelist? | After KYC approval, the `WHITELIST_ADMIN_ROLE` holder (ops multisig) calls `addToWhitelist()` or `addToWhitelistBatch()`. See the **KYC approval → on-chain whitelist** section in `docs/architecture.md`. |
+| Is whitelist population automatic on KYC approval? | **No.** It is an explicit operational step. Backend KYC approval does not update the contract state. |
