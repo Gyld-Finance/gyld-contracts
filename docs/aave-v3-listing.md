@@ -218,19 +218,59 @@ PoolConfigurator.configureReserveAsCollateral(TBA, 0, 7500, 10500);
 
 ---
 
-## 7. Immediate Next Actions
+## 7. Why We Cannot Test on Aave Like We Did on Morpho
+
+This is the most important practical constraint for any developer picking this up.
+
+On Morpho we completed a full end-to-end mainnet test in an afternoon:
+- Deployed our token stack
+- Called `createMarket()` from our deployer wallet
+- Seeded the market
+- Got a shareable `app.morpho.org` link with real on-chain activity
+
+**None of that is possible on Aave without going through governance.**
+
+The functions that would do the equivalent — `initReserves()`, `setAssetSources()`,
+`configureReserveAsCollateral()` — are all gated by `POOL_ADMIN` or `ASSET_LISTING_ADMIN`
+roles. On the official Aave V3 Base mainnet deployment those roles are held exclusively by
+Aave governance contracts. No individual or team can call them directly.
+
+The available alternatives and why they fall short:
+
+| Option | Real on-chain? | Official Aave contracts? | Shareable URL? | Verdict |
+|---|---|---|---|---|
+| Local fork test (Path A) | No — local only | Yes — forked from mainnet | No | Good for CI / dev verification only |
+| Own Aave V3 instance on Base Sepolia (Path B) | Yes | No — our own deployment | Via BaseScan only, not `app.aave.com` | 3–5 days setup, no official UI |
+| Official Aave V3 Base mainnet (Path C) | Yes | Yes | Yes — `app.aave.com` | Requires 4–8 week governance vote |
+
+**Conclusion: there is no Morpho-equivalent quick test path on Aave.**
+
+Morpho's permissionless design is what made our 3-step mainnet test possible in hours.
+Aave's shared pool model requires governance precisely because a bad asset or broken oracle
+affects every single depositor in the pool — so listing is strictly controlled.
+
+**The right approach for Aave is:**
+1. Use Path A (fork test) to prove technical compatibility and catch integration bugs early
+2. Pursue Path C (mainnet governance) only when ready for a real production listing —
+   this is a business development and legal process as much as a technical one
+3. Path B (own Aave V3 deployment) is only worth the effort if a public testnet demo
+   is specifically needed and direct contract interaction is acceptable
+
+---
+
+## 8. Immediate Next Actions
 
 | Priority | Action | Path |
 |---|---|---|
 | 1 | Write `AaveV3Integration.t.sol` fork test | Path A |
 | 2 | Confirm `NAVFeedForwarder.latestAnswer()` returns correct price on Base | Path A |
 | 3 | Confirm Aave Pool address (`0xA238Dd...`) is not sanctioned by Chainalysis | Path A |
-| 4 | Decide: do we need a public testnet (Path B) or is fork test sufficient? | Path B |
-| 5 | Commission risk report | Path C pre-req |
+| 4 | Commission risk report from Chaos Labs or BGD Labs | Path C pre-req |
+| 5 | Internal legal sign-off on listing a tokenised bond on a public DeFi protocol | Path C pre-req |
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
 1. **aToken transfers and Chainalysis:** When a user supplies TBA, Aave calls `transferFrom(user, aavePool, amount)` on GyldBondToken. This hits `_update()` which screens both addresses via Chainalysis. Aave Pool should pass. But during liquidation, Aave transfers TBA to the liquidator — if the liquidator is a smart contract, does Chainalysis screen it? Need to verify in fork test.
 
