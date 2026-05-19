@@ -329,6 +329,34 @@ contract GyldBondTokenTest is Test {
         token.burn(ap, 100e18);
     }
 
+    // ── initialize sanctions oracle probe (M-04) ──────────────────────────────
+
+    function test_initialize_eoa_sanctionsList_reverts() public {
+        GyldBondToken impl = new GyldBondToken();
+        address eoa = address(0xEEEE);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, eoa));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Test Bond", "TST", "XX0000000001", 0,
+                address(0xAD), address(0xAD), eoa
+            ))
+        );
+    }
+
+    function test_initialize_wrongContract_sanctionsList_reverts() public {
+        GyldBondToken impl = new GyldBondToken();
+        address wrongContract = address(new MockWrongContract());
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, wrongContract));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Test Bond", "TST", "XX0000000001", 0,
+                address(0xAD), address(0xAD), wrongContract
+            ))
+        );
+    }
+
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
     function test_setSanctionsList_validOracle_succeeds() public {

@@ -112,6 +112,10 @@ contract GyldBondToken is
         __Pausable_init();
         __UUPSUpgradeable_init();
         if (defaultAdmin == address(0) || pauser == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
+        (bool ok, bytes memory data) = sanctionsList_.staticcall(
+            abi.encodeWithSignature("isSanctioned(address)", address(0))
+        );
+        if (!ok || data.length != 32) revert NotValidSanctionsList(sanctionsList_);
         GyldBondTokenStorage storage $ = _getStorage();
         $.isin = isin_;
         $.maturityTimestamp = maturityTimestamp_;

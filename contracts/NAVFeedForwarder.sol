@@ -71,6 +71,10 @@ contract NAVFeedForwarder is Ownable2Step {
         if (initialUpstream == address(0)) revert UpstreamCannotBeZero();
         (bool ok, bytes memory data) = initialUpstream.staticcall(abi.encodeWithSignature("decimals()"));
         if (!ok || data.length != 32 || uint8(data[31]) != 8) revert InvalidOracle(initialUpstream);
+        // Also probe version() — pure constant on any AggregatorV3Interface implementation,
+        // never reverts for business-logic reasons, catches partial stubs that only have decimals().
+        (bool okV, bytes memory dataV) = initialUpstream.staticcall(abi.encodeWithSignature("version()"));
+        if (!okV || dataV.length != 32) revert InvalidOracle(initialUpstream);
         _upstreamOracle = IUpstreamOracle(initialUpstream);
         emit UpstreamOracleUpdated(address(0), initialUpstream);
     }
@@ -91,6 +95,9 @@ contract NAVFeedForwarder is Ownable2Step {
         // (success=false): we require success AND a full 32-byte return value.
         (bool ok, bytes memory data) = newUpstream.staticcall(abi.encodeWithSignature("decimals()"));
         if (!ok || data.length != 32 || uint8(data[31]) != 8) revert InvalidOracle(newUpstream);
+        // Also probe version() to catch partial interface implementations (M-05).
+        (bool okV, bytes memory dataV) = newUpstream.staticcall(abi.encodeWithSignature("version()"));
+        if (!okV || dataV.length != 32) revert InvalidOracle(newUpstream);
         address previous = address(_upstreamOracle);
         _upstreamOracle = IUpstreamOracle(newUpstream);
         emit UpstreamOracleUpdated(previous, newUpstream);

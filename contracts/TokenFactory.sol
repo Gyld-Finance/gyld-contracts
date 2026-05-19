@@ -60,6 +60,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     error IsinAlreadyDeployed(string isin);
     error MissingRegistrarRole(address factory, address issuanceManager);
     error ProxyDeployFailed();
+    error NotValidSanctionsList(address addr);
 
     event TokenDeployed(
         address indexed token,
@@ -70,6 +71,10 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
 
     constructor(address bondTokenLogic_, address sanctionsList_) Ownable(msg.sender) {
         if (bondTokenLogic_ == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
+        (bool ok, bytes memory data) = sanctionsList_.staticcall(
+            abi.encodeWithSignature("isSanctioned(address)", address(0))
+        );
+        if (!ok || data.length != 32) revert NotValidSanctionsList(sanctionsList_);
         bondTokenLogic = bondTokenLogic_;
         sanctionsList  = sanctionsList_;
     }

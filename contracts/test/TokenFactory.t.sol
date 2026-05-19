@@ -111,6 +111,18 @@ contract TokenFactoryTest is Test {
         new TokenFactory(address(bondTokenImpl), address(0));
     }
 
+    function test_constructor_eoa_sanctionsList_reverts() public {
+        address eoa = address(0xEEEE);
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, eoa));
+        new TokenFactory(address(bondTokenImpl), eoa);
+    }
+
+    function test_constructor_wrongContract_sanctionsList_reverts() public {
+        address wrongContract = address(new MockWrongSanctionsList());
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, wrongContract));
+        new TokenFactory(address(bondTokenImpl), wrongContract);
+    }
+
     // ── deployToken input guards ──────────────────────────────────────────────
 
     function test_deployToken_zeroOperator_reverts() public {
@@ -921,3 +933,6 @@ contract MockSanctionsListTest is Test {
         assertFalse(sanctions.isSanctioned(who), "only alice should be sanctioned");
     }
 }
+
+/// @dev A contract with no isSanctioned() — used to test the factory constructor oracle probe.
+contract MockWrongSanctionsList {}

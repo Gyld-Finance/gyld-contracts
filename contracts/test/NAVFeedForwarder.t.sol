@@ -245,6 +245,23 @@ contract NAVFeedForwarderTest is Test {
         vm.expectRevert();
         new NAVFeedForwarder(wrongDecimals, forwarderOwner);
     }
+
+    // ── M-05: partial interface rejection ────────────────────────────────────
+
+    function test_constructor_partialOracle_reverts() public {
+        // Contract implements decimals()=8 but nothing else — passes decimals check,
+        // must fail on version() probe.
+        address stub = address(new MockPartialOracle());
+        vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, stub));
+        new NAVFeedForwarder(stub, forwarderOwner);
+    }
+
+    function test_setUpstreamOracle_partialOracle_reverts() public {
+        address stub = address(new MockPartialOracle());
+        vm.prank(forwarderOwner);
+        vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, stub));
+        forwarder.setUpstreamOracle(stub);
+    }
 }
 
 /// @dev Minimal contract with no oracle interface — used to test invalid oracle rejection.
@@ -253,4 +270,10 @@ contract MockNoOracle {}
 /// @dev Oracle stub that returns decimals() = 18 instead of 8 — used to test decimal check.
 contract MockWrongDecimals {
     function decimals() external pure returns (uint8) { return 18; }
+}
+
+/// @dev Oracle stub that returns decimals()=8 but has no version() — used to test M-05 partial
+///      interface rejection. Passes the decimals check but fails the version() probe.
+contract MockPartialOracle {
+    function decimals() external pure returns (uint8) { return 8; }
 }
