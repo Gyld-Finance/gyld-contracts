@@ -124,51 +124,58 @@ Morpho remains the better protocol for quick permissionless testing with a publi
 
 ---
 
-## 6. What the Deployment Would Look Like (If We Proceed)
+## 6. Completed Deployment on Base Mainnet (2026-05-19)
 
-Unlike Morpho's single `createMarket()`, Euler requires 6 steps:
+All 6 steps executed and verified on Base mainnet. See the individual step docs
+(`euler-base-step1-oracle.md` through `euler-base-step6-seed-and-verify.md`) for
+full transaction hashes.
 
-**Step 1 — Deploy ChainlinkOracle adapter**
-Points at `NAVFeedForwarder`. Configures `maxStaleness` (e.g. 86400 = 24 hours).
-```
-ChainlinkOracle(base=TBA, quote=USDC, feed=NAVFeedForwarder, maxStaleness=86400)
-```
+### Deployed contracts
 
-**Step 2 — Deploy EulerRouter**
-The router dispatches price queries to the right adapter per asset pair.
-```
-oracleRouterFactory.deploy(governor=deployer)
-router.govSetConfig(TBA, USDC, chainlinkAdapter)
-```
+| Step | Contract | Address |
+|---|---|---|
+| 1 | ChainlinkOracle adapter (TBA/USDC) | `0xC976C499a86aDAf73E4b258BDb3EB3A8e5BE134d` |
+| 2 | EulerRouter (retired — missing `govSetResolvedVault`) | `0xe2Cf003AA0855D035c01c32B1cdEb081f7666428` |
+| 3 | KinkIRM (0% → 5%@80% → 100%) | `0xE0EF36466d5d6Fce7764339d278Fe786a4cA573d` |
+| 4 | TBA Escrow Vault | `0x155872FAA8c6C47BAE55cbE14deFb324663ec3F4` |
+| 5a | EulerRouter V2 (active) | `0xBD8535B344293e96C0eFE7E9224aB54CE880471E` |
+| 5b | USDC Lending Vault | `0xCF8930030FbA9c8599A534304B94972762d79F71` |
 
-**Step 3 — Deploy KinkIRM**
-Interest rate model. Parameters: base rate, kink rate, max rate, kink utilisation.
-```
-kinkIRMFactory.deploy(baseRate, kinkRate, maxRate, kinkUtilisation)
-```
+### Verified end-to-end flow
 
-**Step 4 — Deploy escrowed collateral vault for TBA**
-Holds TBA as collateral only — no borrowing out of it, no interest for depositors.
 ```
-eVaultFactory.createProxy(asset=TBA, upgradeable=false)
+Lender:   USDC.approve + lendingVault.deposit(755962 USDC)
+Borrower: TBA.approve + escrowVault.deposit(0.5 TBA)
+          EVC.enableCollateral(deployer, escrowVault)
+          EVC.enableController(deployer, lendingVault)
+          lendingVault.borrow(300000 USDC)
 ```
 
-**Step 5 — Deploy lending vault for USDC**
-This is where borrowers get USDC and lenders earn yield.
-```
-eVaultFactory.createProxy(asset=USDC, upgradeable=false)
-// configure: oracle=router, IRM=kinkIRM, LTV for TBA collateral, caps
-```
+Post-borrow: `totalAssets=755962`, `totalBorrows=300000`, utilisation ~40%.
 
-**Step 6 — Seed USDC into the lending vault**
-Standard ERC-4626 `deposit()` — no special seeding mechanism like Morpho.
-```
-USDC.approve(lendingVault, amount)
-lendingVault.deposit(amount, receiver)
-```
+### Key lessons learned during deployment
 
-After this the vaults are live on-chain. Interaction is via direct contract calls or
-BaseScan until Euler Labs labels them.
+**1. EVK trailingData is 60 bytes, not 40.**
+`createProxy()` expects `abi.encodePacked(asset, oracle, unitOfAccount)` — the
+asset comes FIRST and must be non-zero. Passing only `(oracle, unitOfAccount)`
+(40 bytes) triggers `E_ProxyMetadata()` at initialisation.
+
+**2. EulerRouter needs `govSetResolvedVault()` before governance is renounced.**
+The lending vault calls `oracle.getQuote(shares, escrowVaultAddress, USDC)`. The
+router can only resolve vault shares to underlying TBA if
+`govSetResolvedVault(escrowVault, true)` was called. We missed this in Step 2 and
+had to deploy a replacement router (Router V2) in Step 5.
+
+**3. BaseScan may show "execution reverted" on successful EVault transactions.**
+This is a display artifact. The EVK's deferred liquidity check mechanism (EVC
+calling `checkVaultStatus()` via an internal try/catch probe) produces a sub-call
+revert that BaseScan surfaces as an error — even though the outer transaction
+completed and tokens transferred correctly. Verify success by checking token
+transfer events, not the revert label.
+
+**4. No single-step `createMarket()` equivalent exists on Euler V2.**
+Research confirmed this is the canonical path for any new ERC-20 with a custom
+oracle. There is no shortcut.
 
 ---
 
@@ -208,14 +215,12 @@ V2 response:
 
 | Goal | Best choice |
 |---|---|
-| Quick permissionless mainnet test with shareable UI link | **Morpho Blue** (already done) |
-| Cross-vault collateral (one TBA deposit backs multiple borrows) | Euler V2 |
+| Quick permissionless mainnet test with shareable UI link | **Morpho Blue** (done) |
+| Cross-vault collateral (one TBA deposit backs multiple borrows) | **Euler V2** (done) |
 | Active risk management (adjust LTV/caps over time) | Euler V2 (governed vault) |
 | Production mainnet listing on a well-known protocol UI | Aave V3 (governance) or Euler V2 (with euler-labels PR) |
 
-Euler V2 is technically compatible with our stack and is fully permissionless on Base
-mainnet. The blocker for a Morpho-equivalent test is the UI — not the contracts.
-If Euler Labs labels our vault, the experience becomes comparable to Morpho.
-
-The practical path: complete the Morpho test (done), then pursue Euler if cross-vault
-or governed-vault features become relevant for the product.
+Both Morpho Blue and Euler V2 are now fully deployed and verified on Base mainnet.
+Morpho remains the simpler path for quick UI-visible testing. Euler is the right
+choice if cross-vault collateral or governed risk management becomes a product
+requirement.
