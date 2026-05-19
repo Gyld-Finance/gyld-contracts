@@ -220,41 +220,30 @@ PoolConfigurator.configureReserveAsCollateral(TBA, 0, 7500, 10500);
 
 ## 7. Why We Cannot Test on Aave Like We Did on Morpho
 
-This is the most important practical constraint for any developer picking this up.
+On Morpho we completed a full end-to-end mainnet test in an afternoon because Morpho is
+permissionless — any wallet can call `createMarket()` directly. No approval, no governance,
+no waiting.
 
-On Morpho we completed a full end-to-end mainnet test in an afternoon:
-- Deployed our token stack
-- Called `createMarket()` from our deployer wallet
-- Seeded the market
-- Got a shareable `app.morpho.org` link with real on-chain activity
+**Aave does not work this way. There is no equivalent quick path.**
 
-**None of that is possible on Aave without going through governance.**
+The listing functions — `initReserves()`, `setAssetSources()`, `configureReserveAsCollateral()`
+— are gated by `POOL_ADMIN` and `ASSET_LISTING_ADMIN` roles. On the official Aave V3 Base
+mainnet those roles are held exclusively by Aave governance contracts. No individual, no team,
+no multisig outside of governance can call them.
 
-The functions that would do the equivalent — `initReserves()`, `setAssetSources()`,
-`configureReserveAsCollateral()` — are all gated by `POOL_ADMIN` or `ASSET_LISTING_ADMIN`
-roles. On the official Aave V3 Base mainnet deployment those roles are held exclusively by
-Aave governance contracts. No individual or team can call them directly.
+To list TBA on Aave we must go through the full governance process:
+submit a proposal, pass an on-chain vote with 320,000 AAVE token holder quorum, wait for the
+timelock, and have the governance executor call those functions on our behalf.
+**Minimum 10 days on the fast track. Typically 4–8 weeks.**
 
-The available alternatives and why they fall short:
+There is no testnet shortcut that proves anything on the real Aave contracts.
+A fork test (running locally against a snapshot of mainnet state) can validate technical
+compatibility but is not a real on-chain integration — nothing is broadcast, no real
+transactions exist, no one else can interact with it.
 
-| Option | Real on-chain? | Official Aave contracts? | Shareable URL? | Verdict |
-|---|---|---|---|---|
-| Local fork test (Path A) | No — local only | Yes — forked from mainnet | No | Good for CI / dev verification only |
-| Own Aave V3 instance on Base Sepolia (Path B) | Yes | No — our own deployment | Via BaseScan only, not `app.aave.com` | 3–5 days setup, no official UI |
-| Official Aave V3 Base mainnet (Path C) | Yes | Yes | Yes — `app.aave.com` | Requires 4–8 week governance vote |
-
-**Conclusion: there is no Morpho-equivalent quick test path on Aave.**
-
-Morpho's permissionless design is what made our 3-step mainnet test possible in hours.
-Aave's shared pool model requires governance precisely because a bad asset or broken oracle
-affects every single depositor in the pool — so listing is strictly controlled.
-
-**The right approach for Aave is:**
-1. Use Path A (fork test) to prove technical compatibility and catch integration bugs early
-2. Pursue Path C (mainnet governance) only when ready for a real production listing —
-   this is a business development and legal process as much as a technical one
-3. Path B (own Aave V3 deployment) is only worth the effort if a public testnet demo
-   is specifically needed and direct contract interaction is acceptable
+**Bottom line:** Aave integration is a governance and business development process, not a
+deployment script. The technical work is straightforward once permission is granted.
+The hard part is getting that permission.
 
 ---
 
