@@ -664,6 +664,33 @@ uploaded documents; the gateway flips it to `SUBMITTED` on the first `POST
 transaction. `tier` is set by the provider at approval time; `issuance`
 snapshots `mint_limit` from it when a `MintRequest` row is created.
 
+#### KYC approval → on-chain whitelist
+
+After KYC is approved the user's wallet address must be added to the
+`IssuanceManager` on-chain whitelist before they can subscribe or redeem.
+This is a separate, explicit operational step — approval in the backend
+database does **not** automatically update the contract state.
+
+**Who:** The `WHITELIST_ADMIN_ROLE` holder — an ops multisig in production
+(see `docs/contracts.md` IssuanceManager roles). On Hoodi / staging the
+deployer EOA holds this role for convenience.
+
+**When:** Immediately after `KycCase` transitions to `APPROVED` and the user's
+`token_recipient_address` (chain wallet) is registered. The `KycDriver` tick
+(1 hr) is the latest point at which this can be triggered automatically; a
+manual ops step may be needed before the next tick if faster activation is
+required.
+
+**How:** Call `IssuanceManager.addToWhitelist(walletAddress)` from the ops
+multisig (single address) or `addToWhitelistBatch(addresses[])` when
+batch-approving a cohort of users. Both functions are gated by
+`WHITELIST_ADMIN_ROLE`.
+
+**Removal:** If KYC is revoked or an AP relationship ends, call
+`removeFromWhitelist(walletAddress)` from the ops multisig. Existing
+positions are unaffected; the holder can no longer be named as a recipient
+or beneficiary in future subscribe / redeem calls.
+
 ---
 
 ### Deposit detection (balance-first model)
