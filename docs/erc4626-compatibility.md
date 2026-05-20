@@ -33,6 +33,34 @@ GyldBondToken (ERC-20)       ← underlying asset, unchanged
 
 ---
 
+## Buying and Selling Vault Shares
+
+Vault shares are a separate ERC-20 issued by the vault — they carry none of
+GyldBondToken's compliance mechanics. This makes them freely tradeable.
+
+**Secondary market (DEX / OTC):**
+- Buying or selling vault shares involves no GyldBondToken transfer.
+- No sanctions check, no pause dependency, no whitelist.
+- Vault shares can be listed on any DEX or traded OTC without restriction.
+
+**Minting shares (deposit path):**
+- User calls `vault.deposit(amount, receiver)`.
+- Vault calls `gyldToken.transferFrom(user, vault, amount)`.
+- Sanctions check fires on the user and vault address at this point.
+
+**Burning shares (redeem path):**
+- User calls `vault.redeem(shares, receiver, owner)`.
+- Vault calls `gyldToken.transfer(receiver, amount)`.
+- Sanctions check fires on the receiver at this point.
+
+**Compliance note for legal/compliance team:** A sanctioned address can buy vault
+shares on a secondary market and hold economic exposure to the bond without triggering
+the Chainalysis oracle — the oracle only fires at deposit and redemption, not during
+share-to-share transfers. Whether this is acceptable is a compliance decision, not a
+technical one. The system behaves as designed.
+
+---
+
 ## Known Upstream Properties
 
 Vault builders must document these as upstream risk (not vault bugs):
