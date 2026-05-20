@@ -1,6 +1,6 @@
 # gyld-contracts
 
-On-chain smart contracts for the Gyld tokenized bond platform. One ERC-20 token per bond series, backed 1:1 by securities held in custody off-chain. The [Kaleidoscope](../kaleidoscope) backend orchestrates mint and redemption workflows; these contracts enforce compliance and finality on-chain.
+On-chain smart contracts for the Gyld tokenized bond platform. One ERC-20 token per bond series, backed 1:1 by securities held in custody off-chain. The [Kaleidoscope](https://github.com/Gyld-Finance/kaleidoscope) backend orchestrates mint and redemption workflows; these contracts enforce compliance and finality on-chain.
 
 **Primary chain: Ethereum mainnet.** Solidity `0.8.28`, compiled with Foundry.
 
