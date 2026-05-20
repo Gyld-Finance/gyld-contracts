@@ -30,7 +30,6 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
 ///                                   so DeFi integrations work over weekends and holidays
 ///
-/// @custom:security-contact security@gyld.fi
 
 // ── Chainlink AggregatorV3Interface (inlined — no @chainlink/contracts dep) ──
 interface AggregatorV3Interface {

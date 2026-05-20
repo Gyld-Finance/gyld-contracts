@@ -156,7 +156,6 @@ Prerequisites: [Foundry](https://getfoundry.sh) installed, `ETHERSCAN_API_KEY` s
 
 ## Security
 
-- Security contact: security@gyld.fi
 - All contracts compiled with `via_ir = true`, `optimizer_runs = 200`
 - OpenZeppelin contracts-upgradeable v5 (ERC-7201 namespaced storage)
 - UUPS upgrade path requires TimelockController in production (48-hour recommended delay)

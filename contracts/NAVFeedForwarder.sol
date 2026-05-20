@@ -30,7 +30,6 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///      and latestAnswer() (Aave V3 legacy AggregatorInterface). All calls are
 ///      pure delegations — no local state, no transformation, no caching.
 ///
-/// @custom:security-contact security@gyld.fi
 
 interface IUpstreamOracle {
     function decimals() external view returns (uint8);
