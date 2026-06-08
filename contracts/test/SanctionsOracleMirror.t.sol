@@ -401,4 +401,136 @@ contract SanctionsOracleMirrorTest is Test {
         assertTrue(o2.isSanctioned(sanctioned1));
         assertFalse(o2.isSanctioned(clean));
     }
+
+    // ── renounceRole override ─────────────────────────────────────────────────
+
+    function test_admin_cannotRenounceAdminRole() public {
+        bytes32 adminRole = oracle.DEFAULT_ADMIN_ROLE(); // cache before prank; prank consumed by first call
+        vm.prank(admin);
+        vm.expectRevert(SanctionsOracleMirror.CannotRenounceAdminRole.selector);
+        oracle.renounceRole(adminRole, admin);
+    }
+
+    function test_updater_canRenounceOwnRole() public {
+        bytes32 updaterRole = oracle.SANCTIONS_UPDATER_ROLE();
+        vm.prank(updater);
+        oracle.renounceRole(updaterRole, updater);
+        assertFalse(oracle.hasRole(updaterRole, updater));
+    }
+
+    // ── forwarding oracle failure paths ───────────────────────────────────────
+
+    // Forwarding oracle reverts at lookup time → isSanctioned reverts (fail-closed).
+    // Uses SelectiveRevertingOracle: passes the address(0) probe but reverts on all
+    // other addresses — so it can be set, but real lookups fail.
+    function test_isSanctioned_forwardingOracleReverts_propagates() public {
+        SelectiveRevertingOracle bad = new SelectiveRevertingOracle();
+        vm.prank(admin); oracle.setForwardingOracle(address(bad));
+        vm.expectRevert();
+        oracle.isSanctioned(clean); // non-zero address → oracle reverts → fail-closed
+    }
+
+    // Local true short-circuits before the reverting oracle is called
+    function test_isSanctioned_localTrue_shortCircuitsRevertingOracle() public {
+        SelectiveRevertingOracle bad = new SelectiveRevertingOracle();
+        vm.prank(admin); oracle.setForwardingOracle(address(bad));
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = sanctioned1;
+        vm.prank(updater); oracle.addToSanctionsList(addrs);
+
+        // Must not revert — local check returns true before reaching the bad oracle
+        assertTrue(oracle.isSanctioned(sanctioned1));
+    }
+
+    // Non-canonical bool word (> 1) from forwarding oracle → revert (fail-closed)
+    function test_isSanctioned_nonCanonicalBool_reverts() public {
+        MalformedReturnOracle bad = new MalformedReturnOracle();
+        // Probe also uses same decode — expect revert on setForwardingOracle
+        vm.prank(admin);
+        vm.expectRevert();
+        oracle.setForwardingOracle(address(bad));
+    }
+
+    // Self-destructed oracle (code wiped) → probe rejects it
+    function test_setForwardingOracle_selfDestructedOracle_reverts() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        // Wipe the contract's code with vm.etch — simulates self-destruct
+        vm.etch(address(mock), "");
+
+        // Subsequent isSanctioned call hits codeless address → staticcall ok=true,
+        // data.length=0 → revert InvalidForwardingOracle (fail-closed)
+        vm.expectRevert(
+            abi.encodeWithSelector(SanctionsOracleMirror.InvalidForwardingOracle.selector, address(mock))
+        );
+        oracle.isSanctioned(clean);
+    }
+
+    // ── gas cap ───────────────────────────────────────────────────────────────
+
+    // Gas-griefing oracle is contained — call does not consume unbounded gas
+    function test_isSanctioned_gasGriefingOracle_bounded() public {
+        GasGriefingOracle bad = new GasGriefingOracle();
+        // bad returns a valid false so probe passes
+        vm.prank(admin); oracle.setForwardingOracle(address(bad));
+
+        uint256 gasBefore = gasleft();
+        // Call with ample gas; the griefing oracle tries to burn it all
+        try oracle.isSanctioned{gas: 200_000}(clean) returns (bool) {} catch {}
+        uint256 gasUsed = gasBefore - gasleft();
+
+        // Should use well under 100k despite the oracle attempting to burn 1M+
+        assertLt(gasUsed, 100_000);
+    }
+
+    // ── fuzz: forwarding-path invariant ──────────────────────────────────────
+
+    function testFuzz_forwardingOrLocalTrue_meansTrue(address addr) public {
+        vm.assume(addr != address(0));
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        // local only
+        address[] memory addrs = new address[](1);
+        addrs[0] = addr;
+        vm.prank(updater); oracle.addToSanctionsList(addrs);
+        assertTrue(oracle.isSanctioned(addr));
+
+        // clear local, set forwarding only
+        vm.prank(updater); oracle.removeFromSanctionsList(addrs);
+        mock.setSanctioned(addr, true);
+        assertTrue(oracle.isSanctioned(addr));
+
+        // both clear
+        mock.setSanctioned(addr, false);
+        assertFalse(oracle.isSanctioned(addr));
+    }
+}
+
+// ── Helper contracts for failure-path tests ───────────────────────────────────
+
+// Passes the address(0) probe but reverts for any real address.
+// Models an oracle that is callable but broken for non-zero inputs.
+contract SelectiveRevertingOracle {
+    function isSanctioned(address addr) external pure returns (bool) {
+        if (addr == address(0)) return false;
+        revert("reverts on real addresses");
+    }
+}
+
+contract MalformedReturnOracle {
+    function isSanctioned(address) external pure returns (bytes32) {
+        return bytes32(uint256(2)); // non-canonical bool word
+    }
+}
+
+contract GasGriefingOracle {
+    function isSanctioned(address) external view returns (bool) {
+        // Attempt to burn all gas via an infinite-ish loop
+        uint256 i;
+        while (gasleft() > 100) { unchecked { i++; } }
+        return false;
+    }
 }

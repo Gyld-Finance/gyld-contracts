@@ -69,14 +69,26 @@ contract SanctionsOracleMirror is AccessControl {
         return "Gyld sanctions oracle";
     }
 
+    /// @notice Gas budget forwarded to the forwarding oracle per call.
+    ///         Sized to cover a cold SLOAD + event + overhead with headroom.
+    ///         Keeps a misbehaving/compromised oracle from burning the caller's
+    ///         entire gas and bricking all secondary transfers.
+    uint256 public constant FORWARDING_GAS = 40_000;
+
     /// @notice Returns true if `addr` is sanctioned on the local list OR on the
     ///         forwarding oracle (if configured). Fail-closed: reverts if the
-    ///         forwarding oracle call reverts.
+    ///         forwarding oracle call reverts or returns malformed data.
     function isSanctioned(address addr) public view returns (bool) {
         if (_sanctioned[addr]) return true;
         ISanctionsList fwd = forwardingOracle;
         if (address(fwd) == address(0)) return false;
-        return fwd.isSanctioned(addr);
+        // Low-level staticcall: caps gas, bounds returndata to 32 bytes,
+        // decodes canonically (non-zero word = true; wrong length = revert).
+        (bool ok, bytes memory data) = address(fwd).staticcall{gas: FORWARDING_GAS}(
+            abi.encodeWithSelector(ISanctionsList.isSanctioned.selector, addr)
+        );
+        if (!ok || data.length != 32) revert InvalidForwardingOracle(address(fwd));
+        return abi.decode(data, (bool));
     }
 
     // ── Keeper write interface (SANCTIONS_UPDATER_ROLE) ───────────────────────
@@ -136,12 +148,15 @@ contract SanctionsOracleMirror is AccessControl {
     function _setForwardingOracle(address newOracle) internal {
         if (newOracle == address(this)) revert SelfReferenceOracle();
         if (newOracle != address(0)) {
-            // Probe: must implement isSanctioned(address) returning a bool.
-            // Rejects EOAs, wrong contracts, and self-destructed addresses.
-            (bool ok, bytes memory data) = newOracle.staticcall(
+            // Probe: must implement isSanctioned(address) and return a
+            // canonically-decodable bool. Uses the same gas cap and decode
+            // logic as the runtime path so a probe-passing oracle cannot
+            // revert or return garbage at call time.
+            (bool ok, bytes memory data) = newOracle.staticcall{gas: FORWARDING_GAS}(
                 abi.encodeWithSelector(ISanctionsList.isSanctioned.selector, address(0))
             );
             if (!ok || data.length != 32) revert InvalidForwardingOracle(newOracle);
+            abi.decode(data, (bool)); // canonical bool check — reverts on non-zero word > 1
         }
         emit ForwardingOracleUpdated(address(forwardingOracle), newOracle);
         forwardingOracle = ISanctionsList(newOracle);
