@@ -3,16 +3,18 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
+import {MockSanctionsList} from "./MockSanctionsList.sol";
 
 contract SanctionsOracleMirrorTest is Test {
     event SanctionedAddressesAdded(address[] addrs);
     event SanctionedAddressesRemoved(address[] addrs);
+    event ForwardingOracleUpdated(address indexed previous, address indexed next);
 
     SanctionsOracleMirror oracle;
 
-    address admin   = address(0xA0);
-    address updater = address(0xA1);
-    address stranger = address(0xFF);
+    address admin      = address(0xA0);
+    address updater    = address(0xA1);
+    address stranger   = address(0xFF);
     address newUpdater = address(0xA2);
 
     address sanctioned1 = address(0xBAD1);
@@ -20,7 +22,7 @@ contract SanctionsOracleMirrorTest is Test {
     address clean       = address(0x600D);
 
     function setUp() public {
-        oracle = new SanctionsOracleMirror(admin, updater);
+        oracle = new SanctionsOracleMirror(admin, updater, address(0));
     }
 
     // ── constructor ───────────────────────────────────────────────────────────
@@ -35,18 +37,18 @@ contract SanctionsOracleMirrorTest is Test {
 
     function test_constructor_zeroAdmin_reverts() public {
         vm.expectRevert(SanctionsOracleMirror.ZeroAddress.selector);
-        new SanctionsOracleMirror(address(0), updater);
+        new SanctionsOracleMirror(address(0), updater, address(0));
     }
 
     function test_constructor_zeroUpdater_reverts() public {
         vm.expectRevert(SanctionsOracleMirror.ZeroAddress.selector);
-        new SanctionsOracleMirror(admin, address(0));
+        new SanctionsOracleMirror(admin, address(0), address(0));
     }
 
     // ── name ──────────────────────────────────────────────────────────────────
 
-    function test_name_matchesChainanalysis() public view {
-        assertEq(oracle.name(), "Chainalysis sanctions oracle");
+    function test_name() public view {
+        assertEq(oracle.name(), "Gyld sanctions oracle");
     }
 
     // ── isSanctioned — initial state ──────────────────────────────────────────
@@ -277,5 +279,126 @@ contract SanctionsOracleMirrorTest is Test {
 
         vm.prank(updater); oracle.removeFromSanctionsList(addrs);
         assertFalse(oracle.isSanctioned(addr));
+    }
+
+    // ── forwarding oracle ─────────────────────────────────────────────────────
+
+    function test_setForwardingOracle_adminCanSet() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin);
+        oracle.setForwardingOracle(address(mock));
+        assertEq(address(oracle.forwardingOracle()), address(mock));
+    }
+
+    function test_setForwardingOracle_strangerReverts() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(stranger);
+        vm.expectRevert();
+        oracle.setForwardingOracle(address(mock));
+    }
+
+    function test_setForwardingOracle_emitsEvent() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.expectEmit(true, true, false, false, address(oracle));
+        emit ForwardingOracleUpdated(address(0), address(mock));
+        vm.prank(admin);
+        oracle.setForwardingOracle(address(mock));
+    }
+
+    function test_setForwardingOracle_canBeZeroed() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+        vm.prank(admin); oracle.setForwardingOracle(address(0));
+        assertEq(address(oracle.forwardingOracle()), address(0));
+    }
+
+    function test_setForwardingOracle_selfReferenceReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(SanctionsOracleMirror.SelfReferenceOracle.selector);
+        oracle.setForwardingOracle(address(oracle));
+    }
+
+    function test_setForwardingOracle_invalidContractReverts() public {
+        // EOA has no code — staticcall probe must reject it
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(
+            SanctionsOracleMirror.InvalidForwardingOracle.selector, stranger
+        ));
+        oracle.setForwardingOracle(stranger);
+    }
+
+    // Forwarding: address only on forwarding oracle → isSanctioned returns true
+    function test_isSanctioned_trueFromForwardingOracle() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        mock.setSanctioned(sanctioned1, true);
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        assertTrue(oracle.isSanctioned(sanctioned1));
+    }
+
+    // Forwarding: address only on local list → isSanctioned returns true (no external call)
+    function test_isSanctioned_trueFromLocalList() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = sanctioned1;
+        vm.prank(updater); oracle.addToSanctionsList(addrs);
+
+        assertTrue(oracle.isSanctioned(sanctioned1));
+    }
+
+    // Forwarding: address on both lists → still returns true
+    function test_isSanctioned_trueFromBothLists() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        mock.setSanctioned(sanctioned1, true);
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = sanctioned1;
+        vm.prank(updater); oracle.addToSanctionsList(addrs);
+
+        assertTrue(oracle.isSanctioned(sanctioned1));
+    }
+
+    // Forwarding: clean address on neither list → false
+    function test_isSanctioned_falseOnBothLists() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+        assertFalse(oracle.isSanctioned(clean));
+    }
+
+    // Remove from local list does NOT clear forwarding oracle flag
+    function test_removeFromLocal_doesNotClearForwardingFlag() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        mock.setSanctioned(sanctioned1, true);
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = sanctioned1;
+        vm.prank(updater); oracle.addToSanctionsList(addrs);
+        vm.prank(updater); oracle.removeFromSanctionsList(addrs);
+
+        // local cleared, but forwarding oracle still flags it
+        assertTrue(oracle.isSanctioned(sanctioned1));
+    }
+
+    // After zeroing forwarding oracle, removed-local address is clean
+    function test_zeroForwarding_thenRemovedLocal_isFalse() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        mock.setSanctioned(sanctioned1, true);
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        // Zero out forwarding
+        vm.prank(admin); oracle.setForwardingOracle(address(0));
+        assertFalse(oracle.isSanctioned(sanctioned1));
+    }
+
+    function test_constructor_withForwardingOracle() public {
+        MockSanctionsList mock = new MockSanctionsList();
+        mock.setSanctioned(sanctioned1, true);
+        SanctionsOracleMirror o2 = new SanctionsOracleMirror(admin, updater, address(mock));
+        assertTrue(o2.isSanctioned(sanctioned1));
+        assertFalse(o2.isSanctioned(clean));
     }
 }

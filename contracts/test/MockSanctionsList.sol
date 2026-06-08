@@ -30,4 +30,9 @@ contract MockSanctionsList {
             _sanctioned[addrs[i]] = false;
         }
     }
+
+    /// @dev Test helper — set a single address directly without an array.
+    function setSanctioned(address addr, bool sanctioned) external {
+        _sanctioned[addr] = sanctioned;
+    }
 }
