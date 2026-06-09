@@ -29,7 +29,7 @@ interface ISanctionsList {
 ///         the Chainalysis oracle so GyldBondToken._requireAccess() works unchanged.
 ///
 ///         Access control:
-///           - SANCTIONS_UPDATER_ROLE  → keeper bot hot wallet (write-only)
+///           - SANCTIONS_UPDATER_ROLE  → Forefi/MPC wallet (write-only); refreshes sanctions list weekly/per epoch
 ///           - DEFAULT_ADMIN_ROLE      → compliance ops multisig (Gnosis Safe)
 contract SanctionsOracleMirror is AccessControl {
     bytes32 public constant SANCTIONS_UPDATER_ROLE = keccak256("SANCTIONS_UPDATER_ROLE");
