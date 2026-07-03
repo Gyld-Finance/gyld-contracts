@@ -452,6 +452,49 @@ contract GyldDvpEscrowTest is Test {
         escrow.fill(1, NO_PERMIT());
     }
 
+    function test_fill_navBand_exactEdges() public {
+        // navValue = TOKEN_AMOUNT * NAV / 1e20 = 1_000e6; band at 200 bps = 20e6.
+        // Accept iff navValue - band <= usdc <= navValue + band — pin both edges
+        // exactly. fill() is terminal, so each attempt gets its own termsId.
+        _enableNavBand();
+
+        // Exact upper edge: navValue + band — fills.
+        GyldDvpEscrow.DvpTerms memory t1 = _p2pTerms(1);
+        t1.usdcAmount = 1_020_000_000;
+        _deposit(t1);
+        vm.prank(buyer);
+        escrow.fill(1, NO_PERMIT());
+        assertEq(uint8(escrow.positionOf(1).status), uint8(GyldDvpEscrow.Status.SETTLED));
+
+        // One above the upper edge — out of band.
+        GyldDvpEscrow.DvpTerms memory t2 = _p2pTerms(2);
+        t2.usdcAmount = 1_020_000_001;
+        _deposit(t2);
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldDvpEscrow.NavPriceOutOfBand.selector, 1_020_000_001, 1_000e6)
+        );
+        escrow.fill(2, NO_PERMIT());
+
+        // Exact lower edge: navValue - band — fills.
+        GyldDvpEscrow.DvpTerms memory t3 = _p2pTerms(3);
+        t3.usdcAmount = 980_000_000;
+        _deposit(t3);
+        vm.prank(buyer);
+        escrow.fill(3, NO_PERMIT());
+        assertEq(uint8(escrow.positionOf(3).status), uint8(GyldDvpEscrow.Status.SETTLED));
+
+        // One below the lower edge — out of band.
+        GyldDvpEscrow.DvpTerms memory t4 = _p2pTerms(4);
+        t4.usdcAmount = 979_999_999;
+        _deposit(t4);
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldDvpEscrow.NavPriceOutOfBand.selector, 979_999_999, 1_000e6)
+        );
+        escrow.fill(4, NO_PERMIT());
+    }
+
     function test_fill_navBand_revertsOnStaleFeed() public {
         _enableNavBand();
         _deposit(_p2pTerms(1));
