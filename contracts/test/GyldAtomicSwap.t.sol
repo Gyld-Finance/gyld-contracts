@@ -22,6 +22,8 @@ contract GyldAtomicSwapTest is Test {
         address tokenOut,
         uint256 amountOut
     );
+    // amountIn/amountOut above are the ACTUAL executed amounts (requestedAmountIn and its
+    // derived amountOut) — not the quote's maxAmountIn/price ceiling.
     event QuoteEpochBumped(uint64 indexed newEpoch);
     event VaultUpdated(address indexed previousVault, address indexed newVault);
 
@@ -108,32 +110,59 @@ contract GyldAtomicSwapTest is Test {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// BUY: taker pays 1_000 USDC, receives 10 bond tokens (exactly at NAV).
+    /// BUY: taker may draw up to 1_000 USDC, priced exactly at NAV (10 tokens per 1_000 USDC).
     function _buyQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
+        return _buyQuoteCapped(quoteId, 1_000e6);
+    }
+
+    /// BUY quote with an explicit `maxAmountIn` cap, same $100/token price as `_buyQuote`.
+    function _buyQuoteCapped(uint256 quoteId, uint256 maxAmountIn)
+        internal
+        view
+        returns (GyldAtomicSwap.SwapMessage memory)
+    {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:   quoteId,
-            taker:     taker,
-            tokenIn:   address(usdc),
-            amountIn:  1_000e6,
-            tokenOut:  address(token),
-            amountOut: 10e18,
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     quoteId,
+            taker:       taker,
+            tokenIn:     address(usdc),
+            maxAmountIn: maxAmountIn,
+            tokenOut:    address(token),
+            price:       1e28, // amountOut per 1e18 tokenIn: 10e18 tokens / 1_000e6 USDC * 1e18
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
     }
 
-    /// REDEEM: taker pays 10 bond tokens, receives 1_000 USDC (exactly at NAV).
+    /// REDEEM: taker may draw up to 10 bond tokens, priced exactly at NAV ($100/token).
     function _redeemQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
+        return _redeemQuoteCapped(quoteId, 10e18);
+    }
+
+    /// REDEEM quote with an explicit `maxAmountIn` cap, same $100/token price as `_redeemQuote`.
+    function _redeemQuoteCapped(uint256 quoteId, uint256 maxAmountIn)
+        internal
+        view
+        returns (GyldAtomicSwap.SwapMessage memory)
+    {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:   quoteId,
-            taker:     taker,
-            tokenIn:   address(token),
-            amountIn:  10e18,
-            tokenOut:  address(usdc),
-            amountOut: 1_000e6,
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     quoteId,
+            taker:       taker,
+            tokenIn:     address(token),
+            maxAmountIn: maxAmountIn,
+            tokenOut:    address(usdc),
+            price:       100e6, // amountOut per 1e18 tokenIn: 1_000e6 USDC / 10e18 tokens * 1e18
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
+    }
+
+    /// amountOut a quote's price implies for a given draw, rounded down like the contract.
+    function _impliedAmountOut(GyldAtomicSwap.SwapMessage memory m, uint256 requestedAmountIn)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (requestedAmountIn * m.price) / 1e18;
     }
 
     function _sign(GyldAtomicSwap.SwapMessage memory m, uint256 pk) internal view returns (bytes memory) {
@@ -171,7 +200,7 @@ contract GyldAtomicSwapTest is Test {
         emit SwapExecuted(1, taker, address(usdc), 1_000e6, address(token), 10e18);
 
         vm.prank(taker);
-        swap.executeSwap(m, sig, p);
+        swap.executeSwap(m, sig, p, m.maxAmountIn);
 
         assertEq(usdc.balanceOf(taker),          1_000_000e6 - 1_000e6, "taker USDC not debited");
         assertEq(usdc.balanceOf(address(vault)), 100_000e6 + 1_000e6,   "vault USDC not credited");
@@ -190,10 +219,32 @@ contract GyldAtomicSwapTest is Test {
         usdc.approve(address(swap), 1_000e6);
 
         vm.prank(taker);
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 100e18 + 10e18);
         assertEq(usdc.balanceOf(address(vault)), 100_000e6 + 1_000e6);
+    }
+
+    /// Partial draw: taker requests less than `maxAmountIn`; amountOut derives from `price`.
+    function test_executeSwap_buy_partialDraw_succeeds() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuoteCapped(50, 1_000e6); // cap $1,000
+        uint256 requested = 250e6; // draw a quarter of the cap
+        uint256 expectedOut = _impliedAmountOut(m, requested); // 2.5 tokens
+        bytes memory sig = _sign(m, SIGNER_PK);
+
+        vm.prank(taker);
+        usdc.approve(address(swap), requested);
+
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit SwapExecuted(50, taker, address(usdc), requested, address(token), expectedOut);
+
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), requested);
+
+        assertEq(usdc.balanceOf(taker),          1_000_000e6 - requested,   "taker USDC not debited for partial draw");
+        assertEq(token.balanceOf(taker),          100e18 + expectedOut,     "taker tokens not credited for partial draw");
+        assertEq(usdc.allowance(taker, address(swap)), 0, "unused allowance should be fully consumed by transferFrom");
+        assertTrue(swap.isQuoteUsed(50), "quoteId must be consumed even on a partial draw");
     }
 
     // ── Happy path: REDEEM (bond token in via GyldBondToken permit, USDC out) ─
@@ -207,7 +258,7 @@ contract GyldAtomicSwapTest is Test {
         emit SwapExecuted(3, taker, address(token), 10e18, address(usdc), 1_000e6);
 
         vm.prank(taker);
-        swap.executeSwap(m, sig, p);
+        swap.executeSwap(m, sig, p, m.maxAmountIn);
 
         assertEq(token.balanceOf(taker),          100e18 - 10e18,      "taker tokens not debited");
         assertEq(token.balanceOf(address(vault)), 1_000e18 + 10e18,    "vault collateral not credited");
@@ -226,7 +277,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpired.selector, m.expiry));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     function test_executeSwap_staleEpoch_reverts() public {
@@ -238,7 +289,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(0), uint64(1)));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     function test_executeSwap_replayedQuoteId_reverts() public {
@@ -247,7 +298,7 @@ contract GyldAtomicSwapTest is Test {
         GyldAtomicSwap.PermitData memory p = _signPermit(address(usdc), 1_000e6, block.timestamp + 15 minutes);
 
         vm.prank(taker);
-        swap.executeSwap(m, sig, p);
+        swap.executeSwap(m, sig, p, m.maxAmountIn);
 
         // Same quoteId signed again (even on a different leg) must be rejected.
         GyldAtomicSwap.SwapMessage memory replay = _redeemQuote(6);
@@ -255,7 +306,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteAlreadyUsed.selector, uint256(6)));
-        swap.executeSwap(replay, replaySig, _noPermit());
+        swap.executeSwap(replay, replaySig, _noPermit(), replay.maxAmountIn);
     }
 
     function test_executeSwap_wrongSigner_reverts() public {
@@ -265,7 +316,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteSigner.selector, vm.addr(badPk)));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     function test_executeSwap_wrongTaker_reverts() public {
@@ -274,18 +325,18 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(outsider); // quote pins `taker` — anyone else must be rejected
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NotTaker.selector, taker, outsider));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     function test_executeSwap_tamperedMessage_reverts() public {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(9);
         bytes memory sig = _sign(m, SIGNER_PK);
 
-        m.amountOut = 100e18; // taker tries to get 10x the tokens on a real signature
+        m.price = 100e28; // taker tries to get 10x the tokens on a real signature
 
         vm.prank(taker);
         vm.expectRevert(); // recovered signer is garbage → InvalidQuoteSigner
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     // ── Pause ─────────────────────────────────────────────────────────────────
@@ -299,7 +350,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     /// Asymmetric pause: PAUSER halts but cannot resume; admin resumes.
@@ -318,7 +369,7 @@ contract GyldAtomicSwapTest is Test {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(11);
         bytes memory sig = _sign(m, SIGNER_PK);
         vm.prank(taker); usdc.approve(address(swap), 1_000e6);
-        vm.prank(taker); swap.executeSwap(m, sig, _noPermit());
+        vm.prank(taker); swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
         assertTrue(swap.isQuoteUsed(11));
     }
 
@@ -342,32 +393,74 @@ contract GyldAtomicSwapTest is Test {
 
         // Taker's original transaction still succeeds.
         vm.prank(taker);
-        swap.executeSwap(m, sig, p);
+        swap.executeSwap(m, sig, p, m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 100e18 + 10e18, "swap bricked by permit front-run");
         assertTrue(swap.isQuoteUsed(12));
     }
 
-    // ── Zero amounts ──────────────────────────────────────────────────────────
+    // ── Requested-amount range (capped-allowance SwapMessage) ──────────────────
 
-    function test_executeSwap_zeroAmountIn_reverts() public {
+    function test_executeSwap_zeroRequestedAmountIn_reverts() public {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(13);
-        m.amountIn = 0;
         bytes memory sig = _sign(m, SIGNER_PK);
+        uint256 minAllowed = (m.maxAmountIn * swap.MIN_DRAW_BPS()) / swap.BPS_DENOMINATOR();
 
         vm.prank(taker);
-        vm.expectRevert(GyldAtomicSwap.ZeroAmount.selector);
-        swap.executeSwap(m, sig, _noPermit());
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldAtomicSwap.RequestedAmountOutOfRange.selector, uint256(0), minAllowed, m.maxAmountIn)
+        );
+        swap.executeSwap(m, sig, _noPermit(), 0);
     }
 
-    function test_executeSwap_zeroAmountOut_reverts() public {
+    function test_executeSwap_requestedAmountInBelowDustFloor_reverts() public {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(14);
-        m.amountOut = 0;
+        bytes memory sig = _sign(m, SIGNER_PK);
+        uint256 minAllowed = (m.maxAmountIn * swap.MIN_DRAW_BPS()) / swap.BPS_DENOMINATOR(); // 1% of 1_000e6
+        uint256 dustDraw = minAllowed - 1;
+
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldAtomicSwap.RequestedAmountOutOfRange.selector, dustDraw, minAllowed, m.maxAmountIn)
+        );
+        swap.executeSwap(m, sig, _noPermit(), dustDraw);
+    }
+
+    function test_executeSwap_requestedAmountInAboveMaxAmountIn_reverts() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(15);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        uint256 minAllowed = (m.maxAmountIn * swap.MIN_DRAW_BPS()) / swap.BPS_DENOMINATOR();
+        uint256 overDraw = m.maxAmountIn + 1;
+
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldAtomicSwap.RequestedAmountOutOfRange.selector, overDraw, minAllowed, m.maxAmountIn)
+        );
+        swap.executeSwap(m, sig, _noPermit(), overDraw);
+    }
+
+    function test_executeSwap_zeroPrice_reverts() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(16);
+        m.price = 0;
         bytes memory sig = _sign(m, SIGNER_PK);
 
         vm.prank(taker);
         vm.expectRevert(GyldAtomicSwap.ZeroAmount.selector);
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// A draw so small that `requestedAmountIn * price / 1e18` truncates to zero must
+    /// revert rather than silently move `tokenIn` for zero `tokenOut`. A tiny-enough
+    /// `maxAmountIn` puts even the 1%-dust-floor draw below the rounding threshold.
+    function test_executeSwap_impliedAmountOutRoundsToZero_reverts() public {
+        GyldAtomicSwap.SwapMessage memory m = _redeemQuoteCapped(17, 1e11); // minAllowed = 1e9
+        uint256 minAllowed = (m.maxAmountIn * swap.MIN_DRAW_BPS()) / swap.BPS_DENOMINATOR();
+        assertEq(_impliedAmountOut(m, minAllowed), 0, "test fixture must actually round amountOut to zero");
+        bytes memory sig = _sign(m, SIGNER_PK);
+
+        vm.prank(taker);
+        vm.expectRevert(GyldAtomicSwap.ZeroAmount.selector);
+        swap.executeSwap(m, sig, _noPermit(), minAllowed);
     }
 
     // ── Quote epoch ───────────────────────────────────────────────────────────
@@ -394,13 +487,13 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         swap.bumpQuoteEpoch();
 
-        GyldAtomicSwap.SwapMessage memory m = _buyQuote(15);
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(18);
         m.epoch = 1;
         bytes memory sig = _sign(m, SIGNER_PK);
 
         vm.prank(taker); usdc.approve(address(swap), 1_000e6);
-        vm.prank(taker); swap.executeSwap(m, sig, _noPermit());
-        assertTrue(swap.isQuoteUsed(15));
+        vm.prank(taker); swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(18));
     }
 
     // ── setVault probe ────────────────────────────────────────────────────────
@@ -485,17 +578,18 @@ contract GyldAtomicSwapTest is Test {
     function test_swapMessageTypehash_matchesCanonicalString() public view {
         bytes32 expected = keccak256(
             bytes(
-                "SwapMessage(uint256 quoteId,address taker,address tokenIn,uint256 amountIn,address tokenOut,uint256 amountOut,uint64 expiry,uint64 epoch)"
+                "SwapMessage(uint256 quoteId,address taker,address tokenIn,uint256 maxAmountIn,address tokenOut,uint256 price,uint64 expiry,uint64 epoch)"
             )
         );
         assertEq(swap.SWAP_MESSAGE_TYPEHASH(), expected, "SWAP_MESSAGE_TYPEHASH drifted from canonical type string");
     }
 
     /// Cross-check hashSwapMessage against a hand-built _hashTypedDataV4 equivalent:
-    /// reconstruct the domain separator from name "GyldAtomicSwap" / version "1" and
-    /// the struct hash from the canonical typehash, then assert the contract produces
-    /// the identical digest the off-chain signer would. Guards both the typehash AND
-    /// the EIP-712 domain (name/version/chainId/verifyingContract).
+    /// reconstruct the domain separator from name "GyldAtomicSwap" / version "2" (bumped
+    /// for the capped-allowance breaking wire change) and the struct hash from the
+    /// canonical typehash, then assert the contract produces the identical digest the
+    /// off-chain signer would. Guards both the typehash AND the EIP-712 domain
+    /// (name/version/chainId/verifyingContract).
     function test_hashSwapMessage_matchesHandBuiltDigest() public view {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(100);
 
@@ -506,7 +600,7 @@ contract GyldAtomicSwapTest is Test {
             abi.encode(
                 EIP712_DOMAIN_TYPEHASH,
                 keccak256(bytes("GyldAtomicSwap")),
-                keccak256(bytes("1")),
+                keccak256(bytes("2")),
                 block.chainid,
                 address(swap)
             )
@@ -514,7 +608,7 @@ contract GyldAtomicSwapTest is Test {
         bytes32 structHash = keccak256(
             abi.encode(
                 swap.SWAP_MESSAGE_TYPEHASH(),
-                m.quoteId, m.taker, m.tokenIn, m.amountIn, m.tokenOut, m.amountOut, m.expiry, m.epoch
+                m.quoteId, m.taker, m.tokenIn, m.maxAmountIn, m.tokenOut, m.price, m.expiry, m.epoch
             )
         );
         bytes32 expectedDigest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
@@ -539,7 +633,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureS(bytes32)", highS));
-        swap.executeSwap(m, malleable, _noPermit());
+        swap.executeSwap(m, malleable, _noPermit(), m.maxAmountIn);
     }
 
     /// A zero-length signature is malformed — ECDSA.recover rejects the bad length.
@@ -549,7 +643,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", uint256(0)));
-        swap.executeSwap(m, empty, _noPermit());
+        swap.executeSwap(m, empty, _noPermit(), m.maxAmountIn);
     }
 
     /// A wrong-length (64-byte, truncated) signature is malformed and rejected.
@@ -560,7 +654,7 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", uint256(64)));
-        swap.executeSwap(m, truncated, _noPermit());
+        swap.executeSwap(m, truncated, _noPermit(), m.maxAmountIn);
     }
 
     /// A well-formed signature from a key that does NOT hold QUOTE_SIGNER_ROLE
@@ -574,6 +668,6 @@ contract GyldAtomicSwapTest is Test {
 
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteSigner.selector, vm.addr(strangerPk)));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 }

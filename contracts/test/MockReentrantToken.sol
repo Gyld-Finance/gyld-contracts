@@ -13,9 +13,9 @@ interface ISwapReentryTarget {
         uint256 quoteId;
         address taker;
         address tokenIn;
-        uint256 amountIn;
+        uint256 maxAmountIn;
         address tokenOut;
-        uint256 amountOut;
+        uint256 price;
         uint64 expiry;
         uint64 epoch;
     }
@@ -28,7 +28,12 @@ interface ISwapReentryTarget {
         bytes32 s;
     }
 
-    function executeSwap(SwapMessage calldata m, bytes calldata signature, PermitData calldata permitIn) external;
+    function executeSwap(
+        SwapMessage calldata m,
+        bytes calldata signature,
+        PermitData calldata permitIn,
+        uint256 requestedAmountIn
+    ) external;
 }
 
 /// @dev Malicious ERC-20 used to probe the vault's / swap's nonReentrant guards.
@@ -55,6 +60,7 @@ contract MockReentrantToken is ERC20 {
     // Captured args for the re-entrant executeSwap attempt.
     ISwapReentryTarget.SwapMessage private _msg;
     bytes private _sig;
+    uint256 private _requestedAmountIn;
 
     constructor() ERC20("Malicious Bond", "EVIL") {}
 
@@ -83,11 +89,17 @@ contract MockReentrantToken is ERC20 {
         _amountOut = amountOut_;
     }
 
-    function armExecuteSwap(address swap_, ISwapReentryTarget.SwapMessage calldata m, bytes calldata sig_) external {
+    function armExecuteSwap(
+        address swap_,
+        ISwapReentryTarget.SwapMessage calldata m,
+        bytes calldata sig_,
+        uint256 requestedAmountIn_
+    ) external {
         mode = Mode.ReenterExecuteSwap;
         swapTarget = swap_;
         _msg = m;
         _sig = sig_;
+        _requestedAmountIn = requestedAmountIn_;
     }
 
     /// The hook fires inside the vault's safeTransfer (onSwap leg 2). The re-entrant
@@ -101,7 +113,7 @@ contract MockReentrantToken is ERC20 {
         if (mode == Mode.ReenterOnSwap) {
             IReentryTarget(vaultTarget).onSwap(_taker, _tokenIn, _amountIn, _tokenOut, _amountOut);
         } else if (mode == Mode.ReenterExecuteSwap) {
-            ISwapReentryTarget(swapTarget).executeSwap(_msg, _sig, _emptyPermit());
+            ISwapReentryTarget(swapTarget).executeSwap(_msg, _sig, _emptyPermit(), _requestedAmountIn);
         }
         _entered = false;
     }

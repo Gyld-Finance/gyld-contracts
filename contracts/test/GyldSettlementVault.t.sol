@@ -865,24 +865,24 @@ contract GyldSettlementVaultTest is Test {
             quoteId: 999,
             taker: takerAddr,
             tokenIn: address(usdc),
-            amountIn: 1_000e6,
+            maxAmountIn: 1_000e6,
             tokenOut: address(evil),
-            amountOut: 10e18,
+            price: 10e18 * 1e18 / 1_000e6,
             expiry: uint64(block.timestamp + 15 minutes),
             epoch: 0
         });
         GyldAtomicSwap.SwapMessage memory inner = GyldAtomicSwap.SwapMessage({
-            quoteId: 999, taker: takerAddr, tokenIn: address(usdc), amountIn: 1_000e6,
-            tokenOut: address(evil), amountOut: 10e18,
+            quoteId: 999, taker: takerAddr, tokenIn: address(usdc), maxAmountIn: 1_000e6,
+            tokenOut: address(evil), price: 10e18 * 1e18 / 1_000e6,
             expiry: uint64(block.timestamp + 15 minutes), epoch: 0
         });
         (uint8 iv, bytes32 ir, bytes32 is_) = vm.sign(signerPk, swapContract.hashSwapMessage(inner));
-        evil.armExecuteSwap(address(swapContract), innerStruct, abi.encodePacked(ir, is_, iv));
+        evil.armExecuteSwap(address(swapContract), innerStruct, abi.encodePacked(ir, is_, iv), 1_000e6);
 
         // Outer buy of `evil` — fully valid, reaches the vault push.
         GyldAtomicSwap.SwapMessage memory outer = GyldAtomicSwap.SwapMessage({
-            quoteId: 1, taker: takerAddr, tokenIn: address(usdc), amountIn: 1_000e6,
-            tokenOut: address(evil), amountOut: 10e18,
+            quoteId: 1, taker: takerAddr, tokenIn: address(usdc), maxAmountIn: 1_000e6,
+            tokenOut: address(evil), price: 10e18 * 1e18 / 1_000e6,
             expiry: uint64(block.timestamp + 15 minutes), epoch: 0
         });
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, swapContract.hashSwapMessage(outer));
@@ -895,7 +895,7 @@ contract GyldSettlementVaultTest is Test {
         // ReentrancyGuardReentrantCall from the re-entered executeSwap unwinds the tx.
         vm.prank(takerAddr);
         vm.expectRevert(abi.encodeWithSignature("ReentrancyGuardReentrantCall()"));
-        swapContract.executeSwap(outer, sig, _noPermit());
+        swapContract.executeSwap(outer, sig, _noPermit(), 1_000e6);
 
         assertEq(evil.balanceOf(takerAddr), 0, "reentrancy let inventory escape");
         assertEq(usdc.balanceOf(takerAddr), 1_000e6, "taker USDC moved despite revert");

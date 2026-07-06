@@ -70,15 +70,17 @@ contract GyldAtomicSwap is
 
     /// @notice Off-chain-signed quote. `taker` pins the user (quotes are not bearer
     ///         paper); `epoch` must equal the current quoteEpoch (mass invalidation).
+    ///         `maxAmountIn`/`price` bound a *range* of draws, not one exact amount —
+    ///         see `executeSwap`'s `requestedAmountIn` parameter.
     struct SwapMessage {
-        uint256 quoteId;   // single-use; consumed via the bitmap below
-        address taker;     // must equal msg.sender at execution
-        address tokenIn;   // leg the user pays
-        uint256 amountIn;
-        address tokenOut;  // leg the user receives (vault inventory / USDC pot)
-        uint256 amountOut;
-        uint64  expiry;    // unix seconds
-        uint64  epoch;     // quote-signer generation
+        uint256 quoteId;      // single-use; consumed via the bitmap below, regardless of draw size
+        address taker;        // must equal msg.sender at execution
+        address tokenIn;      // leg the user pays
+        uint256 maxAmountIn;  // ceiling on tokenIn the taker may draw against this quote
+        address tokenOut;     // leg the user receives (vault inventory / USDC pot)
+        uint256 price;        // fixed-point amountOut per 1e18 tokenIn; amountOut = requestedAmountIn * price / 1e18
+        uint64  expiry;       // unix seconds
+        uint64  epoch;        // quote-signer generation
     }
 
     /// @notice Optional EIP-2612 permit for the incoming leg; value == 0 skips.
@@ -90,9 +92,15 @@ contract GyldAtomicSwap is
         bytes32 s;
     }
 
-    // keccak256("SwapMessage(uint256 quoteId,address taker,address tokenIn,uint256 amountIn,address tokenOut,uint256 amountOut,uint64 expiry,uint64 epoch)")
+    // keccak256("SwapMessage(uint256 quoteId,address taker,address tokenIn,uint256 maxAmountIn,address tokenOut,uint256 price,uint64 expiry,uint64 epoch)")
     bytes32 public constant SWAP_MESSAGE_TYPEHASH =
-        0xb61ceb75c757acc060b9f02779e91190b775292df96a4784edff6d184e9b7aa7;
+        0x87423ed2b6ce38b5c2943920bccdd1f9e50d2e0493f61560b2302e7508b52f0b;
+
+    /// @dev Dust floor on `requestedAmountIn`, expressed as basis points of `maxAmountIn`.
+    ///      Prevents a taker griefing the quote-signer's single-use quoteId budget with
+    ///      near-zero-value draws (docs/atomic-settlement.md "Proposed amendment").
+    uint256 public constant MIN_DRAW_BPS      = 100;    // 1%
+    uint256 public constant BPS_DENOMINATOR   = 10_000;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -117,6 +125,7 @@ contract GyldAtomicSwap is
 
     error ZeroAddress();
     error ZeroAmount();
+    error RequestedAmountOutOfRange(uint256 requested, uint256 minAllowed, uint256 maxAllowed);
     error QuoteExpired(uint64 expiry);
     error QuoteEpochStale(uint64 quoteEpoch, uint64 currentEpoch);
     error QuoteAlreadyUsed(uint256 quoteId);
@@ -158,7 +167,7 @@ contract GyldAtomicSwap is
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
-        __EIP712_init("GyldAtomicSwap", "1");
+        __EIP712_init("GyldAtomicSwap", "2"); // v2: capped-allowance SwapMessage (maxAmountIn/price)
         __UUPSUpgradeable_init();
         _setVault(vault_);
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
@@ -183,33 +192,57 @@ contract GyldAtomicSwap is
 
     // ── Swap execution ────────────────────────────────────────────────────────
 
-    /// @notice Settle a platform-signed quote atomically. Pulls `tokenIn` from the
-    ///         caller into the vault, then the vault pushes `tokenOut` to the caller.
-    /// @dev    Verification order: taker binding → amounts → expiry → epoch → EIP-712
-    ///         signature against QUOTE_SIGNER_ROLE → single-use quoteId consumption.
+    /// @notice Settle a platform-signed quote atomically. Pulls `requestedAmountIn` of
+    ///         `tokenIn` from the caller into the vault, then the vault pushes the
+    ///         derived `tokenOut` amount to the caller.
+    /// @dev    Verification order: taker binding → price sanity → requested-amount range
+    ///         → expiry → epoch → EIP-712 signature against QUOTE_SIGNER_ROLE →
+    ///         single-use quoteId consumption → derived-amount sanity. The quoteId is
+    ///         burned in full regardless of how much of `maxAmountIn` is drawn — this is
+    ///         single-shot-capped sizing, not multi-draw (see docs/atomic-settlement.md).
     ///         The optional permit is applied with try/catch so a front-run permit()
     ///         cannot brick the swap (standard griefing mitigation) — the subsequent
     ///         safeTransferFrom enforces the allowance regardless. Real USDC permit is
     ///         non-standard (version "2") and MockUSDC has none, hence optional.
-    /// @param m         The quote message exactly as signed by the quote service.
-    /// @param signature 65-byte ECDSA signature over hashSwapMessage(m).
-    /// @param permitIn  Optional EIP-2612 permit for `m.tokenIn`; permitIn.value == 0 skips.
-    function executeSwap(SwapMessage calldata m, bytes calldata signature, PermitData calldata permitIn)
+    /// @param m                 The quote message exactly as signed by the quote service.
+    /// @param signature         65-byte ECDSA signature over hashSwapMessage(m).
+    /// @param permitIn          Optional EIP-2612 permit for `m.tokenIn`, sized to
+    ///                          `requestedAmountIn` by the taker; permitIn.value == 0 skips.
+    /// @param requestedAmountIn Taker-chosen draw size, NOT part of the signed message.
+    ///                          Must satisfy `0 < minAllowed <= requestedAmountIn <= m.maxAmountIn`,
+    ///                          where minAllowed is a `MIN_DRAW_BPS` dust floor of `maxAmountIn`.
+    function executeSwap(
+        SwapMessage calldata m,
+        bytes calldata signature,
+        PermitData calldata permitIn,
+        uint256 requestedAmountIn
+    )
         external
         nonReentrant
         whenNotPaused
     {
         GyldAtomicSwapStorage storage $ = _getStorage();
 
-        if (m.taker != msg.sender)               revert NotTaker(m.taker, msg.sender);
-        if (m.amountIn == 0 || m.amountOut == 0) revert ZeroAmount();
-        if (block.timestamp > m.expiry)          revert QuoteExpired(m.expiry);
-        if (m.epoch != $.quoteEpoch)             revert QuoteEpochStale(m.epoch, $.quoteEpoch);
+        if (m.taker != msg.sender) revert NotTaker(m.taker, msg.sender);
+        if (m.price == 0)          revert ZeroAmount();
+
+        uint256 minAmountIn = (m.maxAmountIn * MIN_DRAW_BPS) / BPS_DENOMINATOR;
+        if (requestedAmountIn == 0 || requestedAmountIn < minAmountIn || requestedAmountIn > m.maxAmountIn) {
+            revert RequestedAmountOutOfRange(requestedAmountIn, minAmountIn, m.maxAmountIn);
+        }
+
+        if (block.timestamp > m.expiry) revert QuoteExpired(m.expiry);
+        if (m.epoch != $.quoteEpoch)    revert QuoteEpochStale(m.epoch, $.quoteEpoch);
 
         address signer = ECDSA.recover(hashSwapMessage(m), signature);
         if (!hasRole(QUOTE_SIGNER_ROLE, signer)) revert InvalidQuoteSigner(signer);
 
         _consumeQuote($, m.quoteId);
+
+        // Rounds down — vault's favor; a taker-favorable direction would let a taker
+        // extract dust across many small draws (docs/atomic-settlement.md).
+        uint256 amountOut = (requestedAmountIn * m.price) / 1e18;
+        if (amountOut == 0) revert ZeroAmount();
 
         // Optional EIP-2612 permit; try/catch so a front-run permit() cannot brick the
         // swap — safeTransferFrom below still enforces the allowance.
@@ -221,12 +254,12 @@ contract GyldAtomicSwap is
 
         // Leg 1: user → vault. (If tokenIn is a GyldBondToken, its _update screens
         // msg.sender as from, the vault as to, and this contract as spender.)
-        IERC20(m.tokenIn).safeTransferFrom(msg.sender, $.vault, m.amountIn);
+        IERC20(m.tokenIn).safeTransferFrom(msg.sender, $.vault, requestedAmountIn);
 
         // Leg 2: vault validates series + NAV band, then pushes tokenOut to the user.
-        IGyldSettlementVault($.vault).onSwap(msg.sender, m.tokenIn, m.amountIn, m.tokenOut, m.amountOut);
+        IGyldSettlementVault($.vault).onSwap(msg.sender, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
 
-        emit SwapExecuted(m.quoteId, msg.sender, m.tokenIn, m.amountIn, m.tokenOut, m.amountOut);
+        emit SwapExecuted(m.quoteId, msg.sender, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
     }
 
     /// @notice EIP-712 digest for a SwapMessage (off-chain signer parity check).
@@ -237,7 +270,7 @@ contract GyldAtomicSwap is
             keccak256(
                 abi.encode(
                     SWAP_MESSAGE_TYPEHASH,
-                    m.quoteId, m.taker, m.tokenIn, m.amountIn, m.tokenOut, m.amountOut, m.expiry, m.epoch
+                    m.quoteId, m.taker, m.tokenIn, m.maxAmountIn, m.tokenOut, m.price, m.expiry, m.epoch
                 )
             )
         );

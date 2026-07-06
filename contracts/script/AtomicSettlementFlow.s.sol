@@ -168,22 +168,22 @@ contract AtomicSettlementFlow is Script {
         uint256 vaultTokensBeforeBuy = token.balanceOf(address(vault));
 
         GyldAtomicSwap.SwapMessage memory buy = GyldAtomicSwap.SwapMessage({
-            quoteId:   1,
-            taker:     taker,
-            tokenIn:   address(usdc),
-            amountIn:  1_000e6,   // pays 1,000 USDC
-            tokenOut:  address(token),
-            amountOut: 10e18,     // receives 10 bond tokens (exactly at NAV)
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     1,
+            taker:       taker,
+            tokenIn:     address(usdc),
+            maxAmountIn: 1_000e6,   // pays up to 1,000 USDC
+            tokenOut:    address(token),
+            price:       10e18 * 1e18 / 1_000e6, // 10 bond tokens per 1,000 USDC (exactly at NAV)
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
         bytes memory buySig = _sign(swap, SIGNER_PK, buy);
 
         // Taker executes its own swap (msg.sender must == taker). Broadcast AS the taker.
         vm.broadcast(TAKER_PK);
-        usdc.approve(address(swap), buy.amountIn);
+        usdc.approve(address(swap), buy.maxAmountIn);
         vm.broadcast(TAKER_PK);
-        swap.executeSwap(buy, buySig, _noPermit());
+        swap.executeSwap(buy, buySig, _noPermit(), buy.maxAmountIn);
 
         require(token.balanceOf(taker) == 10e18, "BUY: taker did not receive 10 tokens");
         require(token.balanceOf(address(vault)) == vaultTokensBeforeBuy - 10e18, "BUY: vault inventory not debited");
@@ -201,21 +201,21 @@ contract AtomicSettlementFlow is Script {
         uint256 vaultTokensBeforeRedeem = token.balanceOf(address(vault));
 
         GyldAtomicSwap.SwapMessage memory redeem = GyldAtomicSwap.SwapMessage({
-            quoteId:   2,
-            taker:     taker,
-            tokenIn:   address(token),
-            amountIn:  10e18,     // pays back 10 bond tokens
-            tokenOut:  address(usdc),
-            amountOut: 1_000e6,   // receives 1,000 USDC (exactly at NAV)
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     2,
+            taker:       taker,
+            tokenIn:     address(token),
+            maxAmountIn: 10e18,     // pays back up to 10 bond tokens
+            tokenOut:    address(usdc),
+            price:       1_000e6 * 1e18 / 10e18, // 1,000 USDC per 10 bond tokens (exactly at NAV)
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
         bytes memory redeemSig = _sign(swap, SIGNER_PK, redeem);
 
         vm.broadcast(TAKER_PK);
-        token.approve(address(swap), redeem.amountIn);
+        token.approve(address(swap), redeem.maxAmountIn);
         vm.broadcast(TAKER_PK);
-        swap.executeSwap(redeem, redeemSig, _noPermit());
+        swap.executeSwap(redeem, redeemSig, _noPermit(), redeem.maxAmountIn);
 
         require(token.balanceOf(taker) == 0, "REDEEM: taker tokens not debited");
         require(token.balanceOf(address(vault)) == vaultTokensBeforeRedeem + 10e18, "REDEEM: tokens not back in vault");

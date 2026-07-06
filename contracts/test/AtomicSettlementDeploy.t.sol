@@ -153,31 +153,31 @@ contract AtomicSettlementDeployTest is Test {
         usdc.mint(taker, 100_000e6);
     }
 
-    /// BUY: taker pays 1_000 USDC, receives 10 bond tokens (exactly at NAV).
+    /// BUY: taker pays up to 1_000 USDC, receives bond tokens at 1:100 (exactly at NAV).
     function _buyQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:   quoteId,
-            taker:     taker,
-            tokenIn:   address(usdc),
-            amountIn:  1_000e6,
-            tokenOut:  address(token),
-            amountOut: 10e18,
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     quoteId,
+            taker:       taker,
+            tokenIn:     address(usdc),
+            maxAmountIn: 1_000e6,
+            tokenOut:    address(token),
+            price:       10e18 * 1e18 / 1_000e6, // 10e18 tokenOut per 1_000e6 tokenIn
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
     }
 
-    /// REDEEM: taker pays 10 bond tokens, receives 1_000 USDC (exactly at NAV).
+    /// REDEEM: taker pays up to 10 bond tokens, receives USDC at 100:1 (exactly at NAV).
     function _redeemQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:   quoteId,
-            taker:     taker,
-            tokenIn:   address(token),
-            amountIn:  10e18,
-            tokenOut:  address(usdc),
-            amountOut: 1_000e6,
-            expiry:    uint64(block.timestamp + 15 minutes),
-            epoch:     0
+            quoteId:     quoteId,
+            taker:       taker,
+            tokenIn:     address(token),
+            maxAmountIn: 10e18,
+            tokenOut:    address(usdc),
+            price:       1_000e6 * 1e18 / 10e18, // 1_000e6 tokenOut per 10e18 tokenIn
+            expiry:      uint64(block.timestamp + 15 minutes),
+            epoch:       0
         });
     }
 
@@ -195,9 +195,9 @@ contract AtomicSettlementDeployTest is Test {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(quoteId);
         bytes memory sig = _sign(m);
         vm.prank(taker);
-        usdc.approve(address(swap), m.amountIn);
+        usdc.approve(address(swap), m.maxAmountIn);
         vm.prank(taker);
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
     // ── Deployment recipe wiring ──────────────────────────────────────────────
@@ -249,7 +249,7 @@ contract AtomicSettlementDeployTest is Test {
         vm.prank(taker);
         usdc.approve(address(swap), 1_000e6);
         vm.prank(taker);
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 10e18, "taker did not receive tokens");
         assertEq(token.balanceOf(address(vault)), 90e18, "vault inventory not debited");
@@ -276,7 +276,7 @@ contract AtomicSettlementDeployTest is Test {
         vm.prank(taker);
         token.approve(address(swap), 10e18);
         vm.prank(taker);
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 0, "taker tokens not debited");
         assertEq(token.balanceOf(address(vault)), 100e18, "collateral not back in inventory");
@@ -331,7 +331,7 @@ contract AtomicSettlementDeployTest is Test {
         // push must revert AccountSanctioned (bubbled through SafeERC20 + onSwap).
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.AccountSanctioned.selector, taker));
-        swap.executeSwap(m, sig, _noPermit());
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 0, "sanctioned taker received tokens");
     }

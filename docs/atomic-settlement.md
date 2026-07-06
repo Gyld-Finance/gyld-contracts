@@ -225,6 +225,117 @@ staleness alerting is off-chain via `isFresh()`).
 
 ---
 
+## Proposed amendment: capped-allowance `SwapMessage`
+
+> **Status: proposed, 2026-07-06 — not implemented.** No contract or test
+> changes exist yet; this is a scoping note for a specific gap in the current
+> design, not a landed change.
+
+### Motivation
+
+Today `SwapMessage.amountIn`/`amountOut` are literal values the quote signer
+commits to — `executeSwap` moves exactly those numbers or reverts. There is
+no way to sign a quote "up to $1,000" and let the taker draw $100 of it in a
+single call; the taker must know the exact size *before* requesting the
+quote. For AP/LP-sized flows this forces round-tripping the RFQ desk for
+every size change, and wastes quote-signer capacity on quotes that end up
+only partially used.
+
+### Proposed shape
+
+```solidity
+struct SwapMessage {
+    uint256 quoteId;
+    address taker;
+    address tokenIn;
+    uint256 maxAmountIn;   // was `amountIn` — now a ceiling, not an exact value
+    address tokenOut;
+    uint256 price;         // was `amountOut` — fixed-point amountOut per 1e18 tokenIn
+    uint64  expiry;
+    uint64  epoch;
+}
+```
+
+```solidity
+function executeSwap(
+    SwapMessage calldata m,
+    bytes calldata signature,
+    PermitData calldata permitIn,
+    uint256 requestedAmountIn        // NEW: taker-chosen, not part of the signed message
+) external;
+```
+
+Execution:
+
+1. Signature/taker/expiry/epoch checks unchanged.
+2. **New:** `0 < requestedAmountIn <= m.maxAmountIn`, else `AmountOutOfRange`.
+   A `minAmountIn` floor (message field or a protocol-wide constant) belongs
+   alongside this — otherwise a taker can grief the quote-signer's
+   attention/rate-limit budget with near-zero-value draws.
+3. `_consumeQuote(m.quoteId)` — **unchanged**: still one bit, still burned in
+   full regardless of how much of `maxAmountIn` was actually drawn. The quote
+   remains single-use; it cannot be drawn against twice.
+4. `amountOut = requestedAmountIn * m.price / 1e18` — rounded down (vault's
+   favor; a taker-favorable rounding direction turns into per-call dust
+   extraction across many quotes).
+5. Legs 1–2 (`transferFrom` taker→vault, `vault.onSwap`) proceed exactly as
+   today, using `requestedAmountIn`/`amountOut` in place of
+   `m.amountIn`/`m.amountOut`.
+
+### What this does and doesn't fix
+
+- **Fixes:** "quote me up to $1,000 at this price, I'll decide the size when
+  I call `executeSwap`" — one atomic call, taker-chosen size, still exactly
+  one use per quote.
+- **Does not fix:** drawing down the same quote across *multiple*
+  transactions over time (e.g. $100 now, $200 later, $700 tomorrow). That
+  needs remaining-balance tracking (`filled[quoteId] += requestedAmountIn`,
+  invalidated only once `filled == maxAmountIn` or on explicit cancel)
+  instead of the single BitInvalidator bit — a materially bigger change: it
+  swaps a 256-quotes-per-slot bitmap for a per-quote storage counter,
+  re-opens "which fill's NAV/expiry applies to fill #2," and needs its own
+  reentrancy analysis around a mid-lifecycle quote. **Kept as a separate,
+  larger V2 item** (see [flagged follow-ups](#audit-prep-checklist)), not
+  bundled into this amendment.
+
+### Consequences for the rest of the design
+
+- **Breaking wire change.** Repurposing `amountIn`→`maxAmountIn` and
+  `amountOut`→`price` changes `SWAP_MESSAGE_TYPEHASH` and, per house
+  convention, should bump the EIP-712 domain version
+  (`("GyldAtomicSwap", "2")`). Needs the same 3×-independent-recompute
+  discipline as the original constants. Nothing is live yet (doc status:
+  prototype, uncommitted), so this is free to land pre-launch; post-launch it
+  would need a side-by-side versioned domain, not an in-place field rename.
+- **NAV band is unaffected.** The band already checks a ratio
+  (`amountIn`/`amountOut`); `price` *is* that ratio, so `onSwap`'s
+  `QuotePriceOutOfBand` check needs no logic change — only the caller passing
+  the derived `amountOut`.
+- **Permit sizing shifts to the taker.** `permitIn.value` must now cover
+  `requestedAmountIn`, chosen at call time by the taker/wallet — not
+  `maxAmountIn` signed by the platform. Same "signed allowance can exceed
+  actual transfer" pattern already accepted for the existing permit leg (see
+  [observation 3](#audit-prep-checklist)), just applied one layer up.
+- **Rounding/decimal-scaling review needed.** `price` must be scaled
+  consistently across token-decimal pairs (USDC 6dp vs. bond 18dp) with a
+  fixed, audited rounding direction — new arithmetic surface the exact-amount
+  design never had (today the signer does this math off-chain once per
+  quote; here the chain repeats it per call).
+- **Test surface grows.** Every existing `GyldAtomicSwapTest` case built
+  around an exact `amountIn`/`amountOut` needs a companion case at
+  `requestedAmountIn < maxAmountIn`, plus new coverage for the dust floor,
+  `requestedAmountIn == 0`, and `requestedAmountIn > maxAmountIn`.
+
+### Open question before scoping this as real work
+
+Is single-shot-capped sizing (this amendment) actually sufficient, or is the
+real requirement multi-draw-over-time (the bigger remaining-balance design)?
+They solve different problems and shouldn't be conflated in estimation —
+confirm which one the AP/LP flow actually needs before this moves off the
+scoping-note stage.
+
+---
+
 ## Prior-art lineage
 
 All links verified resolving 2026-06-11.
@@ -411,7 +522,9 @@ Scope: the two new contracts + wiring (whitelist grant, `registerSeries`,
       on-chain V1.1 rate limiter in `onSwap` (Ondo
       `InstantMintTimeBasedRateLimiter` pattern; if a min size is added, keep
       min < cap remainder — the Ondo Medium); ERC-7540 request queue for LP
-      exits (V2).
+      exits (V2); capped-allowance `SwapMessage` for taker-sized single-use
+      fills, see [Proposed amendment](#proposed-amendment-capped-allowance-swapmessage)
+      (plus its own larger V2: multi-draw remaining-balance tracking).
 
 ---
 
@@ -428,7 +541,7 @@ owns the following:
 | **1 — Hoodi** | Deploy via the script to chain 560048, KMS quote signer; publish proxy addresses in `docs/blockchain-status.md` | Manual `executeSwap` BUY succeeds on Hoodi with a hand-signed quote; `hashSwapMessage` parity verified |
 | **5 — Audit** | External audit of the two contracts + wiring, packet per the [checklist](#audit-prep-checklist); add the `StdInvariant` suite; remediation commits re-run the full suite | Report closed, no highs/criticals outstanding |
 | **5 — Mainnet** | Deploy with timelock admin, Fordefi signing, real USDC + Chainalysis live, dust seed, conservative caps; rehearse pause + key-rotation drills on Hoodi first | 1-week limited-notional canary clean (zero recon incidents); caps raised to policy targets |
-| **V1.1 / V2 (flagged)** | On-chain rate limiter in `onSwap`; ERC-7540 LP exit queue | Separate issues + audit deltas |
+| **V1.1 / V2 (flagged)** | On-chain rate limiter in `onSwap`; ERC-7540 LP exit queue; [capped-allowance `SwapMessage`](#proposed-amendment-capped-allowance-swapmessage) for taker-sized fills + its own V2 multi-draw remaining-balance tracking | Separate issues + audit deltas |
 
 Phases 2–4 (everything off-chain) gate on Phase 1's Hoodi addresses but the
 external audit can start immediately after Phase 1 lands — the final report
