@@ -3,11 +3,6 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-/// @dev Minimal view of the contracts a reentrant token attempts to re-enter.
-interface IReentryTarget {
-    function onSwap(address taker, address tokenIn, uint256 amountIn, address tokenOut, uint256 amountOut) external;
-}
-
 interface ISwapReentryTarget {
     struct SwapMessage {
         uint256 quoteId;
@@ -36,26 +31,20 @@ interface ISwapReentryTarget {
     ) external;
 }
 
-/// @dev Malicious ERC-20 used to probe the vault's / swap's nonReentrant guards.
-///      On every transfer/transferFrom it attempts to re-enter a configured target
-///      (the vault's onSwap, or the swap's executeSwap). The re-entrant call MUST
-///      revert (ReentrancyGuardReentrantCall), which — because the attack is wired
-///      inside the token's transfer hook — bubbles up and reverts the whole tx.
-///      Reports 18 decimals so it can pose as a bond series.
+/// @dev Malicious ERC-20 used to probe the swap's nonReentrant guard. On every
+///      transfer/transferFrom it attempts to re-enter the swap's executeSwap. The
+///      re-entrant call MUST revert (ReentrancyGuardReentrantCall), which — because
+///      the attack is wired inside the token's transfer hook — bubbles up and reverts
+///      the whole tx. Reports 18 decimals so it can pose as a bond series.
 contract MockReentrantToken is ERC20 {
-    enum Mode { Off, ReenterOnSwap, ReenterExecuteSwap }
+    enum Mode {
+        Off,
+        ReenterExecuteSwap
+    }
 
     Mode public mode;
-    address public vaultTarget;
     address public swapTarget;
     bool private _entered; // prevents infinite recursion in our OWN hook
-
-    // Captured args for the re-entrant onSwap attempt.
-    address private _taker;
-    address private _tokenIn;
-    uint256 private _amountIn;
-    address private _tokenOut;
-    uint256 private _amountOut;
 
     // Captured args for the re-entrant executeSwap attempt.
     ISwapReentryTarget.SwapMessage private _msg;
@@ -72,23 +61,6 @@ contract MockReentrantToken is ERC20 {
         _mint(to, amount);
     }
 
-    function armOnSwap(
-        address vault_,
-        address taker_,
-        address tokenIn_,
-        uint256 amountIn_,
-        address tokenOut_,
-        uint256 amountOut_
-    ) external {
-        mode = Mode.ReenterOnSwap;
-        vaultTarget = vault_;
-        _taker = taker_;
-        _tokenIn = tokenIn_;
-        _amountIn = amountIn_;
-        _tokenOut = tokenOut_;
-        _amountOut = amountOut_;
-    }
-
     function armExecuteSwap(
         address swap_,
         ISwapReentryTarget.SwapMessage calldata m,
@@ -102,17 +74,14 @@ contract MockReentrantToken is ERC20 {
         _requestedAmountIn = requestedAmountIn_;
     }
 
-    /// The hook fires inside the vault's safeTransfer (onSwap leg 2). The re-entrant
-    /// call hits a contract that is already mid-onSwap / mid-executeSwap, so the
-    /// nonReentrant guard reverts — which propagates out of this transfer and reverts
-    /// the entire enclosing transaction.
+    /// The hook fires inside the swap's safeTransfer (executeSwap leg 2). The re-entrant
+    /// call hits a contract that is already mid-executeSwap, so the nonReentrant guard
+    /// reverts — which propagates out of this transfer and reverts the enclosing tx.
     function _update(address from, address to, uint256 value) internal override {
         super._update(from, to, value);
         if (_entered) return;
         _entered = true;
-        if (mode == Mode.ReenterOnSwap) {
-            IReentryTarget(vaultTarget).onSwap(_taker, _tokenIn, _amountIn, _tokenOut, _amountOut);
-        } else if (mode == Mode.ReenterExecuteSwap) {
+        if (mode == Mode.ReenterExecuteSwap) {
             ISwapReentryTarget(swapTarget).executeSwap(_msg, _sig, _emptyPermit(), _requestedAmountIn);
         }
         _entered = false;

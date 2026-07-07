@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {GyldAtomicSwap} from "../GyldAtomicSwap.sol";
-import {GyldSettlementVault} from "../GyldSettlementVault.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
@@ -13,67 +12,69 @@ import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {MockUSDCPermit} from "./MockUSDCPermit.sol";
 
 /// @title AtomicSettlementDeployTest
-/// @notice Integration test for the DeployAtomicSettlement recipe against REAL
-///         contracts (no token/feed mocks). setUp replicates a minimal DeployDevNet
+/// @notice Integration test for the self-custodial DeployAtomicSettlement recipe against
+///         REAL contracts (no token/feed mocks). setUp replicates a minimal DeployDevNet
 ///         stack (IssuanceManager proxy + MockSanctionsList + TokenFactory deploying
 ///         a real GyldBondToken/KaleidoscopeNAVFeed/NAVFeedForwarder triple), then
-///         runs DeployAtomicSettlement steps 1–6 inline. Step 7 (timelock handover)
-///         is intentionally skipped — the dev path — so the test contract keeps
-///         DEFAULT_ADMIN on vault + swap, standing in for the script broadcaster.
+///         runs the DeployAtomicSettlement steps inline. The timelock handover is
+///         intentionally skipped — the dev path — so the test contract keeps
+///         DEFAULT_ADMIN on the swap, standing in for the script broadcaster.
 ///
-///         End-to-end coverage: BUY via the real IssuanceManager.subscribe mint
-///         path, REDEEM via the real forwardForBurn → IssuanceManager.redeem burn
-///         commitment path (BurnWatcher-compatible), and the Chainalysis fail-closed
-///         screen on the vault → taker push.
+///         End-to-end coverage: BUY via the real IssuanceManager.subscribe mint path
+///         (inventory minted directly into the SWAP), REDEEM against the swap's own
+///         inventory + a treasurer withdraw() of the returned collateral to the fixed
+///         withdrawalWallet (the off-chain broker bridge), and the Chainalysis
+///         fail-closed screen on the swap → taker push.
 contract AtomicSettlementDeployTest is Test {
-    IssuanceManager     issuanceMgr;
-    TokenFactory        factory;
-    GyldBondToken       token;
+    IssuanceManager issuanceMgr;
+    TokenFactory factory;
+    GyldBondToken token;
     KaleidoscopeNAVFeed navFeed;
-    address             forwarder;
-    GyldSettlementVault vault;
-    GyldAtomicSwap      swap;
-    MockUSDCPermit      usdc;
-    MockSanctionsList   mockSanctions;
+    address forwarder;
+    GyldAtomicSwap swap;
+    MockUSDCPermit usdc;
+    MockSanctionsList mockSanctions;
 
     // The test contract itself is the "deployer/broadcaster": IssuanceManager
-    // DEFAULT_ADMIN + WHITELIST_ADMIN, factory owner, vault/swap DEFAULT_ADMIN.
-    address pauser       = address(0xA1); // PAUSER_ROLE on vault + swap; token operator
-    address treasurer    = address(0xA2); // vault TREASURER_ROLE
-    address subscriber   = address(0xA3); // IssuanceManager SUBSCRIBER_ROLE
-    address redeemer     = address(0xA4); // IssuanceManager REDEEMER_ROLE
+    // DEFAULT_ADMIN + WHITELIST_ADMIN, factory owner, swap DEFAULT_ADMIN.
+    address pauser = address(0xA1); // PAUSER_ROLE on swap; token operator
+    address treasurer = address(0xA2); // swap TREASURER_ROLE
+    address subscriber = address(0xA3); // IssuanceManager SUBSCRIBER_ROLE
+    address redeemer = address(0xA4); // IssuanceManager REDEEMER_ROLE
     address navFeedOwner = address(0xA5); // KaleidoscopeNAVFeed owner (KMS stand-in)
-    address lp           = address(0xB0); // vault LP_ROLE
+    address withdrawal = address(0xB1); // fixed treasury withdrawal destination
 
     // Known private keys — vm.addr(PK) is the corresponding address.
     // SIGNER_PK signs SwapMessages (QUOTE_SIGNER_ROLE); TAKER_PK is the end user.
     uint256 constant SIGNER_PK = 0x516E5;
-    uint256 constant TAKER_PK  = 0xA11CE;
-    address          signer;
-    address          taker;
+    uint256 constant TAKER_PK = 0xA11CE;
+    address signer;
+    address taker;
 
     // NAV $100.00 per token (8dp): 1e18 token ⇔ 100e6 USDC. Quotes below sit
-    // exactly on NAV — inside the vault's 2% band.
+    // exactly on NAV — inside the swap's 2% band.
     int256 constant NAV = 100e8;
-
-    // Dust seed deposit (DUST_DEPOSIT_USDC analog): 1 USDC in 6dp units.
-    uint256 constant DUST = 1e6;
-    uint256 dustShares;
+    uint16 constant MAX_BPS = 200; // 2% band
+    uint32 constant MAX_NAV_AGE = 1 days;
 
     function setUp() public {
         vm.warp(1_750_000_000); // realistic timestamp so expiry math is meaningful
         signer = vm.addr(SIGNER_PK);
-        taker  = vm.addr(TAKER_PK);
+        taker = vm.addr(TAKER_PK);
 
         // ── Minimal DevNet stack (mirrors DeployDevNet; no timelock — the test
         //    contract stays factory owner so deployToken is called directly) ─────
         mockSanctions = new MockSanctionsList();
-        usdc          = new MockUSDCPermit();
+        usdc = new MockUSDCPermit();
 
-        issuanceMgr = IssuanceManager(address(new ERC1967Proxy(
-            address(new IssuanceManager()),
-            abi.encodeCall(IssuanceManager.initialize, (address(this), subscriber, redeemer))
-        )));
+        issuanceMgr = IssuanceManager(
+            address(
+                new ERC1967Proxy(
+                    address(new IssuanceManager()),
+                    abi.encodeCall(IssuanceManager.initialize, (address(this), subscriber, redeemer))
+                )
+            )
+        );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), address(this));
 
         factory = new TokenFactory(address(new GyldBondToken()), address(mockSanctions));
@@ -89,95 +90,82 @@ contract AtomicSettlementDeployTest is Test {
             address(issuanceMgr),
             navFeedOwner
         );
-        token     = GyldBondToken(token_);
-        navFeed   = KaleidoscopeNAVFeed(navFeed_);
+        token = GyldBondToken(token_);
+        navFeed = KaleidoscopeNAVFeed(navFeed_);
         forwarder = forwarder_;
 
         // Initial NAV push by the feed owner — first update has no interval/deviation guard.
         vm.prank(navFeedOwner);
         navFeed.updateAnswer(NAV);
 
-        // ── DeployAtomicSettlement steps 1–7 inline ───────────────────────────
+        // ── DeployAtomicSettlement steps inline (self-custodial) ──────────────
 
-        // 1. Vault impl + proxy; deployer (this) is DEFAULT_ADMIN during setup.
-        vault = GyldSettlementVault(address(new ERC1967Proxy(
-            address(new GyldSettlementVault()),
-            abi.encodeCall(
-                GyldSettlementVault.initialize,
-                (address(this), pauser, treasurer, address(usdc), address(issuanceMgr))
+        // 1. Swap impl + proxy; deployer (this) is DEFAULT_ADMIN during setup.
+        swap = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(new GyldAtomicSwap()),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (address(this), pauser, signer, treasurer, address(usdc), MAX_BPS, MAX_NAV_AGE)
+                    )
+                )
             )
-        )));
+        );
 
-        // 2. Swap impl + proxy; initialize probes vault.totalAssets().
-        swap = GyldAtomicSwap(address(new ERC1967Proxy(
-            address(new GyldAtomicSwap()),
-            abi.encodeCall(GyldAtomicSwap.initialize, (address(this), pauser, signer, address(vault)))
-        )));
+        // 2. Whitelist the SWAP as an AP on the IssuanceManager — the only touch on
+        //    existing contracts; lets subscribe() mint inventory directly to the swap.
+        issuanceMgr.addToWhitelist(address(swap));
 
-        // 3. Wire vault → swap (probes SWAP_MESSAGE_TYPEHASH, grants SWAP_ROLE atomically).
-        vault.setSwap(address(swap));
-
-        // 4. Whitelist the vault as an AP on the IssuanceManager — the only touch
-        //    on existing contracts; lets subscribe() mint inventory to the vault.
-        issuanceMgr.addToWhitelist(address(vault));
-
-        // 5. Register the series with the REAL forwarder looked up from the factory
+        // 3. Register the series with the REAL forwarder looked up from the factory
         //    (registerSeries probes forwarder.decimals() == 8 on-chain).
-        vault.registerSeries(address(token), factory.forwarderOf(address(token)));
+        swap.registerSeries(address(token), factory.forwarderOf(address(token)));
 
-        // 6. LP_ROLE grants + dust seed deposit from the broadcaster.
-        bytes32 lpRole = vault.LP_ROLE();
-        vault.grantRole(lpRole, lp);
-        vault.grantRole(lpRole, address(this));
-        usdc.mint(address(this), DUST);
-        usdc.approve(address(vault), DUST);
-        dustShares = vault.deposit(DUST);
+        // 4. Set the fixed treasury withdrawal wallet + allowlist the taker.
+        swap.setWithdrawalWallet(withdrawal);
+        swap.setAllowed(taker, true);
 
-        // 7. Timelock handover intentionally SKIPPED (dev path: TIMELOCK_ADDRESS
+        // 5. Timelock handover intentionally SKIPPED (dev path: TIMELOCK_ADDRESS
         //    unset) — the deployer keeps DEFAULT_ADMIN, asserted in the wiring test.
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Inventory via the REAL mint path (vault is a whitelisted AP) + LP liquidity.
+    /// Inventory via the REAL mint path (swap is a whitelisted AP) + USDC liquidity
+    /// funded directly into the swap.
     function _seedInventoryAndLiquidity() internal {
         vm.prank(subscriber);
-        issuanceMgr.subscribe(address(token), address(vault), 100e18); // 100 tokens @ $100
+        issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens @ $100 minted to the swap
 
-        usdc.mint(lp, 10_000e6);
-        vm.startPrank(lp);
-        usdc.approve(address(vault), 10_000e6);
-        vault.deposit(10_000e6);
-        vm.stopPrank();
-
+        usdc.mint(address(swap), 10_000e6); // USDC liquidity for the redeem leg
         usdc.mint(taker, 100_000e6);
     }
 
     /// BUY: taker pays up to 1_000 USDC, receives bond tokens at 1:100 (exactly at NAV).
     function _buyQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:     quoteId,
-            taker:       taker,
-            tokenIn:     address(usdc),
+            quoteId: quoteId,
+            taker: taker,
+            tokenIn: address(usdc),
             maxAmountIn: 1_000e6,
-            tokenOut:    address(token),
-            price:       10e18 * 1e18 / 1_000e6, // 10e18 tokenOut per 1_000e6 tokenIn
-            expiry:      uint64(block.timestamp + 15 minutes),
-            epoch:       0
+            tokenOut: address(token),
+            price: 10e18 * 1e18 / 1_000e6, // 10e18 tokenOut per 1_000e6 tokenIn
+            expiry: uint64(block.timestamp + 15 minutes),
+            epoch: 0
         });
     }
 
     /// REDEEM: taker pays up to 10 bond tokens, receives USDC at 100:1 (exactly at NAV).
     function _redeemQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
-            quoteId:     quoteId,
-            taker:       taker,
-            tokenIn:     address(token),
+            quoteId: quoteId,
+            taker: taker,
+            tokenIn: address(token),
             maxAmountIn: 10e18,
-            tokenOut:    address(usdc),
-            price:       1_000e6 * 1e18 / 10e18, // 1_000e6 tokenOut per 10e18 tokenIn
-            expiry:      uint64(block.timestamp + 15 minutes),
-            epoch:       0
+            tokenOut: address(usdc),
+            price: 1_000e6 * 1e18 / 10e18, // 1_000e6 tokenOut per 10e18 tokenIn
+            expiry: uint64(block.timestamp + 15 minutes),
+            epoch: 0
         });
     }
 
@@ -202,29 +190,27 @@ contract AtomicSettlementDeployTest is Test {
 
     // ── Deployment recipe wiring ──────────────────────────────────────────────
 
-    function test_deployRecipe_wiresVaultSwapWhitelistAndSeries() public view {
-        // Step 3: vault ↔ swap wiring; SWAP_ROLE held by the swap proxy only.
-        assertEq(vault.swap(), address(swap), "vault.swap() != swap proxy");
-        assertTrue(vault.hasRole(vault.SWAP_ROLE(), address(swap)), "swap proxy lacks SWAP_ROLE");
-        assertEq(swap.vault(), address(vault), "swap.vault() != vault proxy");
+    function test_deployRecipe_wiresSwapWhitelistSeriesAndTreasury() public view {
+        // Swap holds its own inventory and is a whitelisted AP (subscribe mint recipient).
+        assertTrue(issuanceMgr.whitelisted(address(swap)), "swap not whitelisted as AP");
 
-        // Step 4: vault is a whitelisted AP; the swap contract deliberately is NOT.
-        assertTrue(issuanceMgr.whitelisted(address(vault)), "vault not whitelisted as AP");
-        assertFalse(issuanceMgr.whitelisted(address(swap)), "swap must NOT be whitelisted");
-
-        // Step 5: series registered with the factory's REAL forwarder.
-        assertTrue(vault.registeredSeries(address(token)), "series not registered");
-        assertEq(vault.navForwarderOf(address(token)), forwarder, "forwarder mismatch");
+        // Series registered with the factory's REAL forwarder.
+        assertTrue(swap.registeredSeries(address(token)), "series not registered");
+        assertEq(swap.navForwarderOf(address(token)), forwarder, "forwarder mismatch");
         assertEq(factory.forwarderOf(address(token)), forwarder, "factory forwarder mapping drift");
         assertEq(factory.navFeedOf(address(token)), address(navFeed), "factory navFeed mapping drift");
 
-        // Step 6: dust deposit produced shares; vault values exactly the dust.
-        assertGt(dustShares, 0, "dust deposit produced zero shares");
-        assertEq(vault.totalAssets(), DUST, "totalAssets != dust seed");
+        // Band params, withdrawal wallet, allowlist.
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS, "band bps mismatch");
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE, "nav age mismatch");
+        assertEq(swap.usdc(), address(usdc), "usdc mismatch");
+        assertEq(swap.withdrawalWallet(), withdrawal, "withdrawalWallet mismatch");
+        assertTrue(swap.isAllowed(taker), "taker not allowlisted");
 
-        // Step 7 skipped: deployer keeps DEFAULT_ADMIN on both proxies (dev path).
-        assertTrue(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), address(this)), "deployer lost vault admin");
+        // Roles: deployer keeps DEFAULT_ADMIN (dev path); treasurer holds TREASURER_ROLE.
         assertTrue(swap.hasRole(swap.DEFAULT_ADMIN_ROLE(), address(this)), "deployer lost swap admin");
+        assertTrue(swap.hasRole(swap.TREASURER_ROLE(), treasurer), "treasurer lacks TREASURER_ROLE");
+        assertTrue(swap.hasRole(swap.QUOTE_SIGNER_ROLE(), signer), "signer lacks QUOTE_SIGNER_ROLE");
 
         // DevNet base wiring: token registered + IssuanceManager holds mint/burn.
         assertTrue(issuanceMgr.registeredTokens(address(token)), "token not registered with manager");
@@ -237,12 +223,11 @@ contract AtomicSettlementDeployTest is Test {
     function test_e2e_buy_inventoryFromRealSubscribeMint() public {
         _seedInventoryAndLiquidity();
 
-        // Real mint path landed: 100 tokens minted by IssuanceManager.subscribe.
-        assertEq(token.balanceOf(address(vault)), 100e18, "subscribe mint did not land in vault");
+        // Real mint path landed: 100 tokens minted by IssuanceManager.subscribe to the swap.
+        assertEq(token.balanceOf(address(swap)), 100e18, "subscribe mint did not land in swap");
         assertEq(token.totalSupply(), 100e18);
 
-        uint256 vaultUsdcBefore = usdc.balanceOf(address(vault)); // dust + LP deposit
-        uint256 totalAssetsBefore = vault.totalAssets();
+        uint256 swapUsdcBefore = usdc.balanceOf(address(swap)); // seeded liquidity
 
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(1);
         bytes memory sig = _sign(m);
@@ -252,26 +237,22 @@ contract AtomicSettlementDeployTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 10e18, "taker did not receive tokens");
-        assertEq(token.balanceOf(address(vault)), 90e18, "vault inventory not debited");
+        assertEq(token.balanceOf(address(swap)), 90e18, "swap inventory not debited");
         assertEq(usdc.balanceOf(taker), 100_000e6 - 1_000e6, "taker USDC not debited");
-        assertEq(usdc.balanceOf(address(vault)), vaultUsdcBefore + 1_000e6, "vault USDC not credited");
+        assertEq(usdc.balanceOf(address(swap)), swapUsdcBefore + 1_000e6, "swap USDC not credited");
         assertEq(token.totalSupply(), 100e18, "buy must not mint or burn");
         assertTrue(swap.isQuoteUsed(1), "quoteId not consumed");
-
-        // Quote at exact NAV: USDC in exactly replaces inventory out.
-        assertEq(vault.totalAssets(), totalAssetsBefore, "buy at NAV moved totalAssets");
     }
 
-    // ── E2E REDEEM through the burn-commitment path ───────────────────────────
+    // ── E2E REDEEM against swap inventory + treasurer withdraw bridge ──────────
 
-    function test_e2e_redeem_forwardForBurn_redeemAndRepay() public {
+    function test_e2e_redeem_thenTreasurerWithdrawsCollateral() public {
         _seedInventoryAndLiquidity();
         _executeBuy(1); // taker now holds 10e18
 
-        // 1. Taker swaps tokens back for USDC at NAV.
+        // 1. Taker swaps tokens back for USDC at NAV — collateral re-enters swap inventory.
         GyldAtomicSwap.SwapMessage memory m = _redeemQuote(2);
         bytes memory sig = _sign(m);
-        uint256 totalAssetsBefore = vault.totalAssets();
 
         vm.prank(taker);
         token.approve(address(swap), 10e18);
@@ -279,44 +260,33 @@ contract AtomicSettlementDeployTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 0, "taker tokens not debited");
-        assertEq(token.balanceOf(address(vault)), 100e18, "collateral not back in inventory");
+        assertEq(token.balanceOf(address(swap)), 100e18, "collateral not back in inventory");
         assertEq(usdc.balanceOf(taker), 100_000e6, "taker did not get full round trip");
-        assertEq(vault.totalAssets(), totalAssetsBefore, "redeem at NAV moved totalAssets");
 
-        // 2. Treasurer forwards NET collateral for burn — the on-chain commitment
-        //    signal the backend BurnWatcher consumes (tokens land at the manager).
+        // 2. Treasurer evacuates the returned NET collateral out to the fixed
+        //    withdrawalWallet — off-chain ops then bridges it to the IssuanceManager
+        //    for the BurnWatcher commitment. withdraw() can only ever send to the
+        //    admin-fixed wallet.
         vm.prank(treasurer);
-        vault.forwardForBurn(address(token), 10e18);
+        swap.withdraw(address(token), 10e18);
 
-        assertEq(token.balanceOf(address(issuanceMgr)), 10e18, "commitment not at IssuanceManager");
-        assertEq(token.balanceOf(address(vault)), 90e18);
-        (, uint256 buyback) = vault.obligationsOf(address(token));
-        assertEq(buyback, 1_000e6, "buyback receivable != NAV value"); // 10e18 * 100e8 / 1e20
-        assertEq(vault.totalAssets(), totalAssetsBefore, "forwardForBurn moved totalAssets");
+        assertEq(token.balanceOf(withdrawal), 10e18, "collateral not delivered to withdrawalWallet");
+        assertEq(token.balanceOf(address(swap)), 90e18, "swap not debited by withdraw");
 
-        // 3. Redeemer burns from the manager's own balance (proves the existing
-        //    BurnWatcher-compatible commitment path works for vault-forwarded tokens).
+        // 3. Off-chain, ops forwards the collateral to the IssuanceManager and the
+        //    redeemer burns it (the existing BurnWatcher-compatible commitment path).
+        //    Simulate the bridge: withdrawalWallet transfers to the manager, redeemer burns.
+        vm.prank(withdrawal);
+        token.transfer(address(issuanceMgr), 10e18);
         issuanceMgr.addToWhitelist(taker); // beneficiary must be a whitelisted AP
         vm.prank(redeemer);
         issuanceMgr.redeem(address(token), taker, 10e18);
 
         assertEq(token.balanceOf(address(issuanceMgr)), 0, "burn did not consume manager balance");
         assertEq(token.totalSupply(), 90e18, "supply not reduced by burn");
-        assertEq(vault.totalAssets(), totalAssetsBefore, "off-vault burn moved totalAssets");
-
-        // 4. Treasurer repays USDC from the T+2 broker sale — obligation closes.
-        usdc.mint(treasurer, 1_000e6);
-        vm.startPrank(treasurer);
-        usdc.approve(address(vault), 1_000e6);
-        vault.repayUsdc(address(token), 1_000e6);
-        vm.stopPrank();
-
-        (, buyback) = vault.obligationsOf(address(token));
-        assertEq(buyback, 0, "buyback obligation not closed");
-        assertEq(vault.totalAssets(), totalAssetsBefore, "repayUsdc moved totalAssets");
     }
 
-    // ── Sanctions integration: fail-closed on the vault → taker push ──────────
+    // ── Sanctions integration: fail-closed on the swap → taker push ───────────
 
     function test_executeSwap_sanctionedTaker_revertsFailClosed() public {
         _seedInventoryAndLiquidity();
@@ -327,8 +297,9 @@ contract AtomicSettlementDeployTest is Test {
         vm.prank(taker);
         usdc.approve(address(swap), 1_000e6);
 
-        // The USDC leg has no screen; the bond token's _update on the vault → taker
-        // push must revert AccountSanctioned (bubbled through SafeERC20 + onSwap).
+        // The USDC leg has no screen; the bond token's _update on the swap → taker
+        // push must revert AccountSanctioned (bubbled through SafeERC20). The taker is
+        // already allowlisted, so the revert comes from the sanctions screen, not NotAllowed.
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.AccountSanctioned.selector, taker));
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
