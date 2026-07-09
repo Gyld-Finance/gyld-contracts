@@ -159,3 +159,16 @@ Prerequisites: [Foundry](https://getfoundry.sh) installed, `ETHERSCAN_API_KEY` s
 - All contracts compiled with `via_ir = true`, `optimizer_runs = 200`
 - OpenZeppelin contracts-upgradeable v5 (ERC-7201 namespaced storage)
 - UUPS upgrade path requires TimelockController in production (48-hour recommended delay)
+
+---
+
+## License
+
+Core protocol contracts (`GyldAtomicSwap`, `GyldBondToken`, `IssuanceManager`,
+`TokenFactory`, `NAVFeedForwarder`, `SanctionsOracleMirror`,
+`KaleidoscopeNAVFeed`) are licensed under [Business Source
+License 1.1](LICENSE) (`BUSL-1.1`). Source is available for review, testing,
+and non-production use; production use requires a commercial license from
+Gyld Finance until the Change Date (2028-07-09), after which these files
+convert to `GPL-2.0-or-later`. Test and deployment-script files under
+`contracts/test/` and `contracts/script/` remain `MIT`.
