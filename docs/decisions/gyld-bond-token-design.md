@@ -4,6 +4,11 @@
 **Date:** 2026-05-06  
 **Applies to:** `contracts/GyldBondToken.sol`, `contracts/IssuanceManager.sol`, `contracts/TokenFactory.sol`
 
+> **Update (GYL-956):** Section 3 below was narrowed to permit a display-only UI
+> scaling multiplier (ERC-8056). The core prohibition — no multiplier or rebasing
+> that affects real `balanceOf`/`totalSupply` — still stands unchanged. See the
+> new subsection at the end of Section 3.
+
 ---
 
 ## 1. Compliance: Chainalysis only — no internal blacklist
@@ -180,9 +185,12 @@ The NAV feed says "each unit is worth $X today."
 ### What we deliberately do NOT have
 
 - No `shares` internal accounting
-- No `multiplier` or NAV accrual inside the token
+- No multiplier or NAV accrual that affects REAL balances (`balanceOf`/`totalSupply`)
+  inside the token. (GYL-956 added a narrow, display-only exception that does not
+  touch real balances — see "GYL-956 addendum" below.)
 - No `burnShares()` / `redeemShares()` / `transferShares()` / `sharesOf()`
-- No `MULTIPLIER_UPDATER_ROLE`
+- No role that can move REAL balances via a multiplier. (`UI_MULTIPLIER_ROLE`,
+  added in GYL-956, is display-only and cannot affect `balanceOf`/`totalSupply`.)
 - No rebasing — the number of tokens in a wallet never changes from NAV movement
 
 ### Why
@@ -214,6 +222,47 @@ The NAV feed says "each unit is worth $X today."
 - NAV updates go to `KaleidoscopeNAVFeed.updateAnswer()` — never into the token contract.
 - The backend always burns by token amount (`burn_token(contract, from, amount)`) via
   `IChain`. There is no `burn_shares` port method and there should never be one.
+
+### GYL-956 addendum: a narrow, display-only exception (ERC-8056)
+
+**What was added:** `uiMultiplier` (18-dp fixed point, default `1e18`), gated by a
+dedicated `UI_MULTIPLIER_ROLE`, plus read-only views `balanceOfUI()`,
+`totalSupplyUI()`, `toUIAmount()`, `fromUIAmount()`, and a `UIMultiplierUpdated`
+event. ERC-165 advertises support via a minimal `IERC8056` interface.
+
+**Why this is not the multiplier/rebasing system prohibited above:** the
+prohibition in this section is about REAL accounting — anything that changes what
+`balanceOf()`/`totalSupply()` return, or what `transfer()`/`mint()`/`burn()` move.
+None of that changed. `uiMultiplier` only feeds a parallel set of `*UI()` view
+functions that recompute a scaled number on every call; the underlying ERC-20
+storage and every existing function are untouched byte-for-byte. This is the same
+"units vs. price-per-unit" split described for `KaleidoscopeNAVFeed` in Section 4
+— `uiMultiplier` is simply a second, on-token mirror of that same NAV ratio, kept
+for wallets/explorers that want a single-call scaled balance instead of a second
+contract read against the NAV feed.
+
+**Purpose:** industry precedent (e.g. Ondo Global Markets' tokenized equities) puts
+this scaling factor directly on the ERC-20 via the ERC-8056 standard so
+ERC-8056-aware wallets can auto-detect and display "current value" without a
+bespoke integration. `KaleidoscopeNAVFeed`/`NAVFeedForwarder` remain the sole
+source of truth for anything transactional (`GyldAtomicSwap`'s NAV-band and
+staleness checks, `SwapQuoteService` pricing, etc.) — this addition changes
+nothing about how trades are priced or settled.
+
+**Consequences for developers:**
+
+- Do not read `balanceOfUI()`/`totalSupplyUI()` anywhere that needs real
+  accounting. `HoldingsReconciliationDriver`, `SupplyReconciliationDriver`, and
+  `HolderBalancesDriver` must keep reading raw `balanceOf()`/`Transfer` events —
+  pointing any of them at the UI views would corrupt reconciliation.
+- `setUiMultiplier()` should only ever be called by the same off-chain process
+  that publishes to `KaleidoscopeNAVFeed`, using the identical value and the
+  identical circuit-breaker guardrails (10% max deviation, 1h min interval) so the
+  two numbers can never drift apart. That driver wiring is a follow-up (GYL-956
+  Rust-side work), not yet implemented as of this addendum.
+- Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`
+  to prevent `toUIAmount`/`fromUIAmount` from dividing by zero or displaying a
+  permanently-zeroed balance.
 
 ---
 
@@ -634,7 +683,7 @@ institutional AP model.
 | Question | Answer |
 |---|---|
 | **Token model** | |
-| Does the token have shares / multiplier / rebasing? | **No. Never.** Plain OZ ERC-20. Balances change only via mint/burn. |
+| Does the token have shares / multiplier / rebasing? | **No REAL multiplier/rebasing affecting balances.** Plain OZ ERC-20 — `balanceOf`/`totalSupply` change only via mint/burn. A **display-only** `uiMultiplier` (GYL-956) exists purely for `balanceOfUI()`/`totalSupplyUI()`; it cannot affect real accounting. |
 | Where does NAV / value accrual live? | `KaleidoscopeNAVFeed` oracle only — never inside the token. |
 | Are `burnShares`, `transferShares`, `sharesOf` in the contract? | **No.** Deliberately absent — no share system, no dust residual problem. |
 | Is there a `MULTIPLIER_UPDATER_ROLE`? | **No.** Removed with the multiplier system. |
