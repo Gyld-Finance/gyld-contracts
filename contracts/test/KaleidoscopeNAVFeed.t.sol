@@ -487,6 +487,54 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.setEmergencyUpdater(newOwner);
     }
 
+    // ── key separation: owner() != emergencyUpdater (GYL-961) ─────────────────
+
+    function test_setEmergencyUpdater_ownerAddressReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.setEmergencyUpdater(owner);
+    }
+
+    function test_transferOwnership_toEmergencyUpdaterReverts() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.transferOwnership(emergencyUpdater);
+    }
+
+    function test_acceptOwnership_intoEmergencyUpdaterReverts() public {
+        // Drive the completion funnel (_transferOwnership) directly: start a
+        // transfer to `newOwner`, THEN promote that same address to emergency
+        // updater, so the fail-fast transferOwnership guard is bypassed and the
+        // invariant must be caught at acceptOwnership().
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        vm.prank(owner);
+        feed.setEmergencyUpdater(newOwner);
+        vm.prank(newOwner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.acceptOwnership();
+    }
+
+    function test_renounceOwnership_stillWorks() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.renounceOwnership();
+        assertEq(feed.owner(), address(0));
+    }
+
+    function test_transferOwnership_toDifferentAddressStillWorks() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        feed.acceptOwnership();
+        assertEq(feed.owner(), newOwner);
+    }
+
     // ── emergencyUpdateAnswer — access control ────────────────────────────────
 
     function test_emergencyUpdateAnswer_strangerReverts() public {
