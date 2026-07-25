@@ -12,10 +12,11 @@ import {TokenFactory} from "../TokenFactory.sol";
 /// @title DeployDevNet
 /// @notice Deploys the Kaleidoscope token stack to Anvil / Hoodi using GyldBondToken.
 ///
-/// Compliance: each token reads directly from the Chainalysis sanctions oracle (read-only).
-/// On devnet/Hoodi a MockSanctionsList is deployed so the gateway `mock_sanction_address`
-/// endpoint can flip addresses without a real Chainalysis account.
-/// On mainnet pass the real Chainalysis address via SANCTIONS_LIST env var.
+/// Compliance: each token reads from the configured on-chain sanctions oracle (read-only).
+/// On every production EVM chain — including Ethereum mainnet — that is the
+/// platform-operated SanctionsOracleMirror, passed in via the SANCTIONS_LIST env var
+/// (GYL-1051). On devnet/Hoodi a MockSanctionsList is deployed instead so the gateway
+/// `mock_sanction_address` endpoint can flip addresses without a live oracle.
 ///
 /// Role model — each role gets a dedicated address, all fall back to deployer in dev:
 ///
@@ -68,9 +69,6 @@ import {TokenFactory} from "../TokenFactory.sol";
 ///   TOKEN_C                  — Citigroup Inc 3.887% 2028 (CUSIP 172967LD1)
 ///   TOKEN_KO                 — Coca-Cola Co 2.25% 2032 (CUSIP 191216DP2)
 contract DeployDevNet is Script {
-    /// Real Chainalysis oracle on Ethereum mainnet.
-    address constant CHAINALYSIS_MAINNET = 0x40C57923924B5c5c5455c48D93317139ADDaC8fb;
-
     function run() external {
         // Each role resolves to its own env var, falling back to msg.sender so that
         // `forge script ... --private-key <deployer>` works with zero config in dev.
@@ -128,12 +126,13 @@ contract DeployDevNet is Script {
 
         console.log("ISSUANCE_MANAGER=%s", address(issuanceMgr));
 
-        // 5. Sanctions oracle: use SANCTIONS_LIST env var if set; otherwise deploy
-        //    MockSanctionsList on devnet. Blocked on mainnet — wiring a platform-controlled
-        //    mock would silently defeat the compliance model.
+        // 5. Sanctions oracle: use SANCTIONS_LIST env var if set — on production chains that
+        //    is the platform SanctionsOracleMirror address; otherwise deploy MockSanctionsList
+        //    on devnet. Blocked on mainnet — wiring a mock would silently defeat the
+        //    compliance model.
         address sanctionsOracle = _envOrDefault("SANCTIONS_LIST", address(0));
         if (sanctionsOracle == address(0)) {
-            require(block.chainid != 1, "DeployDevNet: set SANCTIONS_LIST=<chainalysis_address> on mainnet");
+            require(block.chainid != 1, "DeployDevNet: set SANCTIONS_LIST=<sanctions_oracle> on mainnet");
             MockSanctionsList mock = new MockSanctionsList();
             sanctionsOracle = address(mock);
             console.log("MOCK_SANCTIONS_ADDRESS=%s", sanctionsOracle);

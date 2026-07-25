@@ -29,7 +29,7 @@ On-chain smart contracts for the Gyld tokenized bond platform. One ERC-20 token 
                     │        │                     │              │
                     │   GyldBondToken proxy    whitelist (APs)    │
                     │   (per bond series)           │              │
-                    │        │               Chainalysis oracle   │
+                    │        │           SanctionsOracleMirror    │
                     │        └───────────────(on-chain sanctions) │
                     └─────────────────────────────────────────────┘
                                             │
@@ -44,12 +44,12 @@ On-chain smart contracts for the Gyld tokenized bond platform. One ERC-20 token 
 
 | Contract | Purpose |
 |---|---|
-| `GyldBondToken` | ERC-20 per bond series. UUPS-upgradeable. Chainalysis sanctions check on every transfer. Pausable by ops multisig. |
+| `GyldBondToken` | ERC-20 per bond series. UUPS-upgradeable. On-chain sanctions check against the configured platform oracle on every transfer. Pausable by ops multisig. |
 | `IssuanceManager` | Single mint/burn gate for all bond series. Only whitelisted Authorised Participants (APs) may receive minted tokens or be recorded as redemption beneficiaries. |
 | `TokenFactory` | Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed, NAVFeedForwarder)` triple atomically and wires all roles in one transaction. |
 | `KaleidoscopeNAVFeed` | Chainlink `AggregatorV3Interface`-compatible NAV oracle. The Kaleidoscope backend pushes daily NAV prices here. 10% max deviation guard, 1-hour min update interval. |
 | `NAVFeedForwarder` | Permanent, stable oracle address that forwards price reads to an upgradeable upstream oracle. DeFi protocols (Morpho, Aave) point at this — never at `KaleidoscopeNAVFeed` directly. |
-| `SanctionsOracleMirror` | Mirror of the Chainalysis oracle for chains where Chainalysis has not deployed natively. A keeper bot syncs OFAC deltas every 4 hours. |
+| `SanctionsOracleMirror` | The platform sanctions oracle on **every** production EVM chain, including Ethereum mainnet (GYL-1051). A keeper bot syncs OFAC deltas every 4 hours into its local list; an optional gas-capped, fail-closed `forwardingOracle` can chain to a vendor oracle. |
 
 ---
 
@@ -98,10 +98,10 @@ Token addresses are deterministic: `TokenFactory.predictTokenAddress()` returns 
 
 ## Compliance Model
 
-- **Sanctions check:** Every `transfer` and `transferFrom` on `GyldBondToken` calls the Chainalysis on-chain oracle. Fail-closed — if the oracle reverts, the transfer reverts. Mint and burn skip the oracle; the Kaleidoscope backend screens APs off-chain before calling `subscribe` / `redeem`.
+- **Sanctions check:** Every `transfer` and `transferFrom` on `GyldBondToken` calls the configured on-chain sanctions oracle (the platform `SanctionsOracleMirror`). Fail-closed — if the oracle reverts, the transfer reverts. Mint and burn skip the oracle; the Kaleidoscope backend screens APs off-chain before calling `subscribe` / `redeem`.
 - **Pause:** `PAUSER_ROLE` (ops multisig) can halt all token movement immediately. Pause stops mint, burn, transfer, approve, and permit.
 - **AP whitelist:** Only whitelisted addresses may receive primary issuance or be the recorded beneficiary of a redemption. Secondary ERC-20 transfers have no whitelist restriction.
-- **No internal blocklist:** Sanctions decisions are delegated entirely to Chainalysis. If the on-chain oracle is compromised or unavailable, deploy a `SanctionsOracleMirror` and call `GyldBondToken.setSanctionsList()`.
+- **No internal blocklist:** The token carries no blocked-address mapping; sanctions decisions are delegated entirely to the configured on-chain oracle — the platform-operated `SanctionsOracleMirror`, which mirrors approved OFAC/SDN data and never adds addresses at platform discretion. To rotate oracle contracts, call `GyldBondToken.setSanctionsList()` (timelock-gated).
 
 ---
 

@@ -1,13 +1,30 @@
 # Decision: SanctionsOracleMirror — sanctions compliance on L2 chains
 
-**Status:** Adopted  
+**Status:** Superseded (GYL-1051, 2026-07-25)  
 **Date:** 2026-05-08  
 **Applies to:** `contracts/SanctionsOracleMirror.sol`, `contracts/test/SanctionsOracleMirror.t.sol`  
-**Linear:** GYL-282
+**Linear:** GYL-282, superseded by GYL-1051
+
+> **Superseded (GYL-1051, 2026-07-25).** The platform-operated
+> `SanctionsOracleMirror` is the production sanctions oracle on **every** EVM chain,
+> **including Ethereum mainnet**. This document's founding premise — that mainnet
+> uses the Chainalysis-operated oracle directly and the mirror exists only for
+> chains where Chainalysis has not deployed — no longer holds, and neither does its
+> "deployment gap adapter" framing (§4) or its retire-the-mirror migration
+> direction (§9), which is now inverted. The rationale below was accurate when
+> written and is retained as a dated record; do not treat it as current policy.
+>
+> **Live record:** the root-repo ADR `docs/decisions/sanctions-oracle-mirror.md`.
+> Access control (§5), keeper design (§6) and the not-a-blacklist argument (§4's
+> first half) carry over unchanged — only the *which chain uses which oracle*
+> question was reversed.
 
 ---
 
 ## 1. The problem — Chainalysis oracle is mainnet-only
+
+> Superseded — see banner. Chainalysis mainnet availability is no longer the
+> deciding factor; the platform mirror is the configured oracle on every chain.
 
 `GyldBondToken` relies exclusively on the Chainalysis on-chain sanctions oracle for
 every secondary transfer check. The call is:
@@ -100,6 +117,11 @@ This is the most important design constraint. The CLAUDE.md hard rule is:
 - **Deterministic delta.** The keeper computes `new_addresses = ofac_current - mirror_current`
   and calls `addToSanctionsList(new_addresses)`. There is no human review step that could
   introduce platform-subjective blocking.
+
+> Superseded — see banner. The mirror is the **primary platform sanctions oracle**
+> on every chain, not a deployment gap adapter, and it is not retired when a vendor
+> oracle becomes available on a chain. The not-a-blacklist reasoning above still
+> holds; the paragraph below does not.
 
 If Chainalysis were to deploy their oracle on Mantle, we would switch `GyldBondToken`'s
 `sanctionsList` pointer to the Chainalysis address and retire the mirror. The mirror is a
@@ -197,6 +219,11 @@ same fail-closed behaviour (if the mirror contract itself reverts, the transfer 
 ---
 
 ## 9. Upgrade and migration path
+
+> Superseded — see banner. The migration direction below is **inverted**: the
+> platform does not migrate off the mirror onto a vendor oracle. A vendor oracle
+> may be consumed *through* the mirror's optional gas-capped `forwardingOracle`,
+> and `setSanctionsList()` is used to rotate between platform oracle contracts.
 
 If Chainalysis deploys their oracle on Mantle:
 

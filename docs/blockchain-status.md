@@ -62,21 +62,25 @@ the full breakdown.
 
 | Contract | File | Origin | Upgrade | Purpose |
 |----------|------|--------|---------|---------|
-| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; Chainalysis sanctions oracle |
+| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; reads the configured platform sanctions oracle |
 | `IssuanceManager` | `contracts/IssuanceManager.sol` | Platform (MIT) | UUPS | AP whitelist; mint (subscribe) and burn (redeem) gate |
 | `TokenFactory` | `contracts/TokenFactory.sol` | Platform (MIT) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series |
 | `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (MIT) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
 | `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (MIT) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
-| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the Chainalysis on-chain oracle |
+| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the on-chain sanctions oracle |
+| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Platform-operated Chainalysis-compatible sanctions oracle (local list + optional composite forwarding) |
 
-**Compliance model:** `GyldBondToken` reads directly from the Chainalysis on-chain sanctions
-oracle (`0x40C57923924B5c5c5455c48D93317139ADDaC8fb` on mainnet). There is no internal
-blocklist — sanctions decisions are made by the oracle. Secondary transfers fail-closed:
-if the oracle call reverts, the transfer reverts.
+**Compliance model:** `GyldBondToken` reads from the platform-operated
+`SanctionsOracleMirror`, the production sanctions oracle on **every** EVM chain including
+Ethereum mainnet (GYL-1051). There is no internal blocklist — sanctions decisions are made
+by the oracle. Secondary transfers fail-closed: if the oracle call reverts, the transfer
+reverts. The mirror may forward lookups to a vendor oracle (on mainnet, Chainalysis at
+`0x40C57923924B5c5c5455c48D93317139ADDaC8fb`) via its optional gas-capped, fail-closed
+`forwardingOracle`.
 
 > **Note (GYL-250):** The Fireblocks ERC20F / DenyList contracts (`contracts/erc20f/`)
 > remain in the repo for reference only. They are **not deployed** for any bond series.
-> All tokens use the GyldBondToken + Chainalysis oracle path. The legacy Anvil integration
+> All tokens use the GyldBondToken + platform sanctions oracle path. The legacy Anvil integration
 > test in `adapter-chain-evm` has been stubbed out pending a rewrite for the new stack.
 
 Full architecture and role documentation: **`docs/contracts.md`**
@@ -91,7 +95,7 @@ end of `deployToken`. No manual cleanup needed; the factory holds no permissions
 ## IChain implementation status (`adapter-chain-evm`)
 
 Uses `GyldBondToken` (UUPS RBAC) + `IssuanceManager` (mint/burn gate). All compliance
-for secondary transfers is enforced by the Chainalysis oracle inside `GyldBondToken`.
+for secondary transfers is enforced by the configured sanctions oracle inside `GyldBondToken`.
 
 | Method | Status | Notes |
 |--------|--------|-------|
@@ -103,7 +107,7 @@ for secondary transfers is enforced by the Chainalysis oracle inside `GyldBondTo
 | `is_paused()` | ✅ | Calls `GyldBondToken.paused()` |
 | `pause_token()` | ✅ | Calls `GyldBondToken.pause()` |
 | `unpause_token()` | ✅ | Calls `GyldBondToken.unpause()` |
-| `freeze_token_holder()` | ✅ | Calls `MockSanctionsList.addToSanctionsList()` (dev only); prod uses Chainalysis oracle externally |
+| `freeze_token_holder()` | ✅ | Calls `MockSanctionsList.addToSanctionsList()` (dev only); prod writes go to the platform `SanctionsOracleMirror` via the keeper |
 | `thaw_token_holder()` | ✅ | Calls `MockSanctionsList.removeFromSanctionsList()` (dev only) |
 | `forced_transfer()` | ✅ removed | Removed — sanctioned addresses are frozen in place by the oracle; no on-chain recovery function exists |
 | `send_tx()` | ✅ | Works with `PRIVKEY_SIGNING_KEY`; KMS path not yet implemented |
@@ -154,7 +158,7 @@ All methods return `NotImplemented`.
 **Gap:** Chainalysis adapter exists and implements `screen_address()` but is not wired in bootstrap.
 Production runs with `FakeScreener`, meaning **no AML/sanctions screening occurs at the Rust service layer**.
 
-> Note: `GyldBondToken` enforces sanctions on-chain directly via the Chainalysis oracle
+> Note: `GyldBondToken` enforces sanctions on-chain via the configured platform oracle
 > for all secondary transfers. The `FakeScreener` gap affects the pre-mint/pre-transfer
 > Rust-layer screening step — not the on-chain transfer guard.
 
@@ -350,7 +354,7 @@ Now `deployToken` maintains a `mapping(bytes32 => bool) private _deployedIsins` 
 
 `ReentrancyGuardUpgradeable` was inherited but never used — a leftover from the `recoverTokens` removal. No function in `GyldBondToken` needs it:
 
-- **`transfer` / `transferFrom`**: The only external call is the read-only Chainalysis oracle in `_requireAccess()`. This is a CHECK (Checks-Effects-Interactions) that happens before `_update()` writes any state. The oracle cannot call back into the token mid-transfer because state has not changed yet when the oracle is called. CEI is correct.
+- **`transfer` / `transferFrom`**: The only external call is the read-only sanctions oracle in `_requireAccess()`. This is a CHECK (Checks-Effects-Interactions) that happens before `_update()` writes any state. The oracle cannot call back into the token mid-transfer because state has not changed yet when the oracle is called. CEI is correct.
 - **`mint` / `burn`**: Role-gated (`MINTER_ROLE` / `BURNER_ROLE`), no external calls at all. OZ v5 also removed all `_afterTokenTransfer` hooks, so there are no post-state callbacks anywhere in the lifecycle.
 - **`approve` / `permit` / `setSanctionsList` / `pause` / `unpause`**: No balance changes, no external calls.
 
@@ -362,8 +366,8 @@ Resolved audit pre-finding: *"ReentrancyGuardUpgradeable inherited but never use
 
 ## Known gaps (by priority)
 
-1. **Chainalysis screener not wired** — production Rust service layer has no AML/sanctions pre-screening (HIGH). Note: on-chain transfer guard via `GyldBondToken` + Chainalysis oracle IS active for secondary transfers.
-2. **`freeze_token_holder` / `thaw_token_holder` / `is_holder_frozen` / `forced_transfer` broken** — `adapter-chain-evm` still calls `factory.denyListOf(token)` and `DenyList.accessListAdd/Remove` which do not exist for tokens deployed after GYL-250. The Chainalysis oracle is read-only — the platform cannot add/remove addresses. Sanctioned addresses are frozen in place by the oracle; there is no on-chain recovery function. The Rust adapter needs a rewrite for these four methods. (HIGH)
+1. **Chainalysis screener not wired** — production Rust service layer has no AML/sanctions pre-screening (HIGH). Note: on-chain transfer guard via `GyldBondToken` + the platform sanctions oracle IS active for secondary transfers.
+2. **`freeze_token_holder` / `thaw_token_holder` / `is_holder_frozen` / `forced_transfer` broken** — `adapter-chain-evm` still calls `factory.denyListOf(token)` and `DenyList.accessListAdd/Remove` which do not exist for tokens deployed after GYL-250. `GyldBondToken` has no internal freeze mechanism — sanctions writes go to the platform `SanctionsOracleMirror` via the keeper, not through the token. Sanctioned addresses are frozen in place by the oracle; there is no on-chain recovery function. The Rust adapter needs a rewrite for these four methods. (HIGH)
 3. **`call()` not implemented** — generic on-chain reads fail (MEDIUM)
 4. **`events_since()` returns empty** — no event indexing, no audit trail from chain (MEDIUM)
 5. **EvmWallet all stubs** — production user wallets need KMS implementation (HIGH)

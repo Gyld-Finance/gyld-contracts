@@ -1,19 +1,19 @@
 # Smart Contracts
 
 Foundry manages compilation and testing. The token stack is platform-written on top of
-OpenZeppelin upgradeable contracts with a read-only Chainalysis sanctions oracle.
+OpenZeppelin upgradeable contracts with a read-only, platform-operated sanctions oracle.
 
 ## Contract inventory
 
 | Contract | File | Origin | Upgrade | Purpose |
 |----------|------|--------|---------|---------|
-| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; Chainalysis sanctions oracle |
+| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; reads the configured platform sanctions oracle |
 | `IssuanceManager` | `contracts/IssuanceManager.sol` | Platform (MIT) | UUPS | AP whitelist; mint (subscribe) and burn (redeem) gate |
 | `TokenFactory` | `contracts/TokenFactory.sol` | Platform (MIT) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series; wires roles atomically |
 | `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (MIT) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
 | `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (MIT) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
-| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the Chainalysis on-chain oracle |
-| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Production sanctions oracle for L2 chains (e.g. Mantle) where Chainalysis has no deployment; keeper-fed mirror of the OFAC SDN list; identical interface to the real Chainalysis oracle |
+| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the on-chain sanctions oracle |
+| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Production sanctions oracle on **every** EVM chain including Ethereum mainnet (GYL-1051); keeper-fed local list plus an optional gas-capped, fail-closed `forwardingOracle`; Chainalysis-compatible interface |
 
 ---
 
@@ -45,13 +45,14 @@ KaleidoscopeNAVFeed  ←── owner calls updateAnswer(int256)
     └─▶ NAVFeedForwarder ──▶ setUpstreamOracle()
               └─▶ DeFi protocols (Morpho, Aave, etc.)
 
-Chainalysis on-chain oracle (read-only, mainnet: 0x40C57923924B5c5c5455c48D93317139ADDaC8fb)
-    └─▶ GyldBondToken._requireAccess()  ← Ethereum mainnet
-
-SanctionsOracleMirror (L2 chains — e.g. Mantle — where Chainalysis has no deployment)
-    ├─ SANCTIONS_UPDATER_ROLE → keeper bot (polls OFAC SDN every 4h, writes deltas)
+SanctionsOracleMirror (platform sanctions oracle on each production EVM chain,
+                       including Ethereum mainnet)
+    ├─ SANCTIONS_UPDATER_ROLE → keeper bot (polls approved sanctions feeds, writes deltas)
     ├─ DEFAULT_ADMIN_ROLE     → compliance ops multisig
-    └─▶ GyldBondToken._requireAccess()  ← identical interface; same fail-closed behaviour
+    ├─ forwardingOracle (optional) ─▶ vendor oracle, e.g. Chainalysis mainnet
+    │                                  0x40C57923924B5c5c5455c48D93317139ADDaC8fb
+    │                                  gas-capped staticcall; fail-closed; address(0) disables
+    └─▶ GyldBondToken._requireAccess()  ← Chainalysis-compatible interface; fail-closed behaviour
 ```
 
 ---
@@ -88,7 +89,9 @@ unchanged. DeFi protocols compute portfolio value as `balanceOf × NAV price`.
 ### Compliance
 
 All secondary transfers (`transfer`, `transferFrom`) check sender, receiver, **and spender**
-(transferFrom) against the Chainalysis on-chain sanctions oracle.
+(transferFrom) against the configured on-chain sanctions oracle — the platform-operated
+`SanctionsOracleMirror` on every production chain (see
+`docs/decisions/sanctions-oracle-mirror.md` in the root repo).
 
 The check is **fail-closed** — if the oracle call itself reverts (e.g., oracle down),
 the transfer reverts. No role or owner bypasses this check for secondary transfers.
