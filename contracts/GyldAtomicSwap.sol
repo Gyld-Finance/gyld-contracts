@@ -55,10 +55,16 @@ interface INavForwarder {
 ///     pre-screens off-chain to avoid wasted gas.
 ///
 /// Roles:
-///   DEFAULT_ADMIN_ROLE — upgrades, unpause, registerSeries/deregisterSeries,
-///                        setMaxQuoteDeviationBps, setMaxNavAgeSecs, setWithdrawalWallet,
-///                        setAllowed, bumpQuoteEpoch, role grants; should be a
-///                        TimelockController in production
+///   DEFAULT_ADMIN_ROLE   — upgrades, unpause, registerSeries/deregisterSeries,
+///                          setMaxQuoteDeviationBps, setMaxNavAgeSecs, setWithdrawalWallet,
+///                          bumpQuoteEpoch, role grants; should be a
+///                          TimelockController in production
+///   ALLOWLIST_ADMIN_ROLE — KYC/compliance ops key (`EVM_KMS_SWAP_ADMIN_`); setAllowed
+///                          ONLY — the live taker allowlist. Deliberately split off
+///                          DEFAULT_ADMIN_ROLE (GYL-1050) so per-taker allowlisting stays
+///                          a synchronous operational action after the production timelock
+///                          handover. Held by a hot key by design; grants access to swap,
+///                          never to funds or upgrades.
 ///   QUOTE_SIGNER_ROLE  — quote-service KMS key(s); passive — checked via hasRole
 ///                        against the recovered EIP-712 signer
 ///   TREASURER_ROLE     — Kaleidoscope ops MPC wallet; withdraw() net inventory out to
@@ -82,6 +88,7 @@ contract GyldAtomicSwap is
     bytes32 public constant QUOTE_SIGNER_ROLE = keccak256("QUOTE_SIGNER_ROLE");
     bytes32 public constant TREASURER_ROLE = keccak256("TREASURER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant ALLOWLIST_ADMIN_ROLE = keccak256("ALLOWLIST_ADMIN_ROLE");
 
     // ── EIP-712 ───────────────────────────────────────────────────────────────
 
@@ -523,14 +530,17 @@ contract GyldAtomicSwap is
     }
 
     /// @notice Add or remove `account` from the executeSwap taker allowlist.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. executeSwap requires the taker
+    /// @dev    Caller must hold ALLOWLIST_ADMIN_ROLE — deliberately NOT DEFAULT_ADMIN_ROLE
+    ///         (GYL-1050): in production DEFAULT_ADMIN_ROLE is the TimelockController, and
+    ///         per-taker allowlisting is a live operational action that cannot wait on a
+    ///         48h governance proposal per user. executeSwap requires the taker
     ///         (== msg.sender) to be allowed. The withdrawalWallet is intentionally
     ///         NOT required to be on this list — it is a cold treasury address that
     ///         never calls executeSwap; coupling the two adds no security and risks
     ///         bricking withdraw during incident response (see setWithdrawalWallet).
     /// @param account Address to toggle.
     /// @param allowed_ True to allow, false to disallow.
-    function setAllowed(address account, bool allowed_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setAllowed(address account, bool allowed_) external onlyRole(ALLOWLIST_ADMIN_ROLE) {
         if (account == address(0)) revert ZeroAddress();
         _getStorage().allowed[account] = allowed_;
         emit AllowedSet(account, allowed_);

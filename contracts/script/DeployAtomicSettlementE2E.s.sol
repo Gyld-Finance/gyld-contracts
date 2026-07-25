@@ -113,6 +113,8 @@ contract DeployAtomicSettlementE2E is Script {
         issuanceMgr.addToWhitelist(address(swap)); // swap holds inventory → whitelisted AP (subscribe recipient)
         swap.registerSeries(address(token), factory.forwarderOf(address(token)));
         swap.setWithdrawalWallet(WITHDRAWAL_WALLET); // fixed treasury destination (distinct from treasurer)
+        // setAllowed is gated on ALLOWLIST_ADMIN_ROLE, not DEFAULT_ADMIN_ROLE (GYL-1050).
+        swap.grantRole(swap.ALLOWLIST_ADMIN_ROLE(), deployer);
         swap.setAllowed(TAKER, true); // acct[1] may be an executeSwap taker
 
         // ── 4. Seed the swap's OWN inventory + USDC liquidity ─────────────────

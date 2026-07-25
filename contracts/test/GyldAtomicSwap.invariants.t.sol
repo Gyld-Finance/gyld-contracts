@@ -87,6 +87,11 @@ contract SwapFuzzTest is Test {
         swap.registerSeries(address(token), address(navFeed));
         vm.prank(admin);
         swap.setWithdrawalWallet(withdrawalWallet);
+        // setAllowed is gated on ALLOWLIST_ADMIN_ROLE (GYL-1050). Read the role bytes
+        // before vm.prank — the getter is an external call that consumes the prank.
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+        vm.prank(admin);
+        swap.grantRole(allowlistRole, admin);
         vm.prank(admin);
         swap.setAllowed(taker, true);
 
@@ -401,9 +406,11 @@ contract GyldAtomicSwapInvariantsTest is StdInvariant, Test {
             )
         );
 
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
         vm.startPrank(admin);
         swap.registerSeries(address(token), address(navFeed));
         swap.setWithdrawalWallet(address(0xA3));
+        swap.grantRole(allowlistRole, admin); // setAllowed gate (GYL-1050)
         swap.setAllowed(taker, true);
         vm.stopPrank();
         // admin grants MINTER_ROLE to this test contract; it then mints as itself.

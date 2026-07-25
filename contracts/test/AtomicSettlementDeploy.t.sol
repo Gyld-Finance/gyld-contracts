@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {GyldAtomicSwap} from "../GyldAtomicSwap.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
@@ -43,6 +44,7 @@ contract AtomicSettlementDeployTest is Test {
     address redeemer = address(0xA4); // IssuanceManager REDEEMER_ROLE
     address navFeedOwner = address(0xA5); // KaleidoscopeNAVFeed owner (KMS stand-in)
     address withdrawal = address(0xB1); // fixed treasury withdrawal destination
+    address allowlistAdmin = address(0xB2); // swap ALLOWLIST_ADMIN_ROLE (KMS allowlist key)
 
     // Known private keys — vm.addr(PK) is the corresponding address.
     // SIGNER_PK signs SwapMessages (QUOTE_SIGNER_ROLE); TAKER_PK is the end user.
@@ -121,12 +123,20 @@ contract AtomicSettlementDeployTest is Test {
         //    (registerSeries probes forwarder.decimals() == 8 on-chain).
         swap.registerSeries(address(token), factory.forwarderOf(address(token)));
 
-        // 4. Set the fixed treasury withdrawal wallet + allowlist the taker.
+        // 4. Set the fixed treasury withdrawal wallet.
         swap.setWithdrawalWallet(withdrawal);
+
+        // 5. Grant ALLOWLIST_ADMIN_ROLE (setAllowed's gate since GYL-1050) to the
+        //    broadcaster — the script does this BEFORE the timelock handover.
+        swap.grantRole(swap.ALLOWLIST_ADMIN_ROLE(), address(this));
+
+        // 6. Allowlist the taker.
         swap.setAllowed(taker, true);
 
-        // 5. Timelock handover intentionally SKIPPED (dev path: TIMELOCK_ADDRESS
+        // 7. Timelock handover intentionally SKIPPED (dev path: TIMELOCK_ADDRESS
         //    unset) — the deployer keeps DEFAULT_ADMIN, asserted in the wiring test.
+        //    The prod handover is covered by
+        //    test_deployRecipe_afterTimelockHandover_allowlistAdminStillWorks.
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -212,10 +222,75 @@ contract AtomicSettlementDeployTest is Test {
         assertTrue(swap.hasRole(swap.TREASURER_ROLE(), treasurer), "treasurer lacks TREASURER_ROLE");
         assertTrue(swap.hasRole(swap.QUOTE_SIGNER_ROLE(), signer), "signer lacks QUOTE_SIGNER_ROLE");
 
+        // GYL-1050: the recipe grants the dedicated operational allowlist role.
+        assertTrue(
+            swap.hasRole(swap.ALLOWLIST_ADMIN_ROLE(), address(this)),
+            "deploy recipe did not grant ALLOWLIST_ADMIN_ROLE"
+        );
+
         // DevNet base wiring: token registered + IssuanceManager holds mint/burn.
         assertTrue(issuanceMgr.registeredTokens(address(token)), "token not registered with manager");
         assertTrue(token.hasRole(token.MINTER_ROLE(), address(issuanceMgr)), "manager lacks MINTER_ROLE");
         assertTrue(token.hasRole(token.BURNER_ROLE(), address(issuanceMgr)), "manager lacks BURNER_ROLE");
+    }
+
+    /// GYL-1050 regression pin — the actual production defect this ticket closes.
+    ///
+    /// The rest of this suite deliberately skips the timelock handover (dev path), which
+    /// is exactly why the incompatibility shipped: after
+    /// DeployAtomicSettlement.s.sol hands DEFAULT_ADMIN_ROLE to the 48h
+    /// TimelockController and revokes the deployer, the gateway's synchronous allowlist
+    /// API (`POST /api/v1/admin/swap/allowlist`, signed by the EVM_KMS_SWAP_ADMIN_ key)
+    /// used to revert on every call. This replays the prod handover and asserts the KMS
+    /// allowlist key survives it.
+    function test_deployRecipe_afterTimelockHandover_allowlistAdminStillWorks() public {
+        address[] memory multisig = new address[](1);
+        multisig[0] = address(0xB3);
+        // admin = address(0) → self-administered, same shape as Timelock.t.sol.
+        TimelockController timelock = new TimelockController(48 hours, multisig, multisig, address(0));
+
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+
+        // Script step 5: grant the operational role to the KMS allowlist key BEFORE the
+        // handover (ordering is load-bearing — after the revoke the deployer can grant
+        // nothing and recovery would need a 48h timelock proposal).
+        swap.grantRole(allowlistRole, allowlistAdmin);
+
+        // Script step 7: hand DEFAULT_ADMIN to the timelock and revoke the deployer
+        // (including its transient allowlist grant from setUp).
+        swap.grantRole(adminRole, address(timelock));
+        swap.revokeRole(allowlistRole, address(this));
+        swap.revokeRole(adminRole, address(this));
+
+        // (c) The timelock now owns governance; the deployer owns nothing.
+        assertTrue(swap.hasRole(adminRole, address(timelock)), "timelock lacks DEFAULT_ADMIN after handover");
+        assertFalse(swap.hasRole(adminRole, address(this)), "deployer kept DEFAULT_ADMIN after handover");
+
+        // (a) The KMS allowlist key can STILL allowlist a taker synchronously — the
+        //     property the whole ticket exists to guarantee.
+        address newTaker = address(0xC0FFEE);
+        assertFalse(swap.isAllowed(newTaker));
+        vm.prank(allowlistAdmin);
+        swap.setAllowed(newTaker, true);
+        assertTrue(swap.isAllowed(newTaker), "ALLOWLIST_ADMIN could not allowlist after handover");
+
+        // (b) The revoked deployer cannot.
+        vm.expectRevert(
+            abi.encodeWithSignature(
+                "AccessControlUnauthorizedAccount(address,bytes32)", address(this), allowlistRole
+            )
+        );
+        swap.setAllowed(address(0xDEAD), true);
+
+        // And the timelock — the DEFAULT_ADMIN holder — is deliberately NOT the gate.
+        vm.prank(address(timelock));
+        vm.expectRevert(
+            abi.encodeWithSignature(
+                "AccessControlUnauthorizedAccount(address,bytes32)", address(timelock), allowlistRole
+            )
+        );
+        swap.setAllowed(address(0xDEAD), true);
     }
 
     // ── E2E BUY through the real mint path ────────────────────────────────────

@@ -39,6 +39,7 @@ contract GyldAtomicSwapTest is Test {
     address pauser = address(0xA1); // PAUSER_ROLE on swap
     address treasurer = address(0xA2); // TREASURER_ROLE on swap
     address wallet = address(0xA3); // fixed withdrawalWallet
+    address allowlistAdmin = address(0xA4); // ALLOWLIST_ADMIN_ROLE on swap (setAllowed only)
     address outsider = address(0xFF);
 
     // Known private keys — vm.addr(PK) is the corresponding address.
@@ -107,7 +108,13 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(token), address(navFeed));
         vm.prank(admin);
         swap.setWithdrawalWallet(wallet);
+
+        // setAllowed is gated on ALLOWLIST_ADMIN_ROLE, not DEFAULT_ADMIN_ROLE (GYL-1050).
+        // Cache the role bytes before pranking — the getter call would consume the prank.
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
         vm.prank(admin);
+        swap.grantRole(allowlistRole, allowlistAdmin);
+        vm.prank(allowlistAdmin);
         swap.setAllowed(taker, true);
 
         // Fund the SWAP's own inventory (self-custodial): tokens minted straight to the
@@ -339,7 +346,7 @@ contract GyldAtomicSwapTest is Test {
 
         // Allowlist the outsider so the revert is proven to come from the taker binding,
         // not the allowlist gate (taker binding is checked first regardless).
-        vm.prank(admin);
+        vm.prank(allowlistAdmin);
         swap.setAllowed(outsider, true);
 
         vm.prank(outsider); // quote pins `taker` — anyone else must be rejected
@@ -363,7 +370,7 @@ contract GyldAtomicSwapTest is Test {
     /// A taker who is NOT on the allowlist is rejected even with a valid signed quote.
     function test_executeSwap_nonAllowlistedTaker_reverts() public {
         // Revoke the taker's allowlisting.
-        vm.prank(admin);
+        vm.prank(allowlistAdmin);
         swap.setAllowed(taker, false);
 
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(30);
@@ -374,26 +381,62 @@ contract GyldAtomicSwapTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
-    function test_setAllowed_onlyAdmin_reverts() public {
+    function test_setAllowed_onlyAllowlistAdmin_reverts() public {
         vm.prank(outsider);
         vm.expectRevert();
         swap.setAllowed(outsider, true);
     }
 
-    function test_setAllowed_zeroAddress_reverts() public {
+    /// GYL-1050 structural pin: `setAllowed` must NOT be callable by the
+    /// DEFAULT_ADMIN_ROLE holder. In production that role is the 48h TimelockController,
+    /// so gating the live per-taker allowlist on it would make the gateway's synchronous
+    /// allowlist API revert on every call. This test fails the moment the gate regresses.
+    function test_setAllowed_defaultAdminCannotCall_reverts() public {
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+        assertTrue(swap.hasRole(swap.DEFAULT_ADMIN_ROLE(), admin), "admin must hold DEFAULT_ADMIN_ROLE");
+        assertFalse(swap.hasRole(allowlistRole, admin), "DEFAULT_ADMIN must not hold ALLOWLIST_ADMIN_ROLE");
+
         vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSignature("AccessControlUnauthorizedAccount(address,bytes32)", admin, allowlistRole)
+        );
+        swap.setAllowed(outsider, true);
+    }
+
+    function test_setAllowed_allowlistAdmin_succeeds() public {
+        assertFalse(swap.isAllowed(outsider));
+
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit AllowedSet(outsider, true);
+        vm.prank(allowlistAdmin);
+        swap.setAllowed(outsider, true);
+
+        assertTrue(swap.isAllowed(outsider));
+    }
+
+    /// Unlike DEFAULT_ADMIN_ROLE, the operational allowlist role is renounceable —
+    /// it bricks nothing (the timelock can always re-grant it).
+    function test_renounceRole_allowlistAdmin_succeeds() public {
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+        vm.prank(allowlistAdmin);
+        swap.renounceRole(allowlistRole, allowlistAdmin);
+        assertFalse(swap.hasRole(allowlistRole, allowlistAdmin));
+    }
+
+    function test_setAllowed_zeroAddress_reverts() public {
+        vm.prank(allowlistAdmin);
         vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
         swap.setAllowed(address(0), true);
     }
 
     function test_setAllowed_emitsAndReAllows() public {
-        vm.prank(admin);
+        vm.prank(allowlistAdmin);
         swap.setAllowed(taker, false);
         assertFalse(swap.isAllowed(taker));
 
         vm.expectEmit(true, false, false, true, address(swap));
         emit AllowedSet(taker, true);
-        vm.prank(admin);
+        vm.prank(allowlistAdmin);
         swap.setAllowed(taker, true);
         assertTrue(swap.isAllowed(taker));
 
