@@ -32,13 +32,20 @@ import {TokenFactory} from "../TokenFactory.sol";
 ///        — forwarder probed for decimals() == 8 on-chain; reverts otherwise.
 ///   4. swap.setWithdrawalWallet(WITHDRAWAL_WALLET) — fixed treasury destination the
 ///        treasurer withdraws NET flow to (required env; defaults to treasurer in dev).
-///   5. Allowlist any APs from ALLOWED_TAKERS: swap.setAllowed(addr, true).
-///   6. Hand DEFAULT_ADMIN_ROLE on the swap proxy to the timelock, revoke deployer.
+///   5. Grant ALLOWLIST_ADMIN_ROLE to the deployer (needed for step 6) and to
+///        ALLOWLIST_ADMIN — the KMS allowlist key that must keep calling setAllowed
+///        AFTER the timelock handover (GYL-1050).
+///   6. Allowlist any APs from ALLOWED_TAKERS: swap.setAllowed(addr, true).
+///   7. Hand DEFAULT_ADMIN_ROLE on the swap proxy to the timelock, revoke deployer
+///        (and revoke the deployer's transient ALLOWLIST_ADMIN_ROLE).
 ///
 /// Role model (falls back to deployer in dev, like DeployDevNet):
 ///   TIMELOCK_ADDRESS     →  DEFAULT_ADMIN_ROLE on swap after setup (upgrades, unpause,
-///                           series registry, band params, withdrawal wallet, allowlist,
+///                           series registry, band params, withdrawal wallet,
 ///                           epoch bump)
+///   ALLOWLIST_ADMIN      →  ALLOWLIST_ADMIN_ROLE on swap (KMS allowlist key; setAllowed
+///                           only — stays LIVE after the timelock handover so the gateway
+///                           allowlist routes keep working without a 48h proposal per user)
 ///   OPS_MULTISIG         →  PAUSER_ROLE on swap (pause only — asymmetric; resume
 ///                           requires the timelock)
 ///   TREASURER_ADDRESS    →  swap TREASURER_ROLE (Kaleidoscope ops MPC wallet:
@@ -61,6 +68,10 @@ import {TokenFactory} from "../TokenFactory.sol";
 ///   OPS_MULTISIG           Pauser. Defaults to deployer.
 ///   TREASURER_ADDRESS      Treasurer. Defaults to deployer.
 ///   QUOTE_SIGNER           Quote signer. Defaults to deployer.
+///   ALLOWLIST_ADMIN        Holder of ALLOWLIST_ADMIN_ROLE (setAllowed). Defaults to the
+///                          deployer. On prod this MUST be the address of the
+///                          EVM_KMS_SWAP_ADMIN_KEY_ID key or the gateway allowlist routes
+///                          revert after the timelock handover (GYL-1050).
 ///   WITHDRAWAL_WALLET      Fixed treasury destination for withdraw(). Defaults to
 ///                          TREASURER_ADDRESS (dev).
 ///   MAX_QUOTE_DEVIATION_BPS  Quote-vs-NAV band, basis points. Default 200 (2%).
@@ -88,6 +99,7 @@ import {TokenFactory} from "../TokenFactory.sol";
 ///   export OPS_MULTISIG=<gnosis_safe_address>
 ///   export TREASURER_ADDRESS=<ops_mpc_address>
 ///   export QUOTE_SIGNER=<kms_signer_address>
+///   export ALLOWLIST_ADMIN=<kms_swap_admin_address>
 ///   export WITHDRAWAL_WALLET=<treasury_safe>
 ///   export EVM_FACTORY_ADDRESS=<factory>
 ///   export SERIES_TOKENS=<token0>,<token1>
@@ -109,13 +121,14 @@ contract DeployAtomicSettlement is Script {
         address opsMultisig = _envOrDefault("OPS_MULTISIG", msg.sender);
         address treasurer = _envOrDefault("TREASURER_ADDRESS", msg.sender);
         address quoteSigner = _envOrDefault("QUOTE_SIGNER", msg.sender);
+        address allowlistAdmin = _envOrDefault("ALLOWLIST_ADMIN", msg.sender);
         address withdrawal = _envOrDefault("WITHDRAWAL_WALLET", treasurer);
         uint16 maxBps = uint16(_envOrUint("MAX_QUOTE_DEVIATION_BPS", 200));
         uint32 maxNavAge = uint32(_envOrUint("MAX_NAV_AGE_SECS", 86400));
 
         vm.startBroadcast();
 
-        // 1. Swap: impl + proxy. Deployer is DEFAULT_ADMIN during setup (step 6 hands
+        // 1. Swap: impl + proxy. Deployer is DEFAULT_ADMIN during setup (step 7 hands
         //    over). Impl is inlined so its stack slot dies immediately.
         GyldAtomicSwap swap = GyldAtomicSwap(
             address(
@@ -152,15 +165,31 @@ contract DeployAtomicSettlement is Script {
         swap.setWithdrawalWallet(withdrawal);
         console.log("withdrawalWallet set: %s", withdrawal);
 
-        // 5. Allowlist APs permitted to be executeSwap takers.
+        // 5. Grant ALLOWLIST_ADMIN_ROLE. ORDERING IS LOAD-BEARING (GYL-1050): this must
+        //    happen BEFORE step 6 (the deployer needs the role to call setAllowed at all)
+        //    and BEFORE the step 7 revoke (after revokeRole(DEFAULT_ADMIN, deployer) the
+        //    deployer can grant nothing, and recovery would need a 48h timelock proposal).
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+        swap.grantRole(allowlistRole, msg.sender);
+        if (allowlistAdmin != msg.sender) {
+            swap.grantRole(allowlistRole, allowlistAdmin);
+        }
+        console.log("ALLOWLIST_ADMIN_ROLE granted: %s (setAllowed only)", allowlistAdmin);
+
+        // 6. Allowlist APs permitted to be executeSwap takers.
         _allowlistTakers(swap);
 
-        // 6. Hand DEFAULT_ADMIN on the swap proxy to the timelock and revoke the
+        // 7. Hand DEFAULT_ADMIN on the swap proxy to the timelock and revoke the
         //    deployer (same pattern as DeployDevNet step 9). Skipped in dev when
         //    TIMELOCK_ADDRESS is unset so the deployer can keep iterating.
+        //    ALLOWLIST_ADMIN_ROLE deliberately survives on allowlistAdmin — that is the
+        //    whole point of the split; only the deployer's transient copy is dropped.
         if (timelock != address(0)) {
             bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
             swap.grantRole(adminRole, timelock);
+            if (allowlistAdmin != msg.sender) {
+                swap.revokeRole(allowlistRole, msg.sender);
+            }
             swap.revokeRole(adminRole, msg.sender);
             console.log("DEFAULT_ADMIN handed to timelock %s on swap", timelock);
         } else {
@@ -176,6 +205,7 @@ contract DeployAtomicSettlement is Script {
         console.log("");
         console.log("=== Role assignments ===");
         console.log("DEFAULT_ADMIN:         %s", timelock != address(0) ? timelock : msg.sender);
+        console.log("ALLOWLIST_ADMIN:       %s", allowlistAdmin);
         console.log("PAUSER (ops):          %s", opsMultisig);
         console.log("TREASURER:             %s", treasurer);
         console.log("QUOTE_SIGNER:          %s", quoteSigner);
@@ -187,6 +217,8 @@ contract DeployAtomicSettlement is Script {
         console.log("     after broker fills (mint-at-fill; swap is now a whitelisted AP)");
         console.log("  3. Fund the swap with USDC for the redeem leg (transfer to the swap)");
         console.log("  4. Gateway env: EVM_ATOMIC_SWAP (above)");
+        console.log("  5. PROD: ALLOWLIST_ADMIN must be the EVM_KMS_SWAP_ADMIN_KEY_ID key's");
+        console.log("     address, else POST /api/v1/admin/swap/allowlist reverts (GYL-1050)");
     }
 
     /// @dev Step 3 — register SERIES_TOKENS with forwarders looked up from the factory.
@@ -208,7 +240,8 @@ contract DeployAtomicSettlement is Script {
         }
     }
 
-    /// @dev Step 5 — allowlist each ALLOWED_TAKERS entry as an executeSwap taker.
+    /// @dev Step 6 — allowlist each ALLOWED_TAKERS entry as an executeSwap taker.
+    ///      Requires the broadcaster to hold ALLOWLIST_ADMIN_ROLE (granted in step 5).
     function _allowlistTakers(GyldAtomicSwap swap) internal {
         try vm.envAddress("ALLOWED_TAKERS", ",") returns (address[] memory takers) {
             for (uint256 i = 0; i < takers.length; i++) {

@@ -494,8 +494,14 @@ Scope: the two new contracts + wiring (whitelist grant, `registerSeries`,
 - [ ] Prior-art diff vs Backed `AtomicSwapUpgradeable` (incl. their Oct-2025
       audit PDF), Hashflow post-mortem, 0x OTC, 1inch invalidation, Ondo C4
       findings — links in the [lineage table](#prior-art-lineage).
-- [ ] `StdInvariant` fuzz handler: `totalAssets` conservation across
-      swap/draw/settle/forward/repay; vault-never-mints-bond-tokens.
+- [x] `StdInvariant` fuzz handler: bond-token `totalSupply` never changes across
+      BUY/REDEEM (never-mints), fair-price rounding, single-use quoteId replay —
+      landed in `contracts/test/GyldAtomicSwap.invariants.t.sol` (5 fuzz tests @
+      10k runs + 2 stateful invariants @ 1k runs/50k calls). Note: the original
+      checklist item assumed the vault-era `totalAssets` conservation; after the
+      self-custodial refactor (`GyldSettlementVault` removed) the equivalent
+      property is "the swap never mints/burns — only transfers pre-minted
+      inventory" which these invariants prove.
 - [ ] Deploy-script fork test transcript (6 steps + one BUY + one REDEEM).
 - [ ] Reviewer's seven non-blocking observations, verbatim:
   1. **Feed-fault wind-down dependency** — broken NAV feed freezes the whole
@@ -539,7 +545,7 @@ owns the following:
 |-------|-------------|----------------|
 | **1 — Land** | Commit the 4 untracked files + this doc + `docs/decisions/atomic-settlement.md` + audit-notes doc on `feat/GYL-xxx-atomic-settlement` (Linear epic + children first — the pre-commit hook requires `GYL-xxx`); update `docs/contracts.md` + `docs/blockchain-status.md` inventory/deployment matrix; write `DeployAtomicSettlement.s.sol` + fork test | `forge build --force` zero warnings; 407+ green incl. fork test; PR merged with Linear linkage |
 | **1 — Hoodi** | Deploy via the script to chain 560048, KMS quote signer; publish proxy addresses in `docs/blockchain-status.md` | Manual `executeSwap` BUY succeeds on Hoodi with a hand-signed quote; `hashSwapMessage` parity verified |
-| **5 — Audit** | External audit of the two contracts + wiring, packet per the [checklist](#audit-prep-checklist); add the `StdInvariant` suite; remediation commits re-run the full suite | Report closed, no highs/criticals outstanding |
+| **5 — Audit** | External audit of the two contracts + wiring, packet per the [checklist](#audit-prep-checklist); ~~add the `StdInvariant` suite~~ (✅ landed in `GyldAtomicSwap.invariants.t.sol` — never-mints + fair-price fuzz + stateful totalSupply invariants); remediation commits re-run the full suite | Report closed, no highs/criticals outstanding |
 | **5 — Mainnet** | Deploy with timelock admin, Fordefi signing, real USDC + Chainalysis live, dust seed, conservative caps; rehearse pause + key-rotation drills on Hoodi first | 1-week limited-notional canary clean (zero recon incidents); caps raised to policy targets |
 | **V1.1 / V2 (flagged)** | On-chain rate limiter in `onSwap`; ERC-7540 LP exit queue; [capped-allowance `SwapMessage`](#proposed-amendment-capped-allowance-swapmessage) for taker-sized fills + its own V2 multi-draw remaining-balance tracking | Separate issues + audit deltas |
 

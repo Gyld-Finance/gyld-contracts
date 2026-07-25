@@ -132,6 +132,8 @@ contract AtomicSettlementFlow is Script {
         issuanceMgr.addToWhitelist(address(swap));
         swap.registerSeries(address(token), factory.forwarderOf(address(token)));
         swap.setWithdrawalWallet(deployer); // fixed treasury destination (deployer in dev)
+        // setAllowed is gated on ALLOWLIST_ADMIN_ROLE, not DEFAULT_ADMIN_ROLE (GYL-1050).
+        swap.grantRole(swap.ALLOWLIST_ADMIN_ROLE(), deployer);
         swap.setAllowed(taker, true); // taker must be allowlisted to execute swaps
 
         require(swap.registeredSeries(address(token)), "series not registered");
