@@ -104,6 +104,7 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     error NoPriceSet();
     error PriceStale(uint256 updatedAt, uint256 currentTime);
     error NotEmergencyUpdater();
+    error EmergencyUpdaterCannotBeOwner();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -137,9 +138,34 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     ///         owner. A compromised KMS key must not be able to call
     ///         emergencyUpdateAnswer. Pass address(0) to disable the path.
     function setEmergencyUpdater(address newUpdater) external onlyOwner {
+        // Key-separation invariant: the emergency updater must be a different
+        // key from the owner (see design doc §4). address(0) disables the path
+        // and is always allowed — the owner is never address(0) while set.
+        if (newUpdater == owner()) revert EmergencyUpdaterCannotBeOwner();
         address previous = _emergencyUpdater;
         _emergencyUpdater = newUpdater;
         emit EmergencyUpdaterSet(previous, newUpdater);
+    }
+
+    // ── Ownership (key-separation guards) ─────────────────────────────────────
+
+    /// @dev Fail-fast guard: reject starting an ownership transfer to the current
+    ///      emergency updater so the two roles can never collapse into one key.
+    ///      address(0) is allowed (cancels a pending transfer).
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        if (newOwner != address(0) && newOwner == _emergencyUpdater)
+            revert EmergencyUpdaterCannotBeOwner();
+        super.transferOwnership(newOwner);
+    }
+
+    /// @dev Single funnel that actually changes owner() (acceptOwnership /
+    ///      renounceOwnership). Enforce the key-separation invariant here so it
+    ///      holds regardless of the path. address(0) is allowed so
+    ///      renounceOwnership() keeps working.
+    function _transferOwnership(address newOwner) internal virtual override {
+        if (newOwner != address(0) && newOwner == _emergencyUpdater)
+            revert EmergencyUpdaterCannotBeOwner();
+        super._transferOwnership(newOwner);
     }
 
     // ── Price update ──────────────────────────────────────────────────────────
