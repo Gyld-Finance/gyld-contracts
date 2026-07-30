@@ -227,8 +227,36 @@ The NAV feed says "each unit is worth $X today."
 
 **What was added:** `uiMultiplier` (18-dp fixed point, default `1e18`), gated by a
 dedicated `UI_MULTIPLIER_ROLE`, plus read-only views `balanceOfUI()`,
-`totalSupplyUI()`, `toUIAmount()`, `fromUIAmount()`, and a `UIMultiplierUpdated`
-event. ERC-165 advertises support via a minimal `IERC8056` interface.
+`totalSupplyUI()`, `toUIAmount()`, `fromUIAmount()`, the scheduled-change views
+`newUIMultiplier()` / `effectiveAt()`, and the `UIMultiplierUpdated` and
+`TransferWithUIAmount` events.
+
+**Conformance (GYL-956 follow-up):** the implementation now matches the published
+ERC-8056 Draft rather than an approximation of it.
+
+- The REQUIRED `IScaledUIAmountNewUIMultiplier` extension is implemented.
+  `scheduleUiMultiplier(newMultiplier, effectiveAtTimestamp)` pre-announces a
+  change; `uiMultiplier()` switches to the pending value once
+  `block.timestamp >= effectiveAt()`, inclusive of the boundary block, matching the
+  EIP reference implementation. At most one schedule is pending at a time, and
+  replacing a pending schedule leaves the displayed value untouched — so a
+  mis-scheduled multiplier can be corrected before any holder sees it.
+  `setUiMultiplier(m)` remains the immediate path (schedules at `block.timestamp`).
+- `UIMultiplierUpdated` carries the canonical **three** parameters
+  (`oldMultiplier`, `newMultiplier`, `effectiveAtTimestamp`). The earlier two-parameter
+  form had a different `topic0`, so no EIP-following indexer would ever have matched it.
+- `TransferWithUIAmount` is emitted from `_update`, covering transfer, mint and burn
+  with the same reach as the canonical `Transfer` event. It is OPTIONAL in the EIP;
+  we pay the extra log so indexers can reconstruct displayed amounts from logs alone.
+- ERC-165 advertises **all four** implemented interface ids — `0xa60bf13d` (core),
+  `0x4bd27648` (pending), `0x57854fc3` (conversion), `0xd890fd71` (balances) —
+  rather than only the core id, which left the conversion and balances helpers live
+  but undiscoverable.
+
+ERC-8056 is still a Draft, so its selectors may move. The interfaces are transcribed
+verbatim into `GyldBondToken.sol` and the four ids are pinned against the published
+hex literals in `GyldBondToken.ScaledUIAmount.t.sol`, so an upstream change fails the
+suite instead of silently producing a non-conformant token.
 
 **Why this is not the multiplier/rebasing system prohibited above:** the
 prohibition in this section is about REAL accounting — anything that changes what
@@ -256,13 +284,39 @@ nothing about how trades are priced or settled.
   `HolderBalancesDriver` must keep reading raw `balanceOf()`/`Transfer` events —
   pointing any of them at the UI views would corrupt reconciliation.
 - `setUiMultiplier()` should only ever be called by the same off-chain process
-  that publishes to `KaleidoscopeNAVFeed`, using the identical value and the
-  identical circuit-breaker guardrails (10% max deviation, 1h min interval) so the
-  two numbers can never drift apart. That driver wiring is a follow-up (GYL-956
+  that publishes to `KaleidoscopeNAVFeed`, using the identical value, so the two
+  numbers can never drift apart. That driver wiring is a follow-up (GYL-956
   Rust-side work), not yet implemented as of this addendum.
-- Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`
-  to prevent `toUIAmount`/`fromUIAmount` from dividing by zero or displaying a
-  permanently-zeroed balance.
+- **The circuit breakers are enforced on-chain, not just by convention.** This
+  addendum originally described the 10%-deviation / 1h-interval guardrails as an
+  off-chain discipline for the (unwritten) driver, while the setter itself
+  validated nothing but non-zero. That meant a single `UI_MULTIPLIER_ROLE` key
+  could set `1000e18` and then `1` in the same block, swinging every displayed
+  balance by 1e18x. `GyldBondToken` now enforces
+  `MAX_UI_MULTIPLIER_DEVIATION_BPS` (1000 bps) and
+  `MIN_UI_MULTIPLIER_UPDATE_INTERVAL` (1 hour) itself — the same constants and the
+  same semantics as `KaleidoscopeNAVFeed.updateAnswer`, since the multiplier is a
+  mirror of that feed. The rate limit is measured on ACTIVATION time, so scheduling
+  cannot be used to pack two activations closer than the interval. Reaching a
+  distant multiplier requires ramping across several intervals, exactly as it does
+  on the NAV feed.
+- There is deliberately **no** emergency bypass equivalent to
+  `emergencyUpdateAnswer`. A wrong NAV is a solvency problem for Morpho markets
+  pricing collateral; a wrong multiplier is a display problem only, which does not
+  justify a second unbounded write channel.
+- Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`,
+  and reads normalise a `0` to `1e18`, so `toUIAmount`/`fromUIAmount` can never
+  divide by zero or display a permanently-zeroed balance.
+- **Upgrading a live proxy needs no post-upgrade initializer call.** A proxy
+  deployed before these fields existed reads `0` from the never-written slots. The
+  read path treats "no schedule ever written" as 1.0x, which reproduces the exact
+  pre-upgrade display (pre-upgrade balances were never scaled). A bare
+  `upgradeToAndCall(impl, "")` is therefore sufficient and complete. An earlier
+  revision shipped an `initializeUiMultiplierV2()` reinitializer for this purpose;
+  it was `external reinitializer(2)` with **no access control**, so any address
+  could call it and permanently consume the version-2 slot, blocking every future
+  v2 migration. It has been removed rather than gated, because the read-path
+  normalisation makes it unnecessary.
 
 ---
 
