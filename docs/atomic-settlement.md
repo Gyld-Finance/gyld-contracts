@@ -1,3 +1,14 @@
+> ⚠️ **SUPERSEDED — retained for history only.** This document describes the
+> **removed** vault/DvP architecture: `GyldSettlementVault`, the v1
+> `SwapMessage` (`amountIn`/`amountOut`), EIP-712 domain version **`"1"`**, and
+> the old `SWAP_MESSAGE_TYPEHASH`. That design no longer exists — the vault was
+> deleted, the swap is now self-custodial and holds its own inventory, and the
+> live wire format is the capped-allowance `SwapMessage`
+> (`maxAmountIn`/`price`) under domain version **`"2"`**. **Do not implement
+> against this document.** The normative specification is
+> [`docs/atomic-swap-spec.md`](atomic-swap-spec.md); integrators should use
+> [`docs/integration/onchain-atomic-swap.md`](integration/onchain-atomic-swap.md).
+
 # Atomic Settlement — `GyldAtomicSwap` + `GyldSettlementVault`
 
 Instant USDC ⇄ bond-token settlement against platform-signed EIP-712 quotes,

@@ -8,10 +8,10 @@ your own wallet, Gyld signs a quote off-chain, and you execute it yourself.
 | | |
 |---|---|
 | Source | [`contracts/GyldAtomicSwap.sol`](../../contracts/GyldAtomicSwap.sol) |
-| Licence | **BUSL-1.1** (Business Source License 1.1) — see [§11](#11-licence) |
+| Licence | **BUSL-1.1** (Business Source License 1.1) — see [§12](#12-licence) |
 | Solidity | `=0.8.28` (exact pin) |
 | Upgradeability | UUPS proxy — **integrate against the proxy address**, never the implementation |
-| Deployment | ⚠️ **Local development chain only. Not deployed to any public network.** See [§2](#2-contract-addresses) |
+| Deployment | ⚠️ **Sepolia (11155111) deployment in progress — no addresses published yet.** See [§2](#2-contract-addresses) |
 
 ---
 
@@ -74,29 +74,37 @@ Mixing these up is the second most common integration error. See
 
 ## 2. Contract addresses
 
-> ## ⚠️ TBD — not yet deployed to any public network
+> ## ⚠️ TBD — Sepolia deployment in progress; no addresses published yet
 >
-> The atomic-swap stack exists on a **local Anvil development chain (31337)
-> only**. There is no public testnet or mainnet deployment, so there is no
-> address for a third party to integrate against, and no shared network on which
-> to test. **No addresses are published in this document.**
+> The atomic-swap stack is being deployed to **Ethereum Sepolia
+> (chainId 11155111)**. Until that deployment lands there is no address for a
+> third party to integrate against, and **no addresses are published in this
+> document** — the table below will be updated when they exist.
+
+**Sepolia (chainId 11155111) is the single supported public testnet for
+integrator testing.** When the deployment lands, its addresses will be
+published in the table below, and Sepolia is the only shared network Gyld
+supports for testing your integration. Hoodi (chain 560048) is a
+backend-internal environment — not an integrator surface — and Anvil (chain
+31337) is local development only. There is no mainnet deployment.
 
 | Network | Chain ID | Contract | Address | Status |
 |---------|----------|----------|---------|--------|
 | Local Anvil | 31337 | `GyldAtomicSwap` (proxy) | — | Local development only; ephemeral, regenerated per run. Not shareable. |
 | Local Anvil | 31337 | `GyldBondToken` series | — | Local development only. |
 | Local Anvil | 31337 | `NAVFeedForwarder` | — | Local development only. |
-| Local Anvil | 31337 | USDC (mock) | — | **Mock** USDC. Note the real USDC permit differs — see [§7](#7-optional-eip-2612-permit). |
-| Ethereum Sepolia | 11155111 | `GyldAtomicSwap` | — | **Not deployed.** Sepolia carries an **older token-only stack**; it has no atomic-swap contract. |
+| Local Anvil | 31337 | USDC (mock) | — | **Mock** USDC. Note the real USDC permit differs — see [§8](#8-optional-eip-2612-permit). |
+| Ethereum Sepolia | 11155111 | `GyldAtomicSwap` (proxy) | — | ⏳ **Pending — deployment in progress.** The supported public testnet for integrator testing; the proxy address will be published here. Sepolia already carries the token/NAV stack the swap settles against. |
+| Ethereum Hoodi | 560048 | `GyldAtomicSwap` | — | Backend-internal testing only — **not an integrator surface**. |
 | Base | 8453 | `GyldAtomicSwap` | — | **Not deployed.** Chain 8453 is Base **mainnet** and carries token and lending-integration contracts only — **not** the atomic-swap stack. |
 | Any other public network | — | `GyldAtomicSwap` | — | **Not deployed.** |
 
-**What this means for you:** you cannot integrate this surface today. Build
-against a local deployment for development, and treat everything in this document
-as an interface contract to be re-verified when a public deployment exists.
-Because the contract is a **UUPS proxy**, always resolve the proxy address from
-Gyld at integration time rather than hardcoding it — and re-check the
-`SWAP_MESSAGE_TYPEHASH` and EIP-712 domain after any upgrade.
+**What this means for you:** you cannot integrate against a shared network
+today. Build against a local deployment for development, and treat everything
+in this document as an interface contract to be re-verified when the Sepolia
+deployment lands. Because the contract is a **UUPS proxy**, always resolve the
+proxy address from Gyld at integration time rather than hardcoding it — and
+re-check the `SWAP_MESSAGE_TYPEHASH` and EIP-712 domain after any upgrade.
 
 ---
 
@@ -274,7 +282,123 @@ expectation before sending.
 
 ---
 
-## 5. Preconditions
+## 5. Obtaining a quote
+
+Everything so far describes what a quote *is*. This section covers how you
+**get** one — and what to check when it arrives.
+
+Quotes are issued **off-chain by Gyld's quote service**. You request a market;
+the service prices it inside the live NAV band, signs a `SwapMessage` with a
+key holding `QUOTE_SIGNER_ROLE`, and returns the message plus its 65-byte
+EIP-712 signature. You never sign the quote itself — the only signature on it
+is Gyld's. Your job on receipt is to **validate**, then execute.
+
+> ## ⚠️ TBD — pending backend publication
+>
+> The quote service's **endpoint URL, request/response schema, and
+> authentication mechanics are not yet published.** Do not code against an
+> assumed URL or payload shape. This section specifies what a quote is and what
+> you must validate on receipt; the transport contract will be added here once
+> the backend team publishes it.
+
+### Validate the `SwapMessage` on receipt
+
+The wire fields are defined in [§3](#3-the-swapmessage) and the pricing
+arithmetic in [§4](#4-capped-allowance-pricing--the-part-that-surprises-people).
+Check every field when the quote arrives:
+
+| Field | What to verify |
+|-------|----------------|
+| `taker` | **Equals the wallet you will submit from.** Quotes are not bearer paper — `executeSwap` reverts `NotTaker` unless `m.taker == msg.sender`, so a quote issued to any other address is useless to you. |
+| `tokenIn` / `tokenOut` | The pair you asked for — exactly one registered bond series, the other USDC. |
+| `maxAmountIn` | A **ceiling**, not a committed size. Your executable range is `[maxAmountIn / 100, maxAmountIn]` — there is a 1% dust floor below which the draw reverts. |
+| `price` | Fixed-point `amountOut` per `1e18 tokenIn`, **non-zero**. The output **floors**: `amountOut = requestedAmountIn * price / 1e18`, rounding down **in the maker's favour** — Gyld keeps the fractional remainder. Recompute the output for your intended draw and confirm it matches the rate you were quoted. |
+| `expiry` | Unix seconds. Quotes are issued **short-lived** by policy, and the contract imposes no upper bound — so verify `block.timestamp <= expiry` yourself, immediately before broadcasting, not just on receipt. An expired quote reverts `QuoteExpired`. |
+| `epoch` | Must equal the live `quoteEpoch()` — see [below](#detecting-invalidation-before-you-broadcast). |
+
+Sanctions screening is not your job: the quote service pre-screens takers
+off-chain before issuing, and the bond token re-screens on-chain at execution
+([§1](#compliance-is-enforced-at-the-token-not-here)). A taker sanctioned
+*after* issuance reverts inside the token leg — one more reason quotes are
+short-lived.
+
+### `quoteId` semantics — one counter, never reset
+
+Quote ids come from a **single, strictly-monotonic counter scoped to the proxy
+address**. Two properties you can rely on:
+
+- **The counter never resets — including across epochs.** `bumpQuoteEpoch`
+  invalidates every *outstanding* quote, but it does **not** free their ids: a
+  consumed `quoteId` stays consumed forever, and `isQuoteUsed(id)` keeps
+  returning `true` no matter how many epoch bumps follow.
+- **Ids are unique for the life of the proxy.** You will never be issued the
+  same `quoteId` twice, so `isQuoteUsed(quoteId)` is a reliable pre-flight
+  check: if it returns `true`, do not submit — the call reverts
+  `QuoteAlreadyUsed`.
+
+### One quote, one draw — partial draws must be deliberate
+
+A quote is **single-shot**. The first successful `executeSwap` burns the
+`quoteId` **in full**, whatever size you draw: drawing 10% of `maxAmountIn`
+permanently forfeits the remaining 90% — it is not carried forward and cannot
+be drawn later (see
+[§4](#4-capped-allowance-pricing--the-part-that-surprises-people)). Choose
+`requestedAmountIn` deliberately; if you want several fills, request several
+quotes up front.
+
+### Detecting invalidation before you broadcast
+
+A quote that was valid on arrival can be dead seconds later. Three cheap view
+calls tell you — run them **immediately before broadcasting**, not when the
+quote arrives:
+
+| Read | What it catches |
+|------|-----------------|
+| `quoteEpoch()` | **Epoch bump.** If it no longer equals `m.epoch`, Gyld rotated the signer generation and **every** outstanding quote is dead (`QuoteEpochStale`). Subscribe to the `QuoteEpochBumped` event if you hold quotes for longer than a few seconds. |
+| `isAllowed(yourAddress)` | **Allowlist revocation.** Compliance can revoke you at any moment; a revoked taker reverts `NotAllowed` no matter how valid the signature is. |
+| `isQuoteUsed(quoteId)` | **Consumption.** The id is already burned (`QuoteAlreadyUsed`). |
+
+### Validate-before-execute checklist
+
+```ts
+// Pseudocode, viem-shaped — run on receipt, and again before broadcasting.
+
+// 1. Taker binding — the quote is addressed to ONE wallet; not bearer paper.
+assert(quote.taker === myAddress);                             // else NotTaker
+
+// 2. Expiry — quotes are short-lived; check the clock NOW, not the arrival time.
+assert(BigInt(Math.floor(Date.now() / 1000)) <= quote.expiry); // else QuoteExpired
+
+// 3. Epoch — must equal the live generation; a bump kills ALL outstanding quotes.
+assert(quote.epoch === await swap.read.quoteEpoch());          // else QuoteEpochStale
+
+// 4. Allowlist — Gyld compliance can revoke you at any moment.
+assert(await swap.read.isAllowed([myAddress]));                // else NotAllowed
+
+// 5. quoteId — consumed ids stay consumed, even across epoch bumps.
+assert(!(await swap.read.isQuoteUsed([quote.quoteId])));       // else QuoteAlreadyUsed
+
+// 6. Draw range — [1% of maxAmountIn, maxAmountIn]; single-shot, residual forfeited.
+const minDraw = quote.maxAmountIn * 100n / 10_000n;            // MIN_DRAW_BPS / BPS_DENOMINATOR
+assert(requestedAmountIn >= minDraw && requestedAmountIn <= quote.maxAmountIn);
+
+// 7. Price — recompute the FLOORED output for your exact draw (rounding favours the maker).
+const amountOut = requestedAmountIn * quote.price / 10n ** 18n;
+assert(amountOut > 0n && amountOut === expectedOut);           // your off-chain expectation
+
+// 8. Digest parity — your EIP-712 encoding must equal the contract's (see §7).
+assert(await swap.read.hashSwapMessage([quote]) === hashTypedData({
+  domain, types, primaryType: 'SwapMessage', message: quote,
+}));
+```
+
+Every check above is a view call or local arithmetic — the whole checklist
+costs no gas, and each line pre-empts a named revert in
+[§6](#6-preconditions) / [`errors.md`](errors.md).
+
+---
+
+## 6. Preconditions
 
 `executeSwap` performs all checks before any transfer (checks-effects-
 interactions). Verify these off-chain first — every one is a cheap read.
@@ -335,13 +459,13 @@ The scaling is `tokenAmount(18dp) * nav(8dp) / 1e20 → USDC(6dp)`.
 
 ---
 
-## 6. Signing and execution
+## 7. Signing and execution
 
 In production **Gyld signs; you execute.** The signing snippets below exist so
 you can (a) verify a quote you were handed, and (b) run end-to-end tests against
 a local deployment. Never expect to hold a quote-signer key.
 
-### 6.1 viem
+### 7.1 viem
 
 ```ts
 import {
@@ -454,7 +578,7 @@ const hash = await wallet.writeContract({
 });
 ```
 
-### 6.2 ethers v6
+### 7.2 ethers v6
 
 ```ts
 import { Contract, JsonRpcProvider, Wallet, ZeroHash, parseUnits } from 'ethers';
@@ -538,7 +662,7 @@ const tx = await swap.executeSwap(
 await tx.wait();
 ```
 
-### 6.3 `cast` (Foundry)
+### 7.3 `cast` (Foundry)
 
 ```bash
 SWAP=0x...            # proxy address
@@ -594,7 +718,7 @@ Verified selectors, should you need them for raw calldata:
 
 ---
 
-## 7. Optional EIP-2612 permit
+## 8. Optional EIP-2612 permit
 
 `PermitData` lets you skip a separate `approve` transaction.
 
@@ -625,7 +749,7 @@ error. If you see that, check your permit signature and nonce.
 
 ---
 
-## 8. Events
+## 9. Events
 
 | Event | Signature |
 |-------|-----------|
@@ -645,7 +769,7 @@ first invalidates every quote you are holding, the second can revoke your access
 
 ---
 
-## 9. Roles (informational)
+## 10. Roles (informational)
 
 You will not hold any of these. They are listed so you understand what can change
 underneath you and how quickly.
@@ -675,14 +799,14 @@ Role identifiers, if you want to watch `RoleGranted`/`RoleRevoked`:
 
 ---
 
-## 10. Errors
+## 11. Errors
 
 Every custom error, with its computed 4-byte selector and the remedy, is in
 [`errors.md` §2](errors.md#2-solidity-custom-errors--gyldatomicswap).
 
 ---
 
-## 11. Licence
+## 12. Licence
 
 The contracts in this repository — including `GyldAtomicSwap.sol` — are licensed
 under the **Business Source License 1.1 (`BUSL-1.1`)**. They are **not** MIT.

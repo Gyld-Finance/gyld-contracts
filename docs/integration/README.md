@@ -132,9 +132,11 @@ is a gap in the source of truth, not a documentation choice.
    undocumented. See the [spec gaps table](rest-api.md#15-known-spec-gaps).
 9. **No rate-limit contract.** API keys carry a `rate_tier`, but no endpoint
    documents `429` or any rate-limit headers.
-10. **`GyldAtomicSwap` is deployed to a local development chain only.** There is
-    no public testnet or mainnet deployment, so no addresses can be published
-    and no integrator can test against a shared network. See the
+10. **`GyldAtomicSwap` public testnet deployment is in progress (Sepolia).**
+    The ERC-8056 / atomic-swap stack is being deployed to **Ethereum Sepolia
+    (chainId 11155111)** — the single supported public testnet for integrator
+    testing — but no addresses are published yet, so there is still no shared
+    network for an integrator to test against today. See the
     [address table](onchain-atomic-swap.md#2-contract-addresses).
 11. **The EIP-712 domain version is `"2"`, not `"1"`.** Any integration brief or
     client stub that hardcodes `"1"` will produce a digest that fails signature
