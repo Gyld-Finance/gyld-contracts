@@ -14,10 +14,11 @@ import {MockReentrantToken, ISwapReentryTarget} from "./MockReentrantToken.sol";
 // ─────────────────────────────────────────────────────────────────────────────
 // Spec-conformance suite for docs/atomic-swap-spec.md.
 //
-// Every test here pins a numbered invariant (I-n) or a normative test vector
-// from that document, and covers ONLY properties that GyldAtomicSwap.t.sol and
-// GyldAtomicSwap.invariants.t.sol do not already assert. Neither of those files
-// is modified. Each test names the invariant it discharges.
+// Every test here pins a numbered invariant (I-n), a normative test vector, or a
+// §10 finding remediation (F-n) from that document, and covers ONLY properties
+// that GyldAtomicSwap.t.sol and GyldAtomicSwap.invariants.t.sol do not already
+// assert. Neither of those files is modified by this suite. Each test names the
+// invariant or finding it discharges.
 //
 // Deliberate non-goals (already covered elsewhere, do not duplicate):
 //   I-2  replay             → [t] test_executeSwap_replayedQuoteId_reverts
@@ -667,17 +668,21 @@ contract GyldAtomicSwapSpecTest is Test {
     /// assumption the compliance design relies on.
     function test_executeSwap_neitherLegUsdc_reverts() public {
         _approveTaker();
-        address seriesB = address(0xD00D);
+        // A second registered series (18-decimal mock, never armed — a plain ERC-20
+        // here; registerSeries now probes decimals() == 18 on-chain, F-1).
+        MockReentrantToken seriesB = new MockReentrantToken();
         vm.prank(admin);
-        swap.registerSeries(seriesB, address(navFeed));
-        assertTrue(swap.registeredSeries(seriesB));
+        swap.registerSeries(address(seriesB), address(navFeed));
+        assertTrue(swap.registeredSeries(address(seriesB)));
 
         GyldAtomicSwap.SwapMessage memory m = _redeemQuote(14, 10e18);
-        m.tokenOut = seriesB; // bond → bond, both registered
+        m.tokenOut = address(seriesB); // bond → bond, both registered
         bytes memory sig = _sign(m);
 
         vm.prank(taker);
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NotOneBondLeg.selector, address(token), seriesB));
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldAtomicSwap.NotOneBondLeg.selector, address(token), address(seriesB))
+        );
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
@@ -717,6 +722,23 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), edge - 1));
         swap.executeSwap(m2, sig2, _noPermit(), m2.maxAmountIn);
+    }
+
+    /// F-6 extends I-15: a future-dated updatedAt would satisfy
+    /// `block.timestamp > updatedAt + maxNavAgeSecs` forever, so the guard rejects it
+    /// explicitly. updatedAt == block.timestamp remains the inclusive fresh edge (the
+    /// mock's default, exercised by every happy-path test).
+    function test_executeSwap_futureDatedNav_reverts() public {
+        _approveTaker();
+        uint256 future = block.timestamp + 100;
+        navFeed.setUpdatedAt(future);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(23, 1_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), future));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertFalse(swap.isQuoteUsed(23), "a future-dated NAV must not let the quote execute");
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -773,14 +795,42 @@ contract GyldAtomicSwapSpecTest is Test {
         assertFalse(swap.hasRole(adminRole, secondAdmin));
     }
 
+    /// F-7 extends I-8 to the incident-response pair: PAUSER and TREASURER renounce
+    /// MUST revert (a sole holder self-renouncing would remove pause() and
+    /// withdraw()-while-paused until the timelock re-grants). QUOTE_SIGNER and
+    /// ALLOWLIST_ADMIN stay renounceable — signer rotation and ops-key retirement.
+    function test_renounceRole_incidentResponseRoles_revert() public {
+        bytes32 pauserRole = swap.PAUSER_ROLE();
+        vm.prank(pauser);
+        vm.expectRevert(GyldAtomicSwap.CannotRenouncePauserRole.selector);
+        swap.renounceRole(pauserRole, pauser);
+
+        bytes32 treasurerRole = swap.TREASURER_ROLE();
+        vm.prank(treasurer);
+        vm.expectRevert(GyldAtomicSwap.CannotRenounceTreasurerRole.selector);
+        swap.renounceRole(treasurerRole, treasurer);
+
+        // The other two roles remain renounceable.
+        bytes32 signerRole = swap.QUOTE_SIGNER_ROLE();
+        vm.prank(signer);
+        swap.renounceRole(signerRole, signer);
+        assertFalse(swap.hasRole(signerRole, signer));
+
+        bytes32 allowlistRole = swap.ALLOWLIST_ADMIN_ROLE();
+        vm.prank(allowlistAdmin);
+        swap.renounceRole(allowlistRole, allowlistAdmin);
+        assertFalse(swap.hasRole(allowlistRole, allowlistAdmin));
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // I-19 — ERC-7201 storage location and packing
     // ═════════════════════════════════════════════════════════════════════════
 
     /// Pins spec §3.1: the base slot equals the ERC-7201 derivation, quoteEpoch /
-    /// maxQuoteDeviationBps / maxNavAgeSecs pack into B+0 at offsets 0 / 8 / 10, and
-    /// withdrawalWallet and usdc occupy B+1 and B+2. An upgrade that reorders or resizes
-    /// any of these silently corrupts live state.
+    /// maxQuoteDeviationBps / maxNavAgeSecs pack into B+0 at offsets 0 / 8 / 10,
+    /// withdrawalWallet and usdc occupy B+1 and B+2, and the F-4 addition maxQuoteTtl
+    /// sits at the append-only tail (B+8). An upgrade that reorders or resizes any of
+    /// these silently corrupts live state.
     function test_storageLayout_erc7201SlotAndPacking() public {
         bytes32 derived =
             keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff));
@@ -813,10 +863,19 @@ contract GyldAtomicSwapSpecTest is Test {
             "usdc must occupy B+2"
         );
 
+        // maxQuoteTtl (F-4) is appended AFTER the existing fields at B+8 — ERC-7201
+        // append-only: nothing above moved.
+        assertEq(
+            uint64(uint256(vm.load(address(swap), bytes32(uint256(derived) + 8)))),
+            swap.DEFAULT_MAX_QUOTE_TTL(),
+            "maxQuoteTtl must occupy B+8 offset 0 (8 bytes), seeded by initialize"
+        );
+
         // Getters agree with the raw slots.
         assertEq(swap.quoteEpoch(), 3);
         assertEq(swap.maxQuoteDeviationBps(), 0x0123);
         assertEq(swap.maxNavAgeSecs(), 0x04050607);
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -948,5 +1007,121 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.executeSwap(m, sig, p, m.maxAmountIn);
 
         assertFalse(swap.isQuoteUsed(20), "a short-allowance swap must not burn the quoteId");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // F-1 (O-4) — Decimal ladder enforced on-chain
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// O-4 is now enforced on-chain, not just operationally: registerSeries probes the
+    /// bond token for 18 decimals (the /1e20 ladder assumes 18dp bond / 8dp NAV / 6dp
+    /// USDC and mis-scales silently for anything else). MockUSDC (6dp) stands in for a
+    /// wrong-decimals series.
+    function test_registerSeries_non18dpToken_reverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(usdc), uint8(6)));
+        swap.registerSeries(address(usdc), address(navFeed));
+    }
+
+    /// The same probe guards the cash token at initialize: a non-6dp cash token would
+    /// silently vacuum the NAV band. The 18dp bond token stands in as the bad cash leg.
+    function test_initialize_non6dpCashToken_reverts() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(token), uint8(18)));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(token), MAX_BPS, MAX_NAV_AGE)
+            )
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // F-4 (S-4, I-23) — Quote expiry is TTL-bounded
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// S-4 is now enforced on-chain: a quote must satisfy
+    /// block.timestamp <= expiry <= block.timestamp + maxQuoteTtl. The upper edge is
+    /// INCLUSIVE — exactly at the TTL executes; one second beyond reverts.
+    function test_executeSwap_quoteExpiryTtlBound_inclusiveEdge() public {
+        _approveTaker();
+        uint64 ttl = swap.maxQuoteTtl();
+        assertEq(ttl, 1 hours, "spec: initialize seeds DEFAULT_MAX_QUOTE_TTL = 1 hour");
+
+        GyldAtomicSwap.SwapMessage memory atEdge = _buyQuote(24, 1_000e6);
+        atEdge.expiry = uint64(block.timestamp + ttl);
+        bytes memory edgeSig = _sign(atEdge);
+        vm.prank(taker);
+        swap.executeSwap(atEdge, edgeSig, _noPermit(), atEdge.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(24), "expiry exactly at block.timestamp + maxQuoteTtl must execute");
+
+        GyldAtomicSwap.SwapMessage memory beyond = _buyQuote(25, 1_000e6);
+        beyond.expiry = uint64(block.timestamp + uint256(ttl) + 1);
+        bytes memory beyondSig = _sign(beyond);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, beyond.expiry, uint64(block.timestamp + ttl)
+            )
+        );
+        swap.executeSwap(beyond, beyondSig, _noPermit(), beyond.maxAmountIn);
+        assertFalse(swap.isQuoteUsed(25), "a too-far-out quote must not burn the quoteId");
+    }
+
+    /// The TTL is admin-adjustable and the setter is DEFAULT_ADMIN-gated (spec §7) —
+    /// narrowing it immediately invalidates longer-dated outstanding quotes.
+    function test_setMaxQuoteTtl_adminOnly_takesEffectImmediately() public {
+        _approveTaker();
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxQuoteTtl(5 minutes);
+
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(5 minutes);
+        assertEq(swap.maxQuoteTtl(), 5 minutes);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(26, 1_000e6); // expiry = +15 min
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 5 minutes)
+            )
+        );
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // F-5 (I-24) — seriesList is observable; swap-and-pop pinned
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// seriesList MUST stay a duplicate-free mirror of registeredSeries, and the
+    /// deregister swap-and-pop MUST move the last element into the removed slot. Pins
+    /// the two previously untestable cases from F-5: mid-array target and last-element.
+    function test_seriesList_swapAndPop_midArrayAndLastElement() public {
+        MockReentrantToken seriesB = new MockReentrantToken();
+        MockReentrantToken seriesC = new MockReentrantToken();
+        vm.startPrank(admin);
+        swap.registerSeries(address(seriesB), address(navFeed));
+        swap.registerSeries(address(seriesC), address(navFeed));
+        vm.stopPrank();
+        assertEq(swap.seriesCount(), 3);
+
+        // Mid-array target: [token, B, C] → deregister B → C fills slot 1.
+        vm.prank(admin);
+        swap.deregisterSeries(address(seriesB));
+        assertEq(swap.seriesCount(), 2);
+        assertEq(swap.seriesAt(0), address(token));
+        assertEq(swap.seriesAt(1), address(seriesC), "swap-and-pop must move the tail into the gap");
+
+        // Last-element target: [token, C] → deregister C → tail popped, order kept.
+        vm.prank(admin);
+        swap.deregisterSeries(address(seriesC));
+        assertEq(swap.seriesCount(), 1);
+        assertEq(swap.seriesAt(0), address(token));
+
+        // The mirror stays exact: deregistered entries are gone from both views.
+        assertFalse(swap.registeredSeries(address(seriesB)));
+        assertFalse(swap.registeredSeries(address(seriesC)));
     }
 }

@@ -27,6 +27,7 @@ contract GyldAtomicSwapTest is Test {
     event QuoteEpochBumped(uint64 indexed newEpoch);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
+    event MaxQuoteTtlUpdated(uint64 newTtl);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     GyldAtomicSwap swap;
@@ -299,6 +300,34 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpired.selector, m.expiry));
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// F-4: a quote expiring beyond block.timestamp + maxQuoteTtl is rejected even
+    /// though it has not expired — immortal quotes are unsignable.
+    function test_executeSwap_expiryBeyondMaxQuoteTtl_reverts() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(70);
+        m.expiry = uint64(block.timestamp + swap.maxQuoteTtl() + 1);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        // Cache before vm.prank — a getter call would consume the prank.
+        uint64 maxAllowed = uint64(block.timestamp + swap.maxQuoteTtl());
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, maxAllowed));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertFalse(swap.isQuoteUsed(70), "a too-far-out quote must not burn the quoteId");
+    }
+
+    /// The TTL bound is INCLUSIVE: expiry == block.timestamp + maxQuoteTtl executes.
+    function test_executeSwap_expiryExactlyMaxQuoteTtl_succeeds() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(71);
+        m.expiry = uint64(block.timestamp + swap.maxQuoteTtl());
+        bytes memory sig = _sign(m, SIGNER_PK);
+
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(71), "expiry exactly at the TTL bound must execute");
     }
 
     function test_executeSwap_staleEpoch_reverts() public {
@@ -657,6 +686,24 @@ contract GyldAtomicSwapTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
+    /// F-6: a future-dated updatedAt would satisfy the age check forever
+    /// (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — it must revert
+    /// StaleNav just like an old feed. The inclusive fresh edge updatedAt ==
+    /// block.timestamp is the mock's default, exercised by every happy-path test.
+    function test_executeSwap_futureDatedNav_reverts() public {
+        uint256 future = block.timestamp + 1;
+        navFeed.setUpdatedAt(future);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(73);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), future));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
     /// A quote where NEITHER leg is a registered series against USDC → NotOneBondLeg.
     function test_executeSwap_unregisteredSeries_reverts() public {
         // Deregister the series (after draining inventory so the guard passes).
@@ -726,6 +773,22 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(0xD00D), eoa);
     }
 
+    /// F-1: the bond token's decimals are probed on-chain — a 6-decimal "series"
+    /// (MockUSDC standing in) would silently vacuum the /1e20 NAV band.
+    function test_registerSeries_wrongDecimalsToken_reverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(usdc), uint8(6)));
+        swap.registerSeries(address(usdc), address(navFeed));
+    }
+
+    /// F-1: a token with no decimals() at all (EOA) is rejected too — reported as 0.
+    function test_registerSeries_tokenWithoutDecimals_reverts() public {
+        address eoa = address(0xD00D);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, eoa, uint8(0)));
+        swap.registerSeries(eoa, address(navFeed));
+    }
+
     function test_registerSeries_zeroAddress_reverts() public {
         vm.prank(admin);
         vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
@@ -749,6 +812,68 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.UnregisteredSeries.selector, address(0xD00D)));
         swap.deregisterSeries(address(0xD00D));
+    }
+
+    // ── seriesList getters (F-5) ──────────────────────────────────────────────
+
+    /// seriesCount/seriesAt mirror the registry: setUp registered `token`; further
+    /// series append in registration order. (MockReentrantToken reports 18 decimals
+    /// and is never armed here — a plain ERC-20.)
+    function test_seriesList_registerMultiple_appendsInOrder() public {
+        assertEq(swap.seriesCount(), 1);
+        assertEq(swap.seriesAt(0), address(token));
+
+        MockReentrantToken seriesB = new MockReentrantToken();
+        MockReentrantToken seriesC = new MockReentrantToken();
+        vm.startPrank(admin);
+        swap.registerSeries(address(seriesB), address(navFeed));
+        swap.registerSeries(address(seriesC), address(navFeed));
+        vm.stopPrank();
+
+        assertEq(swap.seriesCount(), 3);
+        assertEq(swap.seriesAt(0), address(token));
+        assertEq(swap.seriesAt(1), address(seriesB));
+        assertEq(swap.seriesAt(2), address(seriesC));
+
+        // Re-registering an active series updates the forwarder, not the list.
+        vm.prank(admin);
+        swap.registerSeries(address(seriesB), address(navFeed));
+        assertEq(swap.seriesCount(), 3, "re-register must not duplicate the entry");
+    }
+
+    /// Swap-and-pop with the target MID-array: the last element moves into the gap.
+    function test_seriesList_deregisterMidArray_swapsLastIntoGap() public {
+        MockReentrantToken seriesB = new MockReentrantToken();
+        MockReentrantToken seriesC = new MockReentrantToken();
+        vm.startPrank(admin);
+        swap.registerSeries(address(seriesB), address(navFeed));
+        swap.registerSeries(address(seriesC), address(navFeed));
+        vm.stopPrank();
+
+        // [token, B, C] → deregister B → C takes B's slot.
+        vm.prank(admin);
+        swap.deregisterSeries(address(seriesB));
+
+        assertEq(swap.seriesCount(), 2);
+        assertEq(swap.seriesAt(0), address(token));
+        assertEq(swap.seriesAt(1), address(seriesC), "last element must fill the gap");
+        assertFalse(swap.registeredSeries(address(seriesB)));
+        assertEq(swap.navForwarderOf(address(seriesB)), address(0));
+    }
+
+    /// Swap-and-pop with the target AS the last element: the tail is just popped and
+    /// the surviving prefix keeps its order.
+    function test_seriesList_deregisterLastElement_popsTail() public {
+        MockReentrantToken seriesB = new MockReentrantToken();
+        vm.prank(admin);
+        swap.registerSeries(address(seriesB), address(navFeed));
+
+        // [token, B] → deregister B (last) → [token].
+        vm.prank(admin);
+        swap.deregisterSeries(address(seriesB));
+
+        assertEq(swap.seriesCount(), 1);
+        assertEq(swap.seriesAt(0), address(token));
     }
 
     // ── Pause ─────────────────────────────────────────────────────────────────
@@ -938,6 +1063,39 @@ contract GyldAtomicSwapTest is Test {
         swap.setMaxNavAgeSecs(0);
     }
 
+    /// initialize seeds maxQuoteTtl to DEFAULT_MAX_QUOTE_TTL (1 hour, F-4) — the
+    /// suite's 15-minute quote expiry sits well inside it.
+    function test_initialize_seedsDefaultMaxQuoteTtl() public view {
+        assertEq(swap.maxQuoteTtl(), 1 hours);
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
+    }
+
+    function test_setMaxQuoteTtl_onlyAdmin_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxQuoteTtl(2 hours);
+    }
+
+    function test_setMaxQuoteTtl_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit MaxQuoteTtlUpdated(15 minutes);
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(15 minutes);
+        assertEq(swap.maxQuoteTtl(), 15 minutes);
+
+        // A 20-minute quote was legal under the 1-hour default but is now too far out.
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(72);
+        m.expiry = uint64(block.timestamp + 20 minutes);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 15 minutes)
+            )
+        );
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
     function test_initialize_zeroUsdc_reverts() public {
         GyldAtomicSwap impl = new GyldAtomicSwap();
         vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
@@ -945,6 +1103,19 @@ contract GyldAtomicSwapTest is Test {
             address(impl),
             abi.encodeCall(
                 GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(0), MAX_BPS, MAX_NAV_AGE)
+            )
+        );
+    }
+
+    /// F-1: initialize probes the cash token's decimals on-chain — an 18-decimal
+    /// "USDC" (the bond token standing in) must be rejected before any state is set.
+    function test_initialize_wrongDecimalsUsdc_reverts() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(token), uint8(18)));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(token), MAX_BPS, MAX_NAV_AGE)
             )
         );
     }
@@ -1006,6 +1177,25 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         vm.expectRevert(GyldAtomicSwap.CannotRenounceAdminRole.selector);
         swap.renounceRole(adminRole, admin);
+    }
+
+    /// F-7: the incident-response pair cannot be self-renounced — a sole pauser or
+    /// treasurer renouncing would remove pause() / withdraw()-while-paused until the
+    /// timelock re-grants (the very delay those roles exist to bypass).
+    function test_renounceRole_pauser_reverts() public {
+        bytes32 pauserRole = swap.PAUSER_ROLE();
+        vm.prank(pauser);
+        vm.expectRevert(GyldAtomicSwap.CannotRenouncePauserRole.selector);
+        swap.renounceRole(pauserRole, pauser);
+        assertTrue(swap.hasRole(pauserRole, pauser));
+    }
+
+    function test_renounceRole_treasurer_reverts() public {
+        bytes32 treasurerRole = swap.TREASURER_ROLE();
+        vm.prank(treasurer);
+        vm.expectRevert(GyldAtomicSwap.CannotRenounceTreasurerRole.selector);
+        swap.renounceRole(treasurerRole, treasurer);
+        assertTrue(swap.hasRole(treasurerRole, treasurer));
     }
 
     function test_renounceRole_quoteSigner_succeeds() public {
