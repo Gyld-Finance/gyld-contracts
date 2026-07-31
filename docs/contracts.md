@@ -365,8 +365,27 @@ storage slot and does not affect the ERC-7201 layout.
 
 | Network | Chain ID | Address | Status |
 |---------|----------|---------|--------|
-| Ethereum Sepolia | 11155111 | — | ⏳ **Pending — deployment in progress.** The single supported public testnet for integrator testing |
+| Ethereum Sepolia | 11155111 | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` (proxy) | ✅ **Live for integrator testing** (2026-07-31). Dev-mode wiring: deployer EOA holds all roles (no timelock handover); deployed from pre-GYL-1135-hardened scripts — see caveat below |
 | Local Anvil | 31337 | — | Local development only (ephemeral) |
+
+Sepolia smoke-test series (throwaway, deployed alongside the swap for the
+end-to-end run — **not** a real bond series):
+
+| Contract | Address |
+|----------|---------|
+| `GyldBondToken` proxy (ISIN `TEST8056A00001`, "GTB8056") | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` |
+| `GyldBondToken` ERC-8056 implementation | `0x72FAE4fa227e7E28BF315BA363dE39E371a49C52` |
+| `KaleidoscopeNAVFeed` (NAV $100.00 pushed) | `0x4266a4A43Db435056f60C02b37fA8586E58597Fa` |
+| `NAVFeedForwarder` | `0x49be531A7C48077483997d92D7BeF759dd7b2b53` |
+| USDC (Circle Sepolia) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
+
+Verified on-chain 2026-07-31 (`contracts/script/SepoliaAtomicSwapSmoke.s.sol`):
+inventory seeded via `subscribe` (100 bonds + 2 USDC), signed BUY quote executed
+(2 USDC → 0.02 bonds, `quoteId 1` burned), ERC-8056 multiplier updated live
+(1.05×) and scheduled (1.04×), all four ERC-165 interface ids answer `true`.
+Caveat: deployed before the GYL-1134/1135 hardening landed on this branch
+(NAV-age ceiling, fail-closed deploy guards) — redeploy/upgrade after the
+branch merges if this test instance is kept.
 
 ### Storage layout
 

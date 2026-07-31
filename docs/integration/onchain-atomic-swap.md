@@ -11,7 +11,7 @@ your own wallet, Gyld signs a quote off-chain, and you execute it yourself.
 | Licence | **BUSL-1.1** (Business Source License 1.1) — see [§12](#12-licence) |
 | Solidity | `=0.8.28` (exact pin) |
 | Upgradeability | UUPS proxy — **integrate against the proxy address**, never the implementation |
-| Deployment | ⚠️ **Sepolia (11155111) deployment in progress — no addresses published yet.** See [§2](#2-contract-addresses) |
+| Deployment | ✅ **Live on Ethereum Sepolia (11155111) for integrator testing** (dev-mode roles, throwaway series). See [§2](#2-contract-addresses) |
 
 ---
 
@@ -74,12 +74,13 @@ Mixing these up is the second most common integration error. See
 
 ## 2. Contract addresses
 
-> ## ⚠️ TBD — Sepolia deployment in progress; no addresses published yet
+> ## ✅ Live on Sepolia — integrator sandbox
 >
-> The atomic-swap stack is being deployed to **Ethereum Sepolia
-> (chainId 11155111)**. Until that deployment lands there is no address for a
-> third party to integrate against, and **no addresses are published in this
-> document** — the table below will be updated when they exist.
+> The atomic-swap stack is deployed on **Ethereum Sepolia
+> (chainId 11155111)** for third-party integration testing. It runs a
+> throwaway test bond series with dev-mode role wiring (a single deployer
+> key holds every role) — exercise the full swap flow here, but confirm
+> production wiring before mainnet.
 
 **Sepolia (chainId 11155111) is the single supported public testnet for
 integrator testing.** When the deployment lands, its addresses will be
@@ -94,17 +95,21 @@ backend-internal environment — not an integrator surface — and Anvil (chain
 | Local Anvil | 31337 | `GyldBondToken` series | — | Local development only. |
 | Local Anvil | 31337 | `NAVFeedForwarder` | — | Local development only. |
 | Local Anvil | 31337 | USDC (mock) | — | **Mock** USDC. Note the real USDC permit differs — see [§8](#8-optional-eip-2612-permit). |
-| Ethereum Sepolia | 11155111 | `GyldAtomicSwap` (proxy) | — | ⏳ **Pending — deployment in progress.** The supported public testnet for integrator testing; the proxy address will be published here. Sepolia already carries the token/NAV stack the swap settles against. |
+| Ethereum Sepolia | 11155111 | `GyldAtomicSwap` (proxy) | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` | ✅ **Live for integrator testing** (deployed 2026-07-31). Dev-mode wiring: a single deployer key holds all roles (no timelock handover); do not treat role separation as exercised here. |
+| Ethereum Sepolia | 11155111 | `GyldBondToken` test series (proxy) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | Throwaway smoke-test series ("GTB8056", ISIN `TEST8056A00001`), ERC-8056 implementation live — **not** a real bond series. |
+| Ethereum Sepolia | 11155111 | `NAVFeedForwarder` (test series) | `0x49be531A7C48077483997d92D7BeF759dd7b2b53` | 8-dp NAV oracle the swap's band reads. |
+| Ethereum Sepolia | 11155111 | USDC (Circle) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | Real Sepolia USDC, 6 dp. |
 | Ethereum Hoodi | 560048 | `GyldAtomicSwap` | — | Backend-internal testing only — **not an integrator surface**. |
 | Base | 8453 | `GyldAtomicSwap` | — | **Not deployed.** Chain 8453 is Base **mainnet** and carries token and lending-integration contracts only — **not** the atomic-swap stack. |
 | Any other public network | — | `GyldAtomicSwap` | — | **Not deployed.** |
 
-**What this means for you:** you cannot integrate against a shared network
-today. Build against a local deployment for development, and treat everything
-in this document as an interface contract to be re-verified when the Sepolia
-deployment lands. Because the contract is a **UUPS proxy**, always resolve the
-proxy address from Gyld at integration time rather than hardcoding it — and
-re-check the `SWAP_MESSAGE_TYPEHASH` and EIP-712 domain after any upgrade.
+**What this means for you:** you can integrate against the Sepolia deployment
+today. Note the swap proxy on Sepolia is wired in **dev mode** (one deployer key
+holds every role; no timelock handover) and runs a throwaway test series — it is
+an integration sandbox, not a production mirror. Because the contract is a
+**UUPS proxy**, always resolve the proxy address from Gyld at integration time
+rather than hardcoding it — and re-check the `SWAP_MESSAGE_TYPEHASH` and EIP-712
+domain after any upgrade.
 
 ---
 
