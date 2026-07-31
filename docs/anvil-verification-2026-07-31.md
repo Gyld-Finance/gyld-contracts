@@ -626,3 +626,15 @@ Unchanged from before this verification, as expected — no source file was modi
 | 8 | Production happy path: deployer holds no roles, 48h delay, not a proposer | PASS (except factory ownership, F-3) |
 | 9 | CREATE2 addresses differ across chains | PASS for CREATE2 contracts; `TokenFactory` still collides (F-2) |
 | 10 | `forge test` still 511 passing | PASS |
+
+---
+
+## Follow-up: ERC-8056
+
+This run did not touch the ERC-8056 (Scaled UI Amount) UI multiplier. That lifecycle was
+verified separately against live Anvil — including the E-F1 upgrade window against a real
+pre-ERC-8056 proxy, and the `UI_MULTIPLIER_ROLE` deploy wiring this run showed was missing
+from every deploy script — in
+[`anvil-verification-erc8056-2026-07-31.md`](anvil-verification-erc8056-2026-07-31.md)
+(GYL-1136). Note that document numbers the ERC-8056 spec's own F-1/F-2/F-3 remediation
+items, which are unrelated to the F-1/F-2/F-3 findings in [§7](#7-findings) above.
