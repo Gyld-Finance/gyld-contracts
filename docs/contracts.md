@@ -256,6 +256,13 @@ Implements `AggregatorV3Interface` for DeFi protocol compatibility.
 | `MIN_UPDATE_INTERVAL` | 1 hour | Prevents rapid price oscillation from a compromised KMS key |
 | `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | Single-update deviation cap after first push |
 
+**Monitoring views** (reported, never enforced — reads have no staleness revert path):
+
+| View | Returns |
+|------|---------|
+| `isFresh()` | `true` if the last push is within `MAX_STALENESS`; `false` if stale or never set |
+| `stalenessSeconds()` | Seconds since the last push; `type(uint256).max` if never set. Added GYL-1135 — this contract is **not upgradeable**, so already-deployed feeds do not have it; use `latestRoundData().updatedAt` for those. |
+
 **Emergency price correction:**
 
 If a wrong price is pushed within the 10 % band, `MIN_UPDATE_INTERVAL` and
@@ -282,6 +289,14 @@ rules can alert on any use. Every use should trigger an immediate ops review.
 
 Permanent DeFi-facing oracle address. Delegates all reads to a swappable upstream oracle.
 Owner calls `setUpstreamOracle(address)` to upgrade the data source without redeploying DeFi markets.
+
+**Upstream probes** (constructor and `setUpstreamOracle`): the candidate must return
+`decimals() == 8` and a well-formed `version()`, and its `latestRoundData()` must not
+report a **future-dated** `updatedAt` (`UpstreamFutureDated`, GYL-1135) — a future
+timestamp satisfies every consumer's `now - updatedAt <= maxAge` check unconditionally, so
+one pointer swap would silently disarm every integrator's staleness defence at once. An
+upstream with no price pushed yet is still accepted (`latestRoundData()` reverting
+`NoPriceSet` is a legitimate pre-first-push state).
 
 **Upgrade path:**
 
@@ -319,6 +334,22 @@ Deploy script: `contracts/script/DeployAtomicSettlement.s.sol` (env vars in
   no partial-balance carry-over.
 - The signed price is what executes; the series' NAV feed is only a sanity band
   (`maxQuoteDeviationBps`), fail-closed on a stale or non-positive NAV.
+
+### NAV staleness bound
+
+`_checkQuoteBand` reverts `StaleNav` when `block.timestamp > updatedAt + maxNavAgeSecs`,
+and also when `updatedAt` is in the future. Because `KaleidoscopeNAVFeed` never reverts on
+a stale answer (Chainlink read semantics), **this consumer-side check is the only
+staleness defence in the swap path**.
+
+`maxNavAgeSecs` is admin-settable but structurally bounded:
+`0 < maxNavAgeSecs <= MAX_NAV_AGE_CEILING` (**72 hours**), enforced in both `initialize`
+and `setMaxNavAgeSecs` (GYL-1135). Deployed default is 86400 (24 h). Without the ceiling a
+single `DEFAULT_ADMIN_ROLE` call could raise the bound toward the `uint32` maximum
+(~136 years) and turn the guard into a no-op while every getter still reported it as
+configured. 72 h matches Euler's structural `MAX_STALENESS_UPPER_BOUND` and keeps
+3-day-holiday tolerance reachable. `MAX_NAV_AGE_CEILING` is a `constant`, so it adds no
+storage slot and does not affect the ERC-7201 layout.
 
 ### Roles
 

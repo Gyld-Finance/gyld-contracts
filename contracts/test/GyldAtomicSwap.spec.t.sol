@@ -51,6 +51,10 @@ contract GyldAtomicSwapSpecTest is Test {
     uint16 constant MAX_BPS = 200; // ±2%
     uint32 constant MAX_NAV_AGE = 1 days;
 
+    /// Distinguishable probe value for the ERC-7201 packing test. Must stay
+    /// 0 < LAYOUT_NAV_AGE <= GyldAtomicSwap.MAX_NAV_AGE_CEILING (72 h = 259_200 s).
+    uint32 constant LAYOUT_NAV_AGE = 0x0003F123; // 258_339 s ≈ 71.76 h
+
     bytes32 constant PERMIT_TYPEHASH =
         keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 
@@ -742,6 +746,161 @@ contract GyldAtomicSwapSpecTest is Test {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // I-15 (GYL-1135) — the staleness guard is structurally bounded
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    // Context. KaleidoscopeNAVFeed deliberately does NOT revert on a stale answer
+    // (Chainlink read semantics — see KaleidoscopeNAVFeed.t.sol
+    // test_noStalenessRevertPathExists). That makes this contract's StaleNav check the
+    // ONLY thing preventing a swap from being priced against a NAV nobody has
+    // refreshed. Before GYL-1135, setMaxNavAgeSecs validated non-zero only, and uint32
+    // reaches ~136 years — so a single DEFAULT_ADMIN_ROLE transaction could raise the
+    // bound past any real elapsed time and turn the guard into a no-op while every
+    // getter still reported it as "set". MAX_NAV_AGE_CEILING closes that.
+
+    /// No admin call, for any input above the ceiling, can widen the staleness bound.
+    function testFuzz_setMaxNavAgeSecs_revertsAboveCeiling(uint32 newSecs) public {
+        uint32 ceiling = swap.MAX_NAV_AGE_CEILING();
+        newSecs = uint32(bound(uint256(newSecs), uint256(ceiling) + 1, type(uint32).max));
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, newSecs));
+        swap.setMaxNavAgeSecs(newSecs);
+
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE, "a rejected setter must leave the bound untouched");
+    }
+
+    /// The ceiling itself is accepted — the bound is inclusive, so a deliberate
+    /// 3-day-holiday tolerance remains configurable.
+    function test_setMaxNavAgeSecs_ceilingExactlyIsAccepted() public {
+        uint32 ceiling = swap.MAX_NAV_AGE_CEILING();
+        assertEq(ceiling, 72 hours, "ceiling must match Euler's structural upper bound");
+
+        vm.prank(admin);
+        swap.setMaxNavAgeSecs(ceiling);
+        assertEq(swap.maxNavAgeSecs(), ceiling);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, ceiling + 1));
+        swap.setMaxNavAgeSecs(ceiling + 1);
+    }
+
+    /// The same bound applies at construction — otherwise a fresh deployment could be
+    /// born with the guard already disabled and never trip the setter check.
+    function test_initialize_revertsAboveCeiling() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        uint32 ceiling = impl.MAX_NAV_AGE_CEILING();
+        uint32 tooLarge = ceiling + 1;
+
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, tooLarge));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, tooLarge)
+            )
+        );
+
+        // uint32 max — the "just make it never expire" value — is rejected too.
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, type(uint32).max));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize,
+                (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, type(uint32).max)
+            )
+        );
+
+        // Zero is still rejected (pre-existing rule), and the ceiling still deploys.
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, uint32(0)));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, uint32(0))
+            )
+        );
+
+        GyldAtomicSwap ok = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(impl),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, ceiling)
+                    )
+                )
+            )
+        );
+        assertEq(ok.maxNavAgeSecs(), ceiling);
+    }
+
+    /// REGRESSION TEST FOR THE INCIDENT CLASS (GYL-1135).
+    ///
+    /// On Base mainnet the NAV feed stopped being pushed on 2026-05-19. Euler froze on
+    /// its own staleness check; Morpho, which has none, kept quoting the last pushed
+    /// $100.00 answer indefinitely. This contract is on the Euler side of that line
+    /// only because maxNavAgeSecs is small — and that was, until now, one admin
+    /// transaction away from being untrue. This test asserts the guard survives a
+    /// full-authority attempt to remove it: hold DEFAULT_ADMIN_ROLE, push the bound to
+    /// uint32 max, and confirm an ancient NAV still fails closed afterwards.
+    function test_staleNavGuardCannotBeDisabledByAdmin() public {
+        _approveTaker();
+
+        // Full authority: a fresh admin account holding DEFAULT_ADMIN_ROLE, i.e. the
+        // strongest caller that exists on this contract.
+        address rogueAdmin = address(0xBADADD);
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        vm.prank(admin);
+        swap.grantRole(adminRole, rogueAdmin);
+        assertTrue(swap.hasRole(adminRole, rogueAdmin));
+
+        // Attempt 1: the direct "never expire" value.
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, type(uint32).max));
+        swap.setMaxNavAgeSecs(type(uint32).max);
+
+        // Attempt 2: a plausible-looking but still guard-defeating 10 years.
+        uint32 tenYears = 3650 days;
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, tenYears));
+        swap.setMaxNavAgeSecs(tenYears);
+
+        // The bound is unchanged, and is still meaningfully small.
+        // Cache the ceiling before pranking — a getter call would consume the prank.
+        uint32 ceiling = swap.MAX_NAV_AGE_CEILING();
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE);
+        assertLe(swap.maxNavAgeSecs(), ceiling);
+
+        // The widest the admin CAN go is 72 h — apply it, to prove the guard still
+        // bites even at maximum permitted laxity.
+        vm.prank(rogueAdmin);
+        swap.setMaxNavAgeSecs(ceiling);
+
+        // Now replay the mainnet scenario: a feed that stopped 72 days ago. The feed
+        // itself happily returns the pinned answer (it never reverts) — this contract
+        // must refuse to trade on it.
+        uint256 abandonedAt = block.timestamp - 72 days;
+        navFeed.setUpdatedAt(abandonedAt);
+        (, int256 nav,, uint256 updatedAt,) = navFeed.latestRoundData();
+        assertEq(nav, NAV, "the feed still serves a price - that is the whole problem");
+        assertEq(updatedAt, abandonedAt);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(91, 1_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), abandonedAt));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertFalse(swap.isQuoteUsed(91), "no swap may settle against an abandoned NAV");
+
+        // And once the keeper resumes, trading resumes — the guard is a pause, not a brick.
+        navFeed.setUpdatedAt(block.timestamp);
+        GyldAtomicSwap.SwapMessage memory m2 = _buyQuote(92, 1_000e6);
+        bytes memory sig2 = _sign(m2);
+        vm.prank(taker);
+        swap.executeSwap(m2, sig2, _noPermit(), m2.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(92), "a refreshed NAV must restore tradability");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // I-17 — Reentrancy exclusion covers withdraw too
     // ═════════════════════════════════════════════════════════════════════════
 
@@ -842,13 +1001,19 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.bumpQuoteEpoch();
         swap.bumpQuoteEpoch(); // quoteEpoch = 3
         swap.setMaxQuoteDeviationBps(0x0123); // 291 bps
-        swap.setMaxNavAgeSecs(0x04050607);
+        // GYL-1135: maxNavAgeSecs is now bounded by MAX_NAV_AGE_CEILING (72 h), so this
+        // probe value can no longer be an arbitrary uint32. 0x0003F123 (258_339 s ≈
+        // 71.76 h) is the widest distinguishable value that still passes the setter.
+        // Consequence for this test: byte 13 of the field is necessarily 0x00, so the
+        // assertion below no longer distinguishes uint32 from uint24 by content alone —
+        // the `slot0 >> 112 == 0` assertion plus the ceiling itself carry that instead.
+        swap.setMaxNavAgeSecs(LAYOUT_NAV_AGE);
         vm.stopPrank();
 
         uint256 slot0 = uint256(vm.load(address(swap), derived));
         assertEq(uint64(slot0), uint64(3), "quoteEpoch must occupy B+0 offset 0 (8 bytes)");
         assertEq(uint16(slot0 >> 64), uint16(0x0123), "maxQuoteDeviationBps must occupy B+0 offset 8 (2 bytes)");
-        assertEq(uint32(slot0 >> 80), uint32(0x04050607), "maxNavAgeSecs must occupy B+0 offset 10 (4 bytes)");
+        assertEq(uint32(slot0 >> 80), LAYOUT_NAV_AGE, "maxNavAgeSecs must occupy B+0 offset 10 (4 bytes)");
         assertEq(slot0 >> 112, 0, "bytes 14..31 of B+0 must remain free");
 
         // withdrawalWallet does NOT pack into B+0 (14 bytes used + 20 needed > 32).
@@ -874,7 +1039,7 @@ contract GyldAtomicSwapSpecTest is Test {
         // Getters agree with the raw slots.
         assertEq(swap.quoteEpoch(), 3);
         assertEq(swap.maxQuoteDeviationBps(), 0x0123);
-        assertEq(swap.maxNavAgeSecs(), 0x04050607);
+        assertEq(swap.maxNavAgeSecs(), LAYOUT_NAV_AGE);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
     }
 

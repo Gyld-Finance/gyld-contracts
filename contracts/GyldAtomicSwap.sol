@@ -136,6 +136,19 @@ contract GyldAtomicSwap is
     ///      issue-to-submit window (spec S-4: expiry must be short-lived, near-term).
     uint64 public constant DEFAULT_MAX_QUOTE_TTL = 1 hours;
 
+    /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
+    ///      `setMaxNavAgeSecs` only rejected zero — and `uint32` tops out at ~136 years,
+    ///      so a single DEFAULT_ADMIN_ROLE call could disable the StaleNav guard entirely
+    ///      while leaving the NAV band nominally "enforced" against a price nobody
+    ///      refreshed. The upstream feed deliberately does NOT revert on staleness
+    ///      (Chainlink read semantics), so this consumer-side check is the only thing
+    ///      standing between a frozen NAV keeper and quotes validated against a dead
+    ///      price. 72 h matches Euler's structural MAX_STALENESS_UPPER_BOUND and keeps
+    ///      3-day-holiday tolerance available; the deployed default is 24 h.
+    ///      Enforced in BOTH initialize and setMaxNavAgeSecs — a `constant` costs no
+    ///      storage slot, so the ERC-7201 layout is unchanged.
+    uint32 public constant MAX_NAV_AGE_CEILING = 72 hours;
+
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
     /// @custom:storage-location erc7201:gyld.GyldAtomicSwap
@@ -238,7 +251,8 @@ contract GyldAtomicSwap is
     ///                               2%). Capped at BPS_DENOMINATOR; 0 is permitted and
     ///                               forces quotes to match NAV exactly (soft-pause).
     /// @param maxNavAgeSecs_         Max NAV feed age before executeSwap fails closed
-    ///                               with StaleNav. Must be non-zero.
+    ///                               with StaleNav. Must be non-zero and at most
+    ///                               MAX_NAV_AGE_CEILING (72 h) — see GYL-1135.
     /// @dev    withdrawalWallet is deliberately NOT set here — it starts at address(0)
     ///         and must be set post-deploy by the admin via setWithdrawalWallet.
     ///         withdraw() reverts ZeroAddress until then (fail-closed).
@@ -257,7 +271,7 @@ contract GyldAtomicSwap is
                 || usdc_ == address(0)
         ) revert ZeroAddress();
         if (maxQuoteDeviationBps_ > BPS_DENOMINATOR) revert InvalidDeviationBps(maxQuoteDeviationBps_);
-        if (maxNavAgeSecs_ == 0) revert InvalidNavAge(maxNavAgeSecs_);
+        if (maxNavAgeSecs_ == 0 || maxNavAgeSecs_ > MAX_NAV_AGE_CEILING) revert InvalidNavAge(maxNavAgeSecs_);
         // Probe-before-store (house idiom, F-1): the cash token must report 6 decimals —
         // the /1e20 ladder in _checkQuoteBand assumes 18dp bond / 8dp NAV / 6dp USDC and
         // mis-scales silently for any other cash token.
@@ -591,10 +605,17 @@ contract GyldAtomicSwap is
     }
 
     /// @notice Set the max NAV feed age (seconds) before executeSwap fails closed.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Must be non-zero.
-    /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day).
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Must be non-zero AND at most
+    ///         MAX_NAV_AGE_CEILING (72 h). The ceiling is deliberate (GYL-1135): the
+    ///         StaleNav check is the ONLY staleness defence in this system — the NAV
+    ///         feed follows Chainlink read semantics and never reverts on a stale
+    ///         answer — so an admin must not be able to widen it to a value that
+    ///         effectively disables it. Unlike maxQuoteDeviationBps and maxQuoteTtl,
+    ///         where the permissive end (0) is a soft-pause and therefore safe, the
+    ///         permissive end here is "accept an arbitrarily old price".
+    /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newSecs == 0) revert InvalidNavAge(newSecs);
+        if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecs = newSecs;
         emit MaxNavAgeUpdated(newSecs);
     }

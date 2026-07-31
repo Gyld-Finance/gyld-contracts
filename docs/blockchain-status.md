@@ -243,92 +243,182 @@ DeFi protocols read price
 
 | Constant | Value | Effect |
 |----------|-------|--------|
-| `MAX_STALENESS` | 36 hours | `latestRoundData()` / `latestAnswer()` revert if price is older |
-| `MIN_UPDATE_INTERVAL` | 1 hour | `updateAnswer()` reverts if called too soon after last update |
-| `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | `updateAnswer()` reverts if new price deviates >10% from last |
+| `MAX_STALENESS` | 96 hours | Threshold for the `isFresh()` monitoring view **only**. Reads do **not** revert when it is exceeded. |
+| `MIN_UPDATE_INTERVAL` | 1 hour | `updateAnswer()` reverts if called sooner than 1 h after the last update |
+| `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | `updateAnswer()` reverts if the new price deviates >10% from the last |
 
-**Important: `MAX_PRICE_DEVIATION_BPS` has no emergency override — this is intentional.**
+Monitoring views (neither is enforced anywhere on-chain):
 
-`KaleidoscopeNAVFeed` is not upgradeable (no proxy). The deviation cap applies to
-the owner too: even a compromised KMS signer can move the price at most 10% per
-hour. This is the contract's primary defence against key compromise — it limits the
-blast radius and gives the ops team time to detect and respond.
+| View | Returns |
+|------|---------|
+| `isFresh()` | `true` if the last push is within `MAX_STALENESS`; `false` if stale **or never set** |
+| `stalenessSeconds()` | Seconds since the last push; `type(uint256).max` if never set |
 
-An emergency bypass was evaluated during the pre-mainnet security audit (GYL-309 M-3)
-and explicitly rejected for three reasons:
-1. T-bills and IG bonds do not move 10%+ in a single hour in practice.
-2. Large legitimate moves can be published via chained `updateAnswer()` calls spaced
-   1 hour apart — a 25% total move takes 3 hours, which is acceptable for this asset class.
-3. Any bypass callable by the owner would eliminate the rate-limit protection entirely;
-   a compromised key could push NAV to near-zero in one transaction and trigger mass
-   Morpho Blue liquidations.
+> **Corrected 2026-07-30 (GYL-1134).** This table previously read
+> "`MAX_STALENESS` | 36 hours | `latestRoundData()` / `latestAnswer()` revert if price is
+> older". **Both halves were wrong** and had been since the contract was first written:
+> the constant is 96 hours, and no read function has ever reverted on staleness. The
+> only revert on a read is `NoPriceSet`, before the first push
+> (`KaleidoscopeNAVFeed.sol`, `latestRoundData`). A `PriceStale` error was declared but
+> never thrown; it has been deleted (GYL-1135) so the source no longer implies a revert
+> path that does not exist. `docs/contracts.md` has described this correctly throughout.
+>
+> `stalenessSeconds()` was added in GYL-1135 and is **not retrofittable** — this contract
+> is not upgradeable (no proxy, `Ownable2Step` only), so feeds already deployed,
+> including the Base mainnet feed, do not have it. Alerting on existing feeds must derive
+> age off-chain from `latestRoundData().updatedAt` or from `AnswerUpdated` /
+> `EmergencyAnswerUpdated` events, both of which work on every version.
 
-Full analysis: [`docs/decisions/gyld-bond-token-design.md`](decisions/gyld-bond-token-design.md) — Section 4.
+**`MAX_PRICE_DEVIATION_BPS` and `MIN_UPDATE_INTERVAL` have a separate-key emergency override.**
+
+`KaleidoscopeNAVFeed` is not upgradeable (no proxy). Both caps apply to the owner: even a
+compromised KMS signer can move the price at most 10% per hour via `updateAnswer`. That is
+the contract's primary defence against key compromise — it limits blast radius and gives
+the ops team time to detect and respond.
+
+`emergencyUpdateAnswer(int256)` bypasses **both** guards. It is callable only by the
+`emergencyUpdater` address, which `setEmergencyUpdater` forbids from equalling `owner()`
+(enforced in both directions — `transferOwnership` and `_transferOwnership` reject
+collapsing the two roles). The rate limit therefore still holds against a single
+compromised key; it does not hold against a compromise of both. Emergency use emits
+`EmergencyAnswerUpdated`, deliberately a different event from `AnswerUpdated`, so
+monitoring can page on any use. See `docs/contracts.md` → KaleidoscopeNAVFeed for the
+full mechanism.
+
+> **Corrected 2026-07-30 (GYL-1134).** This section previously asserted
+> "`MAX_PRICE_DEVIATION_BPS` has no emergency override — this is intentional", and cited
+> the GYL-309 M-3 audit rejection of a bypass. That decision was later **reversed**:
+> `emergencyUpdateAnswer` ships and bypasses both the deviation cap and the update
+> interval. The original reasoning (T-bills do not move 10%+ in an hour; large moves can
+> be chained hourly; an owner-callable bypass would erase the rate limit) is retained
+> below as history, because the *third* point is why the shipped override is gated on a
+> **separate key** rather than on the owner:
+>
+> 1. T-bills and IG bonds do not move 10%+ in a single hour in practice.
+> 2. Large legitimate moves can be published via chained `updateAnswer()` calls spaced
+>    1 hour apart — a 25% total move takes 3 hours, acceptable for this asset class.
+> 3. Any bypass callable by *the owner* would eliminate the rate-limit protection
+>    entirely; a compromised key could push NAV to near-zero in one transaction and
+>    trigger mass Morpho Blue liquidations.
+>
+> What changed the decision: a fat-finger *within* the 10% band can strand the correct
+> price out of reach (correcting a 9.9% error requires a >10% move back), leaving a wrong
+> NAV live with no on-chain remedy. Key separation answers point 3 without reintroducing
+> the single-key risk.
+
+Full history: [`docs/decisions/gyld-bond-token-design.md`](decisions/gyld-bond-token-design.md) — Section 4.
 
 ---
 
-### Why `MAX_STALENESS` exists — the weekend gap problem
+### Staleness: what the feed actually does, and who is responsible for it
 
-**The root cause:** Bond markets close on weekends and US public holidays. Alpaca (our broker data source) publishes no NAV on those days because there is no market activity to price. Our backend cannot push a price it does not have. The oracle feed goes silent from Friday market close (~4pm ET) to Monday market open (~9:30am ET) — a gap of roughly 65 hours.
+**The gap is real.** Bond markets close on weekends and US public holidays. Alpaca (our
+broker data source) publishes no NAV on those days, so the backend has nothing to push.
+The feed goes silent from Friday close (~4pm ET) to Monday open (~9:30am ET) — roughly
+65 hours, and longer across a 3-day holiday weekend.
 
-**What Morpho does during that gap:**
-
-Morpho Blue calls `KaleidoscopeNAVFeed.latestRoundData()` on every borrow, repay, and liquidation check against bIB01 collateral. Without `MAX_STALENESS`, this call would succeed and return Friday's last pushed price, no matter how much time has passed.
+**What the feed does about it: reports, does not enforce.**
 
 ```
-Friday  4:00pm  → we push NAV = $95.42
+Friday  4:00pm  → push NAV = $95.42
 Saturday        → markets closed, nothing pushed
-Sunday  11:00pm → Morpho uses $95.42 for a liquidation check  ← stale, but no revert
+Sunday  11:00pm → latestRoundData() returns ($95.42, updatedAt = Friday 4pm)
+                  isFresh() == true   (55 h < 96 h)
+                  stalenessSeconds() == 198_000
+Wednesday       → latestRoundData() returns ($95.42, updatedAt = Friday 4pm)
+                  isFresh() == false  (>96 h)
+                  stalenessSeconds() == 450_000
+                  ← still no revert. Ever.
 ```
 
-**Why that is dangerous:**
+Reads always succeed and always carry the true `updatedAt`. **Every consumer is
+responsible for its own age check.** This is the Chainlink aggregator contract, and it is
+a deliberate choice, not an oversight — see below.
 
-Bond prices do not move on weekends because markets are closed — but that does not mean the *true* value is unchanged. If a significant event occurs over the weekend (central bank emergency meeting, sovereign credit event, geopolitical shock), the bond price will gap sharply when markets reopen Monday. Using Friday's price on Sunday to assess whether a borrower is adequately collateralised means:
+**This is not theoretical — it happened.** The Base mainnet feed has been stale since
+2026-05-19. The two live integrations diverged exactly along the "does the consumer
+age-check?" line:
 
-- A borrower who is actually undercollateralised at the true Monday price looks healthy on Sunday
-- Morpho does not liquidate them
-- When the Monday NAV price is pushed ($88.00 in the example below), the position is suddenly deep underwater with no gradual liquidation — a bad debt spike
-
-```
-Friday  4pm   NAV pushed = $95.42
-[weekend]     Fed announces emergency rate hike
-Monday  9am   true NAV  = $88.00  (7.8% drop)
-Sunday night  Morpho used $95.42 — borrower looked safe — was not
-```
-
-**What `MAX_STALENESS = 36 hours` does instead:**
-
-After 36 hours without a price update, every call to `latestRoundData()` and `latestAnswer()` **reverts**. Morpho cannot read the price. All borrowing and liquidation activity against bIB01 collateral halts.
-
-```
-Friday  4pm   NAV pushed = $95.42
-Saturday 4am  MAX_STALENESS exceeded → feed reverts
-Saturday+     Morpho cannot borrow against bIB01, cannot liquidate
-Monday  9am   we push new NAV = $88.00 → feed live again
-Monday  9am+  Morpho runs correct liquidations at $88.00
-```
-
-**The tradeoff:**
-
-| | No staleness check | `MAX_STALENESS = 36hr` (our model) |
+| Consumer | Own staleness check | Behaviour during the outage |
 |---|---|---|
-| Weekend behaviour | Market runs on stale Friday price | Market freezes at Saturday 4am |
-| Risk during freeze | Bad debt if price gaps at Monday open | None — no new positions, no liquidations |
-| Who bears risk | Morpho lenders (bad debt) | Nobody — positions frozen but intact |
-| Resumes | Automatically on next price push | Automatically on next price push |
+| Euler | Yes — `PriceOracle_TooStale` | Froze the market. Correct. |
+| Morpho Blue | None | Kept quoting the pinned $100.00 indefinitely. |
+| `GyldAtomicSwap` | Yes — `StaleNav`, bound `maxNavAgeSecs` | Fails closed on `executeSwap` |
 
-For a regulated fixed-income platform, **freezing is correct**. Lenders deposit capital expecting it is protected by accurate real-time collateral pricing. Allowing Sunday liquidation decisions based on Friday prices violates that expectation. A temporary freeze is operationally inconvenient but financially safe.
+Morpho's behaviour is the risk this section used to claim was impossible. It is a real,
+open exposure, and **no change to the feed fixes it** — see "Why not just make reads
+revert" below.
 
-**Why 36 hours specifically:**
+**The tradeoff, stated honestly:**
 
-- Friday market close (4pm ET) + 36 hours = Saturday 4am ET
-- This leaves the weekend freeze window clearly visible before Monday open
-- It covers US market holidays (typically 1–3 day gaps) with headroom
-- It does not expire so early that a delayed Monday push (e.g. 10am) risks a brief stale window
+| | Feed does not revert (**what we ship**) | Feed reverts when stale |
+|---|---|---|
+| Weekend / holiday behaviour | Consumers that age-check freeze; consumers that do not run on the last price | Everything freezes uniformly |
+| Risk during a freeze | **Bad debt on non-checking consumers (Morpho) if price gaps at reopen** | Position drift; no liquidations possible |
+| Who bears the risk | **Morpho lenders**, and any integrator that skips the age check | Borrowers who cannot be liquidated → lenders again, via unrecoverable bad debt |
+| Liquidations during the gap | Still possible (correctly, on Euler; on a stale price on Morpho) | **Impossible — including for positions that were already unhealthy before the gap** |
+| Recovery | Automatic on next push | Automatic on next push |
 
-**Why we added a staleness check:**
+> **Corrected 2026-07-30 (GYL-1134).** The previous version of this table described the
+> *right-hand* column as our model and recorded "Risk during freeze: **None**" and "Who
+> bears risk: **Nobody** — positions frozen but intact". The bytecode implements the
+> left-hand column, and the risk is neither none nor nobody's. The "Nobody" claim was
+> also wrong on its own terms even for a reverting feed: a market that cannot liquidate
+> is not a market with no risk, it is a market that has deferred and concentrated it.
 
-The deviation cap, update interval, and forwarder pattern follow established oracle design conventions. The key divergence is `MAX_STALENESS`: ETF iNAV feeds update continuously throughout trading hours (every few seconds), so a missing staleness check is tolerable there. Bond NAV is pushed once per market day — silently returning a 65-hour-old price over a weekend is not. We added the staleness check to match our update cadence and own a fresh audit requirement as a result.
+**Why not just make reads revert:**
+
+1. **It breaks the consumers that behave correctly.** Euler age-checks and froze exactly
+   as designed. A reverting feed would give it a raw revert instead of a price plus a
+   timestamp — same freeze, less information, and a failure mode its error handling does
+   not model.
+2. **It destroys diagnosability.** `updatedAt` is what told us the feed died on
+   2026-05-19 and for how long. A revert carries no timestamp.
+3. **It freezes liquidations, unfixably.** This is the decisive one. On Morpho, a
+   reverting oracle blocks *liquidations* as well as borrows. Positions that were already
+   underwater before the outage cannot be closed, and the bad debt grows for the entire
+   duration of the outage with no operator action available. Failing closed is right for
+   opening new risk; it is wrong for unwinding existing risk.
+4. **It is not the Chainlink contract.** Chainlink's own aggregators do not revert on
+   stale answers. Integrators — and their audit checklists — are built around
+   "check `updatedAt` yourself". Diverging surprises the careful ones and does not help
+   the careless ones.
+
+This decision is pinned by
+`contracts/test/KaleidoscopeNAVFeed.t.sol::test_noStalenessRevertPathExists`, which warps
+1000 days and asserts `latestRoundData()`, `latestAnswer()` and `getRoundData()` all still
+succeed. If a future requirement genuinely needs reverting reads, deploy a separate
+wrapper — do not change these semantics under live integrators.
+
+**Where the defence actually lives:**
+
+1. **Consumer-side age checks.** `GyldAtomicSwap._checkQuoteBand` reverts `StaleNav` when
+   `block.timestamp > updatedAt + maxNavAgeSecs` (default 24 h), and also when `updatedAt`
+   is in the future. As of GYL-1135 `maxNavAgeSecs` is bounded above by
+   `MAX_NAV_AGE_CEILING = 72 hours` in both `initialize` and `setMaxNavAgeSecs` — before
+   that, a single `DEFAULT_ADMIN_ROLE` call could raise it toward the `uint32` ceiling
+   (~136 years) and silently turn the guard into a no-op while every getter still reported
+   it as configured. 72 h matches Euler's structural `MAX_STALENESS_UPPER_BOUND` and keeps
+   3-day-holiday tolerance reachable.
+2. **`NAVFeedForwarder` upstream probe.** `setUpstreamOracle` (and the constructor) reject
+   an upstream whose `latestRoundData()` reports a **future-dated** `updatedAt` (GYL-1135).
+   A future timestamp satisfies every consumer's `now - updatedAt <= maxAge` check
+   unconditionally, so one pointer swap could disarm every integrator's staleness defence
+   at once — a silent fail-open, strictly worse than the loud fail-closed of a stale feed.
+   An upstream that merely has *no price yet* is still accepted; that is a legitimate
+   deploy order.
+3. **Ops — and this is the part no contract change substitutes for.** The NAV keeper must
+   push after every market close, and alerting must page when it does not. The 2026-05-19
+   outage was a keeper/alerting failure, not a contract failure: every contract behaved as
+   written. `isFresh()` and `stalenessSeconds()` exist to be *polled*; they protect nobody
+   if nothing polls them.
+
+**Why `MAX_STALENESS` is 96 hours:** it is a monitoring threshold, so it is sized to
+"something is genuinely wrong", not to "market is closed". A normal weekend is ~65 h and a
+3-day holiday weekend ~87 h; 96 h clears both, so `isFresh() == false` means a missed push
+rather than a calendar. Operational alerting should fire far earlier than 96 h — a missed
+daily push is visible within ~26 h — which is why `stalenessSeconds()` returns a magnitude
+rather than a bool pinned to this constant.
 
 ---
 

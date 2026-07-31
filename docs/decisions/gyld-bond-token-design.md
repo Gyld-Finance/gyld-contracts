@@ -9,6 +9,21 @@
 > that affects real `balanceOf`/`totalSupply` — still stands unchanged. See the
 > new subsection at the end of Section 3.
 
+> **Update (GYL-1134, 2026-07-30) — Section 4 oracle claims partly superseded.** Three
+> statements about `KaleidoscopeNAVFeed` in Section 4 were never true of the shipped
+> bytecode, and are now marked inline where they appear:
+> 1. `MAX_STALENESS` is **96 hours, not 36**, and **no read reverts on staleness**. The
+>    constant gates only the `isFresh()` monitoring view. Chainlink read semantics were
+>    re-affirmed deliberately under GYL-1135.
+> 2. There is **no `_requireFresh()`** function, and never was.
+> 3. `MAX_PRICE_DEVIATION_BPS` **does** have an emergency override
+>    (`emergencyUpdateAnswer`), gated on a key separate from the owner.
+>
+> The compliance and upgradeability decisions that are the subject of this ADR are
+> unaffected. Current oracle behaviour: [`docs/contracts.md`](../contracts.md) →
+> KaleidoscopeNAVFeed, and [`docs/blockchain-status.md`](../blockchain-status.md) →
+> "Staleness: what the feed actually does, and who is responsible for it".
+
 ---
 
 ## 1. Compliance: Chainalysis only — no internal blacklist
@@ -384,6 +399,41 @@ The 1-hour minimum is a security floor, not the operational target.
 
 #### 3. MAX_STALENESS = 36 hours (reads revert if price is too old)
 
+> **SUPERSEDED — this was never implemented (GYL-1134, 2026-07-30).** Both claims below
+> are false against the deployed bytecode and always have been. Retained verbatim as ADR
+> history; do not act on it.
+>
+> **What actually shipped:**
+> - `MAX_STALENESS` is **96 hours**, not 36.
+> - It is **advisory**. Its only consumer is the `isFresh()` monitoring view. No read
+>   function has ever reverted on staleness — `latestRoundData()`, `latestAnswer()` and
+>   `getRoundData()` return the last answer with its true `updatedAt` no matter how old
+>   it is. The single revert on a read is `NoPriceSet`, before the first push.
+> - The `require(...)` snippet below does not exist in the source. A `PriceStale` error
+>   was declared and never thrown; it has since been deleted (GYL-1135) so the source no
+>   longer implies a revert path that is not there.
+> - The staleness constant is therefore **not** a "circuit breaker". Only two of the
+>   three breakers in this section are real: `MAX_PRICE_DEVIATION_BPS` and
+>   `MIN_UPDATE_INTERVAL` (and both are now bypassable via `emergencyUpdateAnswer` from a
+>   separate key — see the emergency-override note later in this section).
+>
+> **This is now a deliberate decision, not just a discrepancy.** Chainlink-compatible
+> read semantics were re-affirmed under GYL-1135 and pinned by
+> `contracts/test/KaleidoscopeNAVFeed.t.sol::test_noStalenessRevertPathExists`: reverting
+> would break consumers that age-check correctly (Euler does), destroy the `updatedAt`
+> signal that makes an outage diagnosable, and — decisively — freeze Morpho
+> *liquidations*, which is unrecoverable during an outage. The staleness defence lives in
+> consumers (`GyldAtomicSwap.StaleNav`, bounded above by `MAX_NAV_AGE_CEILING = 72 h`) and
+> in ops alerting. Current description:
+> [`docs/blockchain-status.md`](../blockchain-status.md) → "Staleness: what the feed
+> actually does, and who is responsible for it", and
+> [`docs/contracts.md`](../contracts.md) → KaleidoscopeNAVFeed.
+>
+> **Consequence, observed:** the Base mainnet feed has been stale since 2026-05-19. Euler
+> froze correctly on its own check; Morpho, which has none, kept quoting the pinned
+> $100.00. Anyone who read this section would have expected the feed itself to have
+> stopped that. It cannot, and by design will not.
+
 ```solidity
 require(block.timestamp - _updatedAt <= MAX_STALENESS, "price stale");
 ```
@@ -407,8 +457,14 @@ triggers staleness and forces an update before DeFi activity resumes.
 | `latestRoundData()` | AggregatorV3Interface (V3) | Morpho Blue, most modern protocols |
 | `latestAnswer()` | AggregatorInterface (V2) | Aave V3 (uses the older call) |
 
-Both check staleness via `_requireFresh()` before returning. Both return the same
-current price — there is no difference in the value returned.
+Both return the same current price — there is no difference in the value returned.
+
+> **Corrected (GYL-1134, 2026-07-30).** This paragraph previously read "Both check
+> staleness via `_requireFresh()` before returning." **There is no `_requireFresh()`** —
+> no such function has ever existed in `KaleidoscopeNAVFeed.sol`. Neither read checks
+> staleness; both return the last answer with its true `updatedAt` regardless of age.
+> Consumers must age-check `updatedAt` themselves. See the superseded-notice on
+> `MAX_STALENESS` above.
 
 Historical rounds are **not stored**. `getRoundData(roundId)` only accepts the
 current round ID and reverts for any other value. DeFi protocols do not need
@@ -438,6 +494,18 @@ a single address calling `updateAnswer()` — MPC threshold happens at the
 signing layer, invisible to the contract.
 
 ### Why `MAX_PRICE_DEVIATION_BPS` has no emergency override
+
+> **SUPERSEDED — reversed (GYL-1134, 2026-07-30).** An override **does** ship:
+> `emergencyUpdateAnswer(int256)` bypasses both `MAX_PRICE_DEVIATION_BPS` and
+> `MIN_UPDATE_INTERVAL`. The analysis below is retained as history because reason 3 is
+> what shaped the shipped design: the override is gated on a separate `emergencyUpdater`
+> key, which `setEmergencyUpdater` / `transferOwnership` / `_transferOwnership` all forbid
+> from equalling `owner()`, so a single compromised KMS key still cannot use it — the
+> owner-callable `forceUpdateAnswer()` rejected here is still rejected. What reasons 1
+> and 2 missed: the binding scenario is not a legitimate >10% move, it is a fat-finger
+> *within* the band (a 9.9% error needs a >10% move to undo), which chained updates
+> cannot fix at all. Current behaviour:
+> [`docs/contracts.md`](../contracts.md) → KaleidoscopeNAVFeed.
 
 During the pre-mainnet security audit (GYL-309, finding M-3), the question was raised:
 what happens if a legitimate NAV move exceeds 10% in a single update? The proposed fix
@@ -524,6 +592,9 @@ an attack surface.
 
 ### What we deliberately do NOT do
 
+> **Two of these bullets are superseded (GYL-1134, 2026-07-30)** — marked inline.
+> Retained rather than deleted so the ADR history stays legible.
+
 - NAV is not stored inside `GyldBondToken`. Do not add a `multiplier` or
   `navPerToken` field to the token contract.
 - `navFeedOwner` must not be a plain hot wallet (EOA with private key in memory)
@@ -531,19 +602,42 @@ an attack surface.
 - Do not remove or increase the circuit breaker constants
   (`MAX_PRICE_DEVIATION_BPS`, `MIN_UPDATE_INTERVAL`, `MAX_STALENESS`). They
   are the on-chain guarantee that DeFi integrators and APs rely on.
-- Do not add a `forceUpdateAnswer()` or any bypass of `MAX_PRICE_DEVIATION_BPS`.
-  The cap is a hard rate limit — its value comes precisely from being unconditional.
-  See "Why there is no emergency override" above.
-- Do not disable `_requireFresh()` or allow reads to succeed on a stale price.
-  Returning a stale price to Morpho Blue would cause it to accept undercollateralised
-  loans — a direct financial loss to lenders.
+  **[Partly superseded]** Holds for `MAX_PRICE_DEVIATION_BPS` and
+  `MIN_UPDATE_INTERVAL`. `MAX_STALENESS` is not a circuit breaker and never was —
+  it gates only the `isFresh()` view, so changing it changes no on-chain guarantee.
+- ~~Do not add a `forceUpdateAnswer()` or any bypass of `MAX_PRICE_DEVIATION_BPS`.~~
+  **[Superseded — reversed.]** `emergencyUpdateAnswer(int256)` ships and bypasses
+  **both** `MAX_PRICE_DEVIATION_BPS` and `MIN_UPDATE_INTERVAL`. The reversal is narrow
+  and the original point-3 objection is preserved structurally: the bypass is callable
+  only by a separate `emergencyUpdater` key that the contract forbids from equalling
+  `owner()`, so a single compromised KMS key still cannot use it. It exists because a
+  fat-finger *inside* the 10% band can strand the correct price out of reach (undoing a
+  9.9% error needs a >10% move). Every use emits `EmergencyAnswerUpdated` and should
+  trigger an ops review. Still true: do **not** add an owner-callable bypass.
+- ~~Do not disable `_requireFresh()` or allow reads to succeed on a stale price.~~
+  **[Superseded — never existed; reads have always succeeded on a stale price.]**
+  There is no `_requireFresh()`. Reads deliberately do not revert on staleness
+  (Chainlink semantics), re-affirmed under GYL-1135 and pinned by
+  `test_noStalenessRevertPathExists`. The concern the bullet raises is real and
+  *unaddressed by the feed*: Morpho Blue does not age-check `updatedAt` and did quote a
+  stale price throughout the outage that began 2026-05-19. The mitigation is
+  consumer-side (`GyldAtomicSwap.StaleNav`, now ceilinged at 72 h) plus NAV-keeper
+  alerting — not a revert in the feed, which would freeze Morpho *liquidations*
+  unrecoverably. Replacement rule: **do not add a staleness revert to the read path;
+  do not ship a consumer that reads this feed without its own `updatedAt` age check.**
 
 ### Consequences for developers
 
 - Every bond series gets its own `KaleidoscopeNAVFeed` deployed atomically by
   `TokenFactory`. Do not share one feed across multiple bond series.
-- The backend must push a NAV update after every market close. If it misses 36
-  hours, the DeFi integration stops working until a fresh update is pushed.
+- The backend must push a NAV update after every market close. **[Corrected
+  GYL-1134]** This bullet used to continue "If it misses 36 hours, the DeFi integration
+  stops working until a fresh update is pushed." It does not stop working — that is the
+  problem. The feed keeps serving the last price indefinitely; only consumers with their
+  own age check (Euler, `GyldAtomicSwap`) stop, while consumers without one (Morpho Blue)
+  keep quoting a dead price. A missed push is therefore an **ops incident that requires
+  alerting**, not a self-limiting condition. Poll `stalenessSeconds()` (feeds deployed
+  after GYL-1135) or `latestRoundData().updatedAt` (all feeds) and page on it.
 - When migrating the updater to Fordefi (Phase 2): use `transferOwnership()` +
   `acceptOwnership()` — never call `renounceOwnership()`.
 - `NAVFeedForwarder` (the stable oracle proxy) points at this feed. DeFi protocols
