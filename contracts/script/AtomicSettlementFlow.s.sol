@@ -51,6 +51,7 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 ///   7. WITHDRAW: treasurer withdraws USDC out to the fixed withdrawalWallet.
 contract AtomicSettlementFlow is Script {
     // Anvil deterministic keys. Local-only; account[0] is the broadcaster.
+    uint256 constant DEPLOYER_PK = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80; // acct[0]
     uint256 constant TAKER_PK = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d; // acct[1]
     uint256 constant SIGNER_PK = 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a; // acct[2]
 
@@ -225,7 +226,7 @@ contract AtomicSettlementFlow is Script {
         // ── Step 7: WITHDRAW leg (treasurer evacuates NET USDC to the wallet) ─
         uint256 walletUsdcBefore = usdc.balanceOf(deployer);
         uint256 swapUsdcBeforeWithdraw = usdc.balanceOf(address(swap));
-        vm.broadcast(); // deployer holds TREASURER_ROLE in this dev demo
+        vm.broadcast(DEPLOYER_PK); // treasurer = deployer (acct[0]); a bare vm.broadcast() would sign with anvil acct[1], which holds no roles
         swap.withdraw(address(usdc), 1_000e6);
         require(usdc.balanceOf(deployer) == walletUsdcBefore + 1_000e6, "WITHDRAW: wallet not credited");
         require(usdc.balanceOf(address(swap)) == swapUsdcBeforeWithdraw - 1_000e6, "WITHDRAW: swap not debited");
