@@ -258,8 +258,21 @@ nothing about how trades are priced or settled.
 - `setUiMultiplier()` should only ever be called by the same off-chain process
   that publishes to `KaleidoscopeNAVFeed`, using the identical value and the
   identical circuit-breaker guardrails (10% max deviation, 1h min interval) so the
-  two numbers can never drift apart. That driver wiring is a follow-up (GYL-956
-  Rust-side work), not yet implemented as of this addendum.
+  two numbers can never drift apart. `NavPublishDriver` does exactly this as of
+  GYL-958: it derives the multiplier from the *same* `nav_raw` it just published,
+  never a second independent computation.
+- **`UI_MULTIPLIER_ROLE` is granted to the NAV feed owner, not to a dedicated key**
+  (GYL-958). `TokenFactory._wireRoles` grants it to the `navFeedOwner` argument, so
+  every factory-deployed token has the grant from birth. The rationale is that the
+  two roles are one operational actor — "the process that publishes NAV" — and the
+  Rust adapter signs `setUiMultiplier` with the same `nav_signer` wallet
+  (`EVM_KMS_NAV_KEY_ID`) it signs `updateAnswer` with. Splitting them later is purely
+  additive: grant `UI_MULTIPLIER_ROLE` to a new address and revoke it from the NAV
+  signer via `DEFAULT_ADMIN_ROLE` (the timelock in prod). Without the grant, every
+  NAV tick's multiplier push reverts on `onlyRole` and the driver logs it as
+  `ui_multiplier_errored` while NAV publishing continues — a silent display-only
+  drift, which is why the grant is asserted in `TokenFactory.t.sol` and at deploy
+  time in `scripts/deploy-hoodi-contracts.sh`.
 - Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`
   to prevent `toUIAmount`/`fromUIAmount` from dividing by zero or displaying a
   permanently-zeroed balance.

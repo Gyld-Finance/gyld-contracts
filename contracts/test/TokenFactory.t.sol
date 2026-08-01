@@ -647,6 +647,11 @@ contract TokenFactoryTest is Test {
         assertTrue(t1.hasRole(t1.PAUSER_ROLE(), operator), "token1: operator must have PAUSER_ROLE");
         assertTrue(t2.hasRole(t2.PAUSER_ROLE(), operator), "token2: operator must have PAUSER_ROLE");
 
+        // Both tokens: the NAV feed owner holds UI_MULTIPLIER_ROLE (it publishes the
+        // display multiplier in lockstep with NAV)
+        assertTrue(t1.hasRole(t1.UI_MULTIPLIER_ROLE(), navFeedOwner), "token1: navFeedOwner must have UI_MULTIPLIER_ROLE");
+        assertTrue(t2.hasRole(t2.UI_MULTIPLIER_ROLE(), navFeedOwner), "token2: navFeedOwner must have UI_MULTIPLIER_ROLE");
+
         // Factory has no roles on either token
         assertFalse(t1.hasRole(t1.DEFAULT_ADMIN_ROLE(), address(factory)), "token1: factory must not have DEFAULT_ADMIN_ROLE");
         assertFalse(t1.hasRole(t1.MINTER_ROLE(),        address(factory)), "token1: factory must not have MINTER_ROLE");
@@ -656,6 +661,45 @@ contract TokenFactoryTest is Test {
         assertFalse(t2.hasRole(t2.MINTER_ROLE(),        address(factory)), "token2: factory must not have MINTER_ROLE");
         assertFalse(t2.hasRole(t2.BURNER_ROLE(),        address(factory)), "token2: factory must not have BURNER_ROLE");
         assertFalse(t2.hasRole(t2.PAUSER_ROLE(),        address(factory)), "token2: factory must not have PAUSER_ROLE");
+        assertFalse(t1.hasRole(t1.UI_MULTIPLIER_ROLE(), address(factory)), "token1: factory must not have UI_MULTIPLIER_ROLE");
+        assertFalse(t2.hasRole(t2.UI_MULTIPLIER_ROLE(), address(factory)), "token2: factory must not have UI_MULTIPLIER_ROLE");
+    }
+
+    // ── UI_MULTIPLIER_ROLE is granted to the NAV signer, and nobody else ───────
+
+    /// The off-chain NavPublishDriver signs `setUiMultiplier` with the same wallet it
+    /// signs `updateAnswer` with (`NAV_FEED_OWNER` / `EVM_KMS_NAV_KEY_ID`). Without this
+    /// grant every NAV tick's multiplier push reverts on `onlyRole` — silently, because
+    /// the driver logs and swallows the failure rather than failing the NAV publish.
+    function test_deployToken_navFeedOwner_hasUiMultiplierRole() public {
+        (address token,,) = factory.deployToken(
+            "UI Mult Bond", "UIMB", "US000000UIM1", 0, operator, address(issuanceMgr), navFeedOwner
+        );
+
+        GyldBondToken t = GyldBondToken(token);
+        assertTrue(t.hasRole(t.UI_MULTIPLIER_ROLE(), navFeedOwner), "navFeedOwner must have UI_MULTIPLIER_ROLE");
+        assertFalse(t.hasRole(t.UI_MULTIPLIER_ROLE(), operator),             "operator must NOT have UI_MULTIPLIER_ROLE");
+        assertFalse(t.hasRole(t.UI_MULTIPLIER_ROLE(), address(issuanceMgr)), "issuanceManager must NOT have UI_MULTIPLIER_ROLE");
+        assertFalse(t.hasRole(t.UI_MULTIPLIER_ROLE(), address(factory)),     "factory must NOT have UI_MULTIPLIER_ROLE");
+    }
+
+    /// The grant is only useful if the call it authorises actually lands: the NAV signer
+    /// can move the multiplier on a factory-deployed token, and an unauthorised address
+    /// cannot. Deleting the `grantRole` line in `_wireRoles` reddens the *authorised*
+    /// call here, not merely a role query.
+    function test_deployToken_navFeedOwner_canSetUiMultiplier() public {
+        (address token,,) = factory.deployToken(
+            "UI Mult Bond 2", "UIM2", "US000000UIM2", 0, operator, address(issuanceMgr), navFeedOwner
+        );
+        GyldBondToken t = GyldBondToken(token);
+
+        vm.prank(operator);
+        vm.expectRevert();
+        t.setUiMultiplier(1.05e18);
+
+        vm.prank(navFeedOwner);
+        t.setUiMultiplier(1.05e18);
+        assertEq(t.uiMultiplier(), 1.05e18, "NAV signer's setUiMultiplier must land");
     }
 
     // ── navFeedOf / forwarderOf are unique per token ──────────────────────────

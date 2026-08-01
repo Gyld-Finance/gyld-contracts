@@ -30,7 +30,10 @@ import {TokenFactory} from "../TokenFactory.sol";
 ///                           In prod: platform MPC wallet / Fordefi — burn quorum (separate)
 ///   WHITELIST_ADMIN      →  IssuanceManager WHITELIST_ADMIN_ROLE (AP whitelist mgmt)
 ///                           In prod: ops Gnosis Safe
-///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls)
+///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls) and
+///                           UI_MULTIPLIER_ROLE on each GyldBondToken
+///                           (setUiMultiplier calls — published in lockstep with NAV
+///                           by the same process, so one signer serves both)
 ///                           In prod: KMS signer
 ///
 /// A TimelockController is deployed and wired as:
@@ -214,7 +217,7 @@ contract DeployDevNet is Script {
             console.log("SUBSCRIBER_ADDRESS:    %s  (IssuanceManager SUBSCRIBER_ROLE)", subscriberAddress);
             console.log("REDEEMER_ADDRESS:      %s  (IssuanceManager REDEEMER_ROLE)", redeemerAddress);
             console.log("WHITELIST_ADMIN:       %s  (IssuanceManager WHITELIST_ADMIN_ROLE)", whitelistAdmin);
-            console.log("NAV_FEED_OWNER:        %s  (KaleidoscopeNAVFeed owner - set at Phase 2)", navFeedOwner);
+            console.log("NAV_FEED_OWNER:        %s  (NAVFeed owner, token UI_MULTIPLIER_ROLE - set at Phase 2)", navFeedOwner);
             console.log("");
             console.log("Next: set these env vars for Phase 2:");
             console.log("  EVM_FACTORY_ADDRESS=%s", address(factory));
@@ -247,7 +250,7 @@ contract DeployDevNet is Script {
         console.log("SUBSCRIBER_ADDRESS:    %s  (IssuanceManager SUBSCRIBER_ROLE)", subscriberAddress);
         console.log("REDEEMER_ADDRESS:      %s  (IssuanceManager REDEEMER_ROLE)", redeemerAddress);
         console.log("WHITELIST_ADMIN:       %s  (IssuanceManager WHITELIST_ADMIN_ROLE)", whitelistAdmin);
-        console.log("NAV_FEED_OWNER:        %s  (KaleidoscopeNAVFeed owner)", navFeedOwner);
+        console.log("NAV_FEED_OWNER:        %s  (NAVFeed owner, token UI_MULTIPLIER_ROLE)", navFeedOwner);
         console.log("");
         console.log("Next: set these env vars for the gateway:");
         console.log("  EVM_FACTORY_ADDRESS=%s", address(factory));

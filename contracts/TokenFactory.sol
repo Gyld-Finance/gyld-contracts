@@ -163,7 +163,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (deployedToken == address(0)) revert ProxyDeployFailed();
         token = deployedToken;
 
-        _wireRoles(token, issuanceManager, operator);
+        _wireRoles(token, issuanceManager, operator, navFeedOwner);
 
         navFeed = address(new KaleidoscopeNAVFeed(
             navFeedOwner,
@@ -189,11 +189,21 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     ///      operator_  receives PAUSER_ROLE (ops hot wallet).
     ///      owner()    receives DEFAULT_ADMIN_ROLE — whoever owns the factory at deploy time.
     ///                 In production the factory owner must be a TimelockController.
-    function _wireRoles(address token_, address issuanceManager_, address operator_) internal {
+    ///      uiMultiplierSigner_ receives UI_MULTIPLIER_ROLE. This is the NAV feed owner:
+    ///                 the display-only ERC-8056 multiplier is published in lockstep with
+    ///                 NAV by the same off-chain process (and the same KMS signer), so the
+    ///                 two share one operational actor rather than a second key.
+    function _wireRoles(
+        address token_,
+        address issuanceManager_,
+        address operator_,
+        address uiMultiplierSigner_
+    ) internal {
         GyldBondToken t = GyldBondToken(token_);
         t.grantRole(t.MINTER_ROLE(),        issuanceManager_);
         t.grantRole(t.BURNER_ROLE(),        issuanceManager_);
         t.grantRole(t.PAUSER_ROLE(),        operator_);
+        t.grantRole(t.UI_MULTIPLIER_ROLE(), uiMultiplierSigner_);
         t.grantRole(t.DEFAULT_ADMIN_ROLE(), owner());
         t.revokeRole(t.PAUSER_ROLE(),       address(this));
         t.revokeRole(t.DEFAULT_ADMIN_ROLE(), address(this));
