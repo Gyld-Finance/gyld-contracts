@@ -124,8 +124,16 @@ contract DeployDevNet is Script {
             abi.encodeCall(IssuanceManager.initialize, (msg.sender, subscriberAddress, redeemerAddress))
         )));
 
-        // 4. Grant WHITELIST_ADMIN_ROLE to its dedicated address.
+        // 4. Grant WHITELIST_ADMIN_ROLE to its dedicated address, and to the deployer
+        //    for the duration of this script. DEFAULT_ADMIN_ROLE only permits *granting*
+        //    a role, not exercising it, so without this the step-8 addToWhitelist calls
+        //    revert with AccessControlUnauthorizedAccount whenever WHITELIST_ADMIN is a
+        //    separate address from the deployer. The deployer's grant is revoked in
+        //    step 8 before the DEFAULT_ADMIN handover.
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), whitelistAdmin);
+        if (whitelistAdmin != msg.sender) {
+            issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), msg.sender);
+        }
 
         console.log("ISSUANCE_MANAGER=%s", address(issuanceMgr));
 
@@ -156,6 +164,13 @@ contract DeployDevNet is Script {
         // the investor (beneficiary in IssuanceManager.redeem). In prod all investors
         // are whitelisted during KYC onboarding.
         issuanceMgr.addToWhitelist(0x70997970C51812dc3A010C7d01b50e0d17dc79C8);
+        // The deployer EOA keeps no standing whitelist power: the temporary grant from
+        // step 4 is dropped now that the bootstrap whitelisting is done, leaving
+        // WHITELIST_ADMIN as the only holder. Skipped when the deployer *is* the
+        // configured whitelist admin (the Anvil default), where the role is permanent.
+        if (whitelistAdmin != msg.sender) {
+            issuanceMgr.revokeRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), msg.sender);
+        }
 
         // 9. Hand DEFAULT_ADMIN on IssuanceManager to the timelock.
         {
