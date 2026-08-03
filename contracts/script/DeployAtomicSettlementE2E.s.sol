@@ -84,7 +84,7 @@ contract DeployAtomicSettlementE2E is Script {
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
-            "US14913UBF62",
+            "US14913UBF66",
             1_788_739_200,
             deployer, // token operator / pauser
             address(issuanceMgr),
