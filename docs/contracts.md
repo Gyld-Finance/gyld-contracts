@@ -69,8 +69,11 @@ Standard ERC-20 per bond series. **Token balances are fixed units of bond owners
 one token represents one unit of the underlying bond.**
 
 Value accrual (coupons, NAV appreciation) is reflected exclusively in the paired
-`KaleidoscopeNAVFeed` oracle. Token balances only change through `mint` (subscription)
-and `burn` (redemption). There is no on-chain rebasing or multiplier mechanism.
+`KaleidoscopeNAVFeed` oracle — the same model used by USYC, Spiko, Midas, OpenEden
+and Superstate. Token balances only change through `mint` (subscription)
+and `burn` (redemption). There is no on-chain rebasing or multiplier mechanism —
+display-only scaling (ERC-8056) was evaluated and dropped; see
+[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).
 
 ### Balance model
 
@@ -374,18 +377,20 @@ end-to-end run — **not** a real bond series):
 | Contract | Address |
 |----------|---------|
 | `GyldBondToken` proxy (ISIN `TEST8056A00001`, "GTB8056") | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` |
-| `GyldBondToken` ERC-8056 implementation | `0x72FAE4fa227e7E28BF315BA363dE39E371a49C52` |
+| `GyldBondToken` implementation (evaluation build) | `0x72FAE4fa227e7E28BF315BA363dE39E371a49C52` |
 | `KaleidoscopeNAVFeed` (NAV $100.00 pushed) | `0x4266a4A43Db435056f60C02b37fA8586E58597Fa` |
 | `NAVFeedForwarder` | `0x49be531A7C48077483997d92D7BeF759dd7b2b53` |
 | USDC (Circle Sepolia) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
 
 Verified on-chain 2026-07-31 (`contracts/script/SepoliaAtomicSwapSmoke.s.sol`):
 inventory seeded via `subscribe` (100 bonds + 2 USDC), signed BUY quote executed
-(2 USDC → 0.02 bonds, `quoteId 1` burned), ERC-8056 multiplier updated live
-(1.05×) and scheduled (1.04×), all four ERC-165 interface ids answer `true`.
-Caveat: deployed before the GYL-1134/1135 hardening landed on this branch
+(2 USDC → 0.02 bonds, `quoteId 1` burned).
+Caveats: deployed before the GYL-1134/1135 hardening landed on this branch
 (NAV-age ceiling, fail-closed deploy guards) — redeploy/upgrade after the
-branch merges if this test instance is kept.
+branch merges if this test instance is kept. The token implementation was an
+evaluation build carrying a since-dropped display extension; **do not reuse
+this proxy for a new series** — see
+[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).
 
 ### Storage layout
 

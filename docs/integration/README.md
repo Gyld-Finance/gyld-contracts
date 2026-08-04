@@ -133,7 +133,7 @@ is a gap in the source of truth, not a documentation choice.
 9. **No rate-limit contract.** API keys carry a `rate_tier`, but no endpoint
    documents `429` or any rate-limit headers.
 10. **`GyldAtomicSwap` testnet deployment is a dev-mode sandbox.** The
-    ERC-8056 / atomic-swap stack is deployed on **Ethereum Sepolia
+    atomic-swap stack is deployed on **Ethereum Sepolia
     (chainId 11155111)** — the single supported public testnet for integrator
     testing — but wired in dev mode (one deployer key holds every role, a
     throwaway bond series, pre-hardening deploy scripts). Treat it as an

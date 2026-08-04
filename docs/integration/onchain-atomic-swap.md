@@ -70,6 +70,16 @@ quote service also pre-screens off-chain so you do not waste gas.
 Mixing these up is the second most common integration error. See
 [§4](#4-capped-allowance-pricing--the-part-that-surprises-people).
 
+### How token value works — read the NAV feed, not the balance
+
+`GyldBondToken` balances are fixed units of bond ownership; they change only on
+mint and burn. **All value accrual (coupons, NAV appreciation) is published in
+the NAV**, on-chain via `KaleidoscopeNAVFeed` and read through the series'
+`NAVFeedForwarder` (Chainlink `AggregatorV3Interface`, 8 decimals). Portfolio
+value is `balanceOf × NAV`. This is the same repricing model used by USYC,
+Spiko, Midas, OpenEden and Superstate. There is no rebasing and no display
+multiplier of any kind on the token — do not expect the balance itself to grow.
+
 ---
 
 ## 2. Contract addresses
@@ -96,7 +106,7 @@ backend-internal environment — not an integrator surface — and Anvil (chain
 | Local Anvil | 31337 | `NAVFeedForwarder` | — | Local development only. |
 | Local Anvil | 31337 | USDC (mock) | — | **Mock** USDC. Note the real USDC permit differs — see [§8](#8-optional-eip-2612-permit). |
 | Ethereum Sepolia | 11155111 | `GyldAtomicSwap` (proxy) | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` | ✅ **Live for integrator testing** (deployed 2026-07-31). Dev-mode wiring: a single deployer key holds all roles (no timelock handover); do not treat role separation as exercised here. |
-| Ethereum Sepolia | 11155111 | `GyldBondToken` test series (proxy) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | Throwaway smoke-test series ("GTB8056", ISIN `TEST8056A00001`), ERC-8056 implementation live — **not** a real bond series. |
+| Ethereum Sepolia | 11155111 | `GyldBondToken` test series (proxy) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | Throwaway smoke-test series ("GTB8056", ISIN `TEST8056A00001`) — **not** a real bond series, and this proxy will not be carried forward. Do not integrate against it beyond swap-flow testing. |
 | Ethereum Sepolia | 11155111 | `NAVFeedForwarder` (test series) | `0x49be531A7C48077483997d92D7BeF759dd7b2b53` | 8-dp NAV oracle the swap's band reads. |
 | Ethereum Sepolia | 11155111 | USDC (Circle) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | Real Sepolia USDC, 6 dp. |
 | Ethereum Hoodi | 560048 | `GyldAtomicSwap` | — | Backend-internal testing only — **not an integrator surface**. |

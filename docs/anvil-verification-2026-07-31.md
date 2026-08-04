@@ -629,12 +629,13 @@ Unchanged from before this verification, as expected — no source file was modi
 
 ---
 
-## Follow-up: ERC-8056
+## Follow-up: ERC-8056 (historical)
 
 This run did not touch the ERC-8056 (Scaled UI Amount) UI multiplier. That lifecycle was
-verified separately against live Anvil — including the E-F1 upgrade window against a real
-pre-ERC-8056 proxy, and the `UI_MULTIPLIER_ROLE` deploy wiring this run showed was missing
-from every deploy script — in
+verified separately against live Anvil in
 [`anvil-verification-erc8056-2026-07-31.md`](anvil-verification-erc8056-2026-07-31.md)
-(GYL-1136). Note that document numbers the ERC-8056 spec's own F-1/F-2/F-3 remediation
-items, which are unrelated to the F-1/F-2/F-3 findings in [§7](#7-findings) above.
+(GYL-1136), which also numbers the ERC-8056 spec's own F-1/F-2/F-3 remediation items —
+unrelated to the F-1/F-2/F-3 findings in [§7](#7-findings) above. The extension was
+**subsequently dropped on EVM** (GYL-1201, 2026-08-03) and removed from the codebase; that
+document is retained as a historical record only. See
+[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).

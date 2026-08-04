@@ -4,10 +4,15 @@
 **Date:** 2026-05-06  
 **Applies to:** `contracts/GyldBondToken.sol`, `contracts/IssuanceManager.sol`, `contracts/TokenFactory.sol`
 
-> **Update (GYL-956):** Section 3 below was narrowed to permit a display-only UI
+> ~~**Update (GYL-956):** Section 3 below was narrowed to permit a display-only UI
 > scaling multiplier (ERC-8056). The core prohibition — no multiplier or rebasing
 > that affects real `balanceOf`/`totalSupply` — still stands unchanged. See the
-> new subsection at the end of Section 3.
+> new subsection at the end of Section 3.~~
+> **[Superseded — reversed (GYL-1201, 2026-08-03).]** ERC-8056 has been **dropped
+> on EVM** and the display-only extension removed from `GyldBondToken`. Section 3's
+> original prohibition applies again in full, with no carve-out. The GYL-956
+> addendum at the end of Section 3 is retained as ADR history only. Rationale:
+> [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md).
 
 > **Update (GYL-1134, 2026-07-30) — Section 4 oracle claims partly superseded.** Three
 > statements about `KaleidoscopeNAVFeed` in Section 4 were never true of the shipped
@@ -201,11 +206,14 @@ The NAV feed says "each unit is worth $X today."
 
 - No `shares` internal accounting
 - No multiplier or NAV accrual that affects REAL balances (`balanceOf`/`totalSupply`)
-  inside the token. (GYL-956 added a narrow, display-only exception that does not
-  touch real balances — see "GYL-956 addendum" below.)
+  inside the token. ~~(GYL-956 added a narrow, display-only exception that does not
+  touch real balances — see "GYL-956 addendum" below.)~~ **[GYL-956 exception
+  removed — GYL-1201, 2026-08-03.]** The prohibition is once again absolute: no
+  multiplier of any kind, display-only or otherwise.
 - No `burnShares()` / `redeemShares()` / `transferShares()` / `sharesOf()`
-- No role that can move REAL balances via a multiplier. (`UI_MULTIPLIER_ROLE`,
-  added in GYL-956, is display-only and cannot affect `balanceOf`/`totalSupply`.)
+- No role that can move REAL balances via a multiplier. ~~(`UI_MULTIPLIER_ROLE`,
+  added in GYL-956, is display-only and cannot affect `balanceOf`/`totalSupply`.)~~
+  **[`UI_MULTIPLIER_ROLE` removed — GYL-1201.]**
 - No rebasing — the number of tokens in a wallet never changes from NAV movement
 
 ### Why
@@ -239,6 +247,20 @@ The NAV feed says "each unit is worth $X today."
   `IChain`. There is no `burn_shares` port method and there should never be one.
 
 ### GYL-956 addendum: a narrow, display-only exception (ERC-8056)
+
+> **SUPERSEDED — ERC-8056 dropped on EVM (GYL-1201, 2026-08-03).** Everything in
+> this addendum, including its conformance notes and circuit breakers, describes
+> an extension that has been **removed** from `GyldBondToken`. It was accurate
+> when written and is retained verbatim as ADR history; do not act on it.
+>
+> The short version of why: ERC-8056 is a stock-splits standard, no EVM wallet
+> implements it (MetaMask displayed the raw balance next to BscScan's scaled one
+> on our own deployment), no bond or treasury issuer uses it — the EIP's own
+> co-author Superstate does not use it on their funds — and it duplicated the NAV
+> channel that `KaleidoscopeNAVFeed` already provides. Full rationale, the
+> orphaned testnet token addresses, and the consequences (the NAV feed is now the
+> sole display channel; see GYL-1134):
+> [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md).
 
 **What was added:** `uiMultiplier` (18-dp fixed point, default `1e18`), gated by a
 dedicated `UI_MULTIPLIER_ROLE`, plus read-only views `balanceOfUI()`,
@@ -831,7 +853,7 @@ institutional AP model.
 | Question | Answer |
 |---|---|
 | **Token model** | |
-| Does the token have shares / multiplier / rebasing? | **No REAL multiplier/rebasing affecting balances.** Plain OZ ERC-20 — `balanceOf`/`totalSupply` change only via mint/burn. A **display-only** `uiMultiplier` (GYL-956) exists purely for `balanceOfUI()`/`totalSupplyUI()`; it cannot affect real accounting. |
+| Does the token have shares / multiplier / rebasing? | **No. None of any kind.** Plain OZ ERC-20 — `balanceOf`/`totalSupply` change only via mint/burn. The display-only `uiMultiplier` briefly permitted by GYL-956 was **removed** when ERC-8056 was dropped on EVM (GYL-1201, 2026-08-03 — see [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md)). |
 | Where does NAV / value accrual live? | `KaleidoscopeNAVFeed` oracle only — never inside the token. |
 | Are `burnShares`, `transferShares`, `sharesOf` in the contract? | **No.** Deliberately absent — no share system, no dust residual problem. |
 | Is there a `MULTIPLIER_UPDATER_ROLE`? | **No.** Removed with the multiplier system. |

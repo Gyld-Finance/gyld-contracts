@@ -1,5 +1,17 @@
 # Live-Anvil verification of the ERC-8056 lifecycle — 2026-07-31
 
+> **HISTORICAL RECORD — ERC-8056 was subsequently dropped on EVM (GYL-1201,
+> 2026-08-03).** This document records verification work that was actually
+> performed and is retained as evidence; nothing in it reflects current intent.
+> The Scaled UI Amount extension it exercises has been **removed** from
+> `GyldBondToken`, the `UI_MULTIPLIER_ROLE` deploy wiring it added is gone, and
+> the demo runbooks and `tools/erc8056-ui/` it fed into have been deleted. The
+> testnet tokens deployed during this evaluation (Sepolia `GTB8056`
+> `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b`, BSC testnet `GBSCD`
+> `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a`) are orphaned — do not reuse
+> those proxies. Rationale for the drop:
+> [`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).
+
 First execution of the ERC-8056 (Scaled UI Amount) extension against a **running chain**.
 `GyldBondToken`'s implementation and its 41 unit tests
 (`contracts/test/GyldBondToken.ScaledUIAmount.t.sol`) landed in `0948e8d`, but until this
