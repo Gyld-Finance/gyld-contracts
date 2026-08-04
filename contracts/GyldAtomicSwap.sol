@@ -94,13 +94,17 @@ contract GyldAtomicSwap is
 
     /// @notice Off-chain-signed quote. `taker` pins the user (quotes are not bearer
     ///         paper); `epoch` must equal the current quoteEpoch (mass invalidation).
-    ///         `maxAmountIn`/`price` bound a *range* of draws, not one exact amount —
-    ///         see `executeSwap`'s `requestedAmountIn` parameter.
+    ///         `maxAmountIn`/`price` bound a range of *draw sizes*, exactly one of
+    ///         which may be taken — the unused remainder is forfeited. See
+    ///         `executeSwap`'s `requestedAmountIn` parameter.
     struct SwapMessage {
-        uint256 quoteId; // single-use; consumed via the bitmap below, regardless of draw size
+        // Single-use, globally and permanently, across ALL epochs — the usage bitmap
+        // below is NOT epoch-scoped (bumpQuoteEpoch does not clear it), so the quote
+        // service must allocate ids from one monotonic counter that never resets.
+        uint256 quoteId; // consumed via the bitmap on the first draw, whatever its size
         address taker; // must equal msg.sender at execution
         address tokenIn; // leg the user pays
-        uint256 maxAmountIn; // ceiling on tokenIn the taker may draw against this quote
+        uint256 maxAmountIn; // ceiling on the taker's single draw of tokenIn
         address tokenOut; // leg the user receives (this contract's inventory / USDC pot)
         uint256 price; // fixed-point amountOut per 1e18 tokenIn; amountOut = requestedAmountIn * price / 1e18
         uint64 expiry; // unix seconds
@@ -125,6 +129,26 @@ contract GyldAtomicSwap is
     uint256 public constant MIN_DRAW_BPS = 100; // 1%
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
+    /// @dev Default cap on quote lifetime (finding F-4): executeSwap rejects quotes
+    ///      expiring further than maxQuoteTtl in the future, so a buggy or compromised
+    ///      signer cannot issue immortal quotes. Seeded in initialize; admin-adjustable
+    ///      via setMaxQuoteTtl. One hour comfortably covers the quote service's
+    ///      issue-to-submit window (spec S-4: expiry must be short-lived, near-term).
+    uint64 public constant DEFAULT_MAX_QUOTE_TTL = 1 hours;
+
+    /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
+    ///      `setMaxNavAgeSecs` only rejected zero — and `uint32` tops out at ~136 years,
+    ///      so a single DEFAULT_ADMIN_ROLE call could disable the StaleNav guard entirely
+    ///      while leaving the NAV band nominally "enforced" against a price nobody
+    ///      refreshed. The upstream feed deliberately does NOT revert on staleness
+    ///      (Chainlink read semantics), so this consumer-side check is the only thing
+    ///      standing between a frozen NAV keeper and quotes validated against a dead
+    ///      price. 72 h matches Euler's structural MAX_STALENESS_UPPER_BOUND and keeps
+    ///      3-day-holiday tolerance available; the deployed default is 24 h.
+    ///      Enforced in BOTH initialize and setMaxNavAgeSecs — a `constant` costs no
+    ///      storage slot, so the ERC-7201 layout is unchanged.
+    uint32 public constant MAX_NAV_AGE_CEILING = 72 hours;
+
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
     /// @custom:storage-location erc7201:gyld.GyldAtomicSwap
@@ -139,6 +163,8 @@ contract GyldAtomicSwap is
         mapping(address => bool) registeredSeries; // bond token → enabled
         mapping(address => address) navForwarderOf; // bond token → NAVFeedForwarder (stable addr)
         mapping(address => bool) allowed; // executeSwap taker allowlist
+        // APPEND-ONLY (ERC-7201): new fields go here, never insert/reorder above.
+        uint64 maxQuoteTtl; // quote expiry cap: expiry <= block.timestamp + maxQuoteTtl (F-4)
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -162,6 +188,11 @@ contract GyldAtomicSwap is
     error NotTaker(address taker, address caller);
     error NotAllowed(address taker);
     error CannotRenounceAdminRole();
+    // Incident-response roles are equally non-renounceable (F-7): a sole holder
+    // self-renouncing would remove pause()/withdraw()-while-paused until the timelock
+    // re-grants — the very delay those roles exist to bypass.
+    error CannotRenouncePauserRole();
+    error CannotRenounceTreasurerRole();
     // NAV band / series registry (migrated from the former GyldSettlementVault).
     error UnregisteredSeries(address token);
     error NotOneBondLeg(address tokenIn, address tokenOut);
@@ -174,6 +205,11 @@ contract GyldAtomicSwap is
     error InvalidNavAge(uint32 secs);
     error NotValidForwarder(address forwarder);
     error SeriesNotEmpty(address token);
+    // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
+    // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
+    // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
+    error InvalidTokenDecimals(address token, uint8 decimals);
+    error QuoteExpiryTooFar(uint64 expiry, uint64 maxAllowed);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -190,6 +226,7 @@ contract GyldAtomicSwap is
     event SeriesDeregistered(address indexed token);
     event MaxQuoteDeviationUpdated(uint16 newBps);
     event MaxNavAgeUpdated(uint32 newSecs);
+    event MaxQuoteTtlUpdated(uint64 newTtl);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
@@ -208,16 +245,18 @@ contract GyldAtomicSwap is
     ///                               grant/revoke + bumpQuoteEpoch.
     /// @param treasurer              Kaleidoscope ops MPC wallet (TREASURER_ROLE); may
     ///                               withdraw() inventory out to the withdrawalWallet.
-    /// @param usdc_                  USDC token (6 decimals) — the cash leg every quote
-    ///                               is priced against.
+    /// @param usdc_                  USDC token (6 decimals, probed on-chain — F-1) —
+    ///                               the cash leg every quote is priced against.
     /// @param maxQuoteDeviationBps_  Quote-vs-NAV band width in basis points (e.g. 200 =
     ///                               2%). Capped at BPS_DENOMINATOR; 0 is permitted and
     ///                               forces quotes to match NAV exactly (soft-pause).
     /// @param maxNavAgeSecs_         Max NAV feed age before executeSwap fails closed
-    ///                               with StaleNav. Must be non-zero.
+    ///                               with StaleNav. Must be non-zero and at most
+    ///                               MAX_NAV_AGE_CEILING (72 h) — see GYL-1135.
     /// @dev    withdrawalWallet is deliberately NOT set here — it starts at address(0)
     ///         and must be set post-deploy by the admin via setWithdrawalWallet.
     ///         withdraw() reverts ZeroAddress until then (fail-closed).
+    ///         maxQuoteTtl is seeded to DEFAULT_MAX_QUOTE_TTL (1 hour, F-4).
     function initialize(
         address defaultAdmin,
         address pauser,
@@ -232,7 +271,14 @@ contract GyldAtomicSwap is
                 || usdc_ == address(0)
         ) revert ZeroAddress();
         if (maxQuoteDeviationBps_ > BPS_DENOMINATOR) revert InvalidDeviationBps(maxQuoteDeviationBps_);
-        if (maxNavAgeSecs_ == 0) revert InvalidNavAge(maxNavAgeSecs_);
+        if (maxNavAgeSecs_ == 0 || maxNavAgeSecs_ > MAX_NAV_AGE_CEILING) revert InvalidNavAge(maxNavAgeSecs_);
+        // Probe-before-store (house idiom, F-1): the cash token must report 6 decimals —
+        // the /1e20 ladder in _checkQuoteBand assumes 18dp bond / 8dp NAV / 6dp USDC and
+        // mis-scales silently for any other cash token.
+        (bool usdcOk, bytes memory usdcData) = usdc_.staticcall(abi.encodeWithSignature("decimals()"));
+        if (!usdcOk || usdcData.length != 32) revert InvalidTokenDecimals(usdc_, 0);
+        uint8 usdcDecimals = abi.decode(usdcData, (uint8));
+        if (usdcDecimals != 6) revert InvalidTokenDecimals(usdc_, usdcDecimals);
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
@@ -242,6 +288,7 @@ contract GyldAtomicSwap is
         $.usdc = usdc_;
         $.maxQuoteDeviationBps = maxQuoteDeviationBps_;
         $.maxNavAgeSecs = maxNavAgeSecs_;
+        $.maxQuoteTtl = DEFAULT_MAX_QUOTE_TTL;
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
         _grantRole(PAUSER_ROLE, pauser);
         _grantRole(QUOTE_SIGNER_ROLE, quoteSigner);
@@ -297,6 +344,24 @@ contract GyldAtomicSwap is
         return (_getStorage().usedQuoteWords[quoteId >> 8] >> (quoteId & 0xff)) & 1 != 0;
     }
 
+    /// @notice Upper bound on quote lifetime (seconds). executeSwap rejects quotes
+    ///         expiring further than this far in the future (F-4).
+    function maxQuoteTtl() external view returns (uint64) {
+        return _getStorage().maxQuoteTtl;
+    }
+
+    /// @notice Number of registered bond series (length of the seriesList mirror, F-5).
+    function seriesCount() external view returns (uint256) {
+        return _getStorage().seriesList.length;
+    }
+
+    /// @notice Registered bond series at `index` (0 <= index < seriesCount()). The list
+    ///         is a swap-and-pop mirror of registeredSeries — order is NOT stable across
+    ///         deregistrations (F-5).
+    function seriesAt(uint256 index) external view returns (address) {
+        return _getStorage().seriesList[index];
+    }
+
     // ── Swap execution ────────────────────────────────────────────────────────
 
     /// @notice Settle a platform-signed quote atomically. Pulls `requestedAmountIn` of
@@ -304,16 +369,16 @@ contract GyldAtomicSwap is
     ///         `tokenOut` amount from this contract's OWN balance to the caller.
     /// @dev    Verification order (CEI — all checks before any external transfer): taker
     ///         binding → allowlist → price sanity → requested-amount range → expiry →
-    ///         epoch → EIP-712 signature against QUOTE_SIGNER_ROLE → single-use quoteId
-    ///         consumption (state effect) → derived-amount sanity → NAV band + leg
-    ///         classification → optional permit → PULL tokenIn → inventory check + PUSH
-    ///         tokenOut. The quoteId is burned in full regardless of how much of
-    ///         `maxAmountIn` is drawn — single-shot-capped sizing, not multi-draw (see
-    ///         docs/atomic-settlement.md). The optional permit is applied with try/catch
-    ///         so a front-run permit() cannot brick the swap (standard griefing
-    ///         mitigation) — the subsequent safeTransferFrom enforces the allowance
-    ///         regardless. Real USDC permit is non-standard (version "2") and MockUSDC
-    ///         has none, hence optional.
+    ///         expiry-within-TTL → epoch → EIP-712 signature against QUOTE_SIGNER_ROLE →
+    ///         single-use quoteId consumption (state effect) → derived-amount sanity →
+    ///         NAV band + leg classification → optional permit → PULL tokenIn →
+    ///         inventory check + PUSH tokenOut. The quoteId is burned in full regardless
+    ///         of how much of `maxAmountIn` is drawn — single-shot-capped sizing, not
+    ///         multi-draw (see docs/atomic-settlement.md). The optional permit is applied
+    ///         with try/catch so a front-run permit() cannot brick the swap (standard
+    ///         griefing mitigation) — the subsequent safeTransferFrom enforces the
+    ///         allowance regardless. Real USDC permit is non-standard (version "2") and
+    ///         MockUSDC has none, hence optional.
     /// @param m                 The quote message exactly as signed by the quote service.
     /// @param signature         65-byte ECDSA signature over hashSwapMessage(m).
     /// @param permitIn          Optional EIP-2612 permit for `m.tokenIn`, sized to
@@ -339,6 +404,13 @@ contract GyldAtomicSwap is
         }
 
         if (block.timestamp > m.expiry) revert QuoteExpired(m.expiry);
+        // F-4: expiry must also be NEAR-TERM. An immortal (or months-long) quote outlives
+        // the freshness assumption the NAV band relies on and could only be revoked via a
+        // timelocked bumpQuoteEpoch — exactly when fast containment matters.
+        if (m.expiry > block.timestamp + $.maxQuoteTtl) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            revert QuoteExpiryTooFar(m.expiry, uint64(block.timestamp + $.maxQuoteTtl));
+        }
         if (m.epoch != $.quoteEpoch) revert QuoteEpochStale(m.epoch, $.quoteEpoch);
 
         address signer = ECDSA.recover(hashSwapMessage(m), signature);
@@ -409,9 +481,11 @@ contract GyldAtomicSwap is
     // ── NAV band ──────────────────────────────────────────────────────────────
 
     /// @dev Classify the swap (exactly one leg must be a registered series against
-    ///      USDC), read the series NAV, fail closed on non-positive or stale NAV, and
-    ///      enforce the quoted USDC amount is within maxQuoteDeviationBps of NAV value.
-    ///      Decimals: bond tokens 18dp, NAV 8dp, USDC 6dp → 1e18 * 1e8 / 1e20 = 1e6.
+    ///      USDC), read the series NAV, fail closed on non-positive, stale, or
+    ///      future-dated NAV, and enforce the quoted USDC amount is within
+    ///      maxQuoteDeviationBps of NAV value.
+    ///      Decimals: bond tokens 18dp, NAV 8dp, USDC 6dp → 1e18 * 1e8 / 1e20 = 1e6
+    ///      (bond/cash decimals enforced by the registerSeries/initialize probes, F-1).
     function _checkQuoteBand(
         GyldAtomicSwapStorage storage $,
         address tokenIn,
@@ -430,6 +504,9 @@ contract GyldAtomicSwap is
         // navForwarderOf[bondToken] is guaranteed non-zero (set atomically in registerSeries).
         (, int256 nav,, uint256 updatedAt,) = INavForwarder($.navForwarderOf[bondToken]).latestRoundData();
         if (nav <= 0) revert InvalidNav(bondToken, nav);
+        // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
+        // (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — treat as stale.
+        if (updatedAt > block.timestamp) revert StaleNav(bondToken, updatedAt);
         if (block.timestamp > updatedAt + $.maxNavAgeSecs) revert StaleNav(bondToken, updatedAt);
 
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -463,10 +540,12 @@ contract GyldAtomicSwap is
     // ── Series registry ───────────────────────────────────────────────────────
 
     /// @notice Register a bond series so this contract can hold, value, and serve it.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. The forwarder is probed via
-    ///         staticcall before storing — rejects EOAs, wrong contracts, and feeds
-    ///         that don't report 8 decimals (the NAV scaling in _checkQuoteBand assumes
-    ///         8dp). Re-registering an active series just updates its forwarder.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Both probes are probe-before-store
+    ///         (house idiom): the forwarder is staticcall-probed for 8 decimals (the NAV
+    ///         scaling in _checkQuoteBand assumes 8dp) and the bond token for 18 decimals
+    ///         (F-1 — the /1e20 ladder assumes 18dp bond / 8dp NAV / 6dp USDC and
+    ///         mis-scales silently for anything else). Re-registering an active series
+    ///         just updates its forwarder.
     /// @param token        GyldBondToken proxy address (18 decimals).
     /// @param navForwarder NAVFeedForwarder paired with the series (stable address).
     function registerSeries(address token, address navForwarder) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -474,6 +553,11 @@ contract GyldAtomicSwap is
         // Probe-before-store (house idiom): forwarder must report 8 decimals.
         (bool ok, bytes memory data) = navForwarder.staticcall(abi.encodeWithSignature("decimals()"));
         if (!ok || data.length != 32 || abi.decode(data, (uint8)) != 8) revert NotValidForwarder(navForwarder);
+        // Same probe on the bond token (F-1): it must report 18 decimals.
+        (bool tokenOk, bytes memory tokenData) = token.staticcall(abi.encodeWithSignature("decimals()"));
+        if (!tokenOk || tokenData.length != 32) revert InvalidTokenDecimals(token, 0);
+        uint8 tokenDecimals = abi.decode(tokenData, (uint8));
+        if (tokenDecimals != 18) revert InvalidTokenDecimals(token, tokenDecimals);
         GyldAtomicSwapStorage storage $ = _getStorage();
         if (!$.registeredSeries[token]) $.seriesList.push(token);
         $.registeredSeries[token] = true;
@@ -521,12 +605,30 @@ contract GyldAtomicSwap is
     }
 
     /// @notice Set the max NAV feed age (seconds) before executeSwap fails closed.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Must be non-zero.
-    /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day).
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Must be non-zero AND at most
+    ///         MAX_NAV_AGE_CEILING (72 h). The ceiling is deliberate (GYL-1135): the
+    ///         StaleNav check is the ONLY staleness defence in this system — the NAV
+    ///         feed follows Chainlink read semantics and never reverts on a stale
+    ///         answer — so an admin must not be able to widen it to a value that
+    ///         effectively disables it. Unlike maxQuoteDeviationBps and maxQuoteTtl,
+    ///         where the permissive end (0) is a soft-pause and therefore safe, the
+    ///         permissive end here is "accept an arbitrarily old price".
+    /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newSecs == 0) revert InvalidNavAge(newSecs);
+        if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecs = newSecs;
         emit MaxNavAgeUpdated(newSecs);
+    }
+
+    /// @notice Set the upper bound on quote lifetime (seconds).
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. executeSwap rejects quotes expiring
+    ///         further than this far in the future (F-4), so a buggy or compromised
+    ///         signer cannot issue immortal quotes. Zero is permitted and pins expiry to
+    ///         the current block (effectively a soft-pause of executeSwap).
+    /// @param newTtl Max quote lifetime in seconds (e.g. 3600 = 1 hour).
+    function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _getStorage().maxQuoteTtl = newTtl;
+        emit MaxQuoteTtlUpdated(newTtl);
     }
 
     /// @notice Add or remove `account` from the executeSwap taker allowlist.
@@ -603,9 +705,15 @@ contract GyldAtomicSwap is
     /// DEFAULT_ADMIN_ROLE cannot be renounced — losing it permanently bricks UUPS
     /// upgrades, unpause, series registration, withdrawal-wallet control, and all role
     /// management, including quote-signer rotation.
+    /// PAUSER_ROLE and TREASURER_ROLE cannot be renounced either (F-7): they are the
+    /// incident-response pair, and a sole holder self-renouncing would remove the fast
+    /// halt (pause) and the paused-state evacuation path (withdraw) until the timelock
+    /// re-grants — the very delay those roles exist to bypass.
     /// Intentional removal must go through revokeRole (explicit, two-party action).
     function renounceRole(bytes32 role, address callerConfirmation) public override {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
+        if (role == PAUSER_ROLE) revert CannotRenouncePauserRole();
+        if (role == TREASURER_ROLE) revert CannotRenounceTreasurerRole();
         super.renounceRole(role, callerConfirmation);
     }
 

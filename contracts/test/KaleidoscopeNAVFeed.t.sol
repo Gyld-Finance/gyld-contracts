@@ -15,7 +15,6 @@ contract KaleidoscopeNAVFeedTest is Test {
     address newOwner         = address(0xC3);
     address emergencyUpdater = address(0xE4);
 
-    uint256 constant THIRTY_SIX_HOURS  = 36 hours;
     uint256 constant ONE_HOUR          = 1 hours;
     int256  constant ANSWER            = 9_542_000_000; // $95.42
     int256  constant ANSWER_PLUS_SMALL = 9_542_000_100; // tiny move, well within 10%
@@ -241,14 +240,24 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(answeredInRound, roundId);
     }
 
-    function test_latestRoundData_returnsLastPriceWhenStale() public {
-        // latestRoundData never reverts on staleness — returns last known NAV
-        // so DeFi integrations (Morpho, Aave) work over weekends and holidays.
+    /// Staleness is NOT an error condition for this feed. Past MAX_STALENESS the read
+    /// still succeeds and returns the last known NAV together with its true (old)
+    /// `updatedAt`, so DeFi integrations keep functioning across weekends and holidays
+    /// and consumers can age-check for themselves. See
+    /// test_noStalenessRevertPathExists for the load-bearing version of this claim.
+    function test_latestRoundData_byDesignDoesNotRevertOnStaleness_returnsLastNav() public {
+        // Absolute timestamps throughout — a `block.timestamp` local captured before a
+        // vm.warp can be re-read after it under --ir-minimum (see the comment on
+        // test_updateAnswer_emitsAnswerUpdated_secondRound).
+        vm.warp(1_000_000);
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + 97 hours); // past 96h MAX_STALENESS
-        (, int256 answer,,,) = feed.latestRoundData();
+        vm.warp(1_000_000 + 97 hours); // past 96h MAX_STALENESS
+        (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
         assertEq(answer, ANSWER);
+        // The staleness must be visible to the caller, not papered over: `updatedAt`
+        // reports the original push time, never block.timestamp.
+        assertEq(updatedAt, 1_000_000, "updatedAt must report the real (stale) push time");
     }
 
     function test_isFresh_trueBeforeStaleness() public {
@@ -269,13 +278,107 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertFalse(feed.isFresh());
     }
 
+    // ── stalenessSeconds — monitoring entrypoint (GYL-1135) ───────────────────
+
+    /// A never-initialised feed must be distinguishable from a just-updated one.
+    /// Returning 0 here would make "no price has ever been pushed" look identical to
+    /// "pushed this very block" to any threshold-based alert.
+    function test_stalenessSeconds_maxWhenNoPriceSet() public view {
+        assertEq(feed.stalenessSeconds(), type(uint256).max);
+        assertFalse(feed.isFresh(), "isFresh and stalenessSeconds must agree on 'never set'");
+    }
+
+    function test_stalenessSeconds_tracksElapsed() public {
+        vm.warp(1_000_000);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        assertEq(feed.stalenessSeconds(), 0, "zero in the push block");
+
+        vm.warp(1_000_000 + 3 hours);
+        assertEq(feed.stalenessSeconds(), 3 hours);
+
+        // Past MAX_STALENESS it keeps counting rather than saturating or reverting —
+        // an alert needs the magnitude to escalate on, which is exactly what the Base
+        // mainnet feed (silent since 2026-05-19) had no way to expose.
+        vm.warp(1_000_000 + 100 days);
+        assertEq(feed.stalenessSeconds(), 100 days);
+        assertFalse(feed.isFresh());
+
+        // A fresh push resets it.
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER_PLUS_SMALL);
+        assertEq(feed.stalenessSeconds(), 0);
+        assertTrue(feed.isFresh());
+    }
+
+    function test_stalenessSeconds_resetByEmergencyUpdate() public {
+        vm.warp(1_000_000);
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+
+        vm.warp(1_000_000 + 10 days);
+        assertEq(feed.stalenessSeconds(), 10 days);
+
+        vm.prank(emergencyUpdater);
+        feed.emergencyUpdateAnswer(ANSWER);
+        assertEq(feed.stalenessSeconds(), 0, "the emergency path must also refresh the clock");
+    }
+
+    // ── The Chainlink-compat decision, pinned (GYL-1135) ─────────────────────
+
+    /// LOAD-BEARING. This feed has exactly ONE revert path on reads — NoPriceSet — and
+    /// staleness is deliberately not one of them.
+    ///
+    /// Do not "fix" this by adding a freshness gate to latestRoundData / latestAnswer /
+    /// getRoundData. Chainlink's own aggregators do not revert on stale answers; they
+    /// return the last answer with its true `updatedAt` and leave the age check to the
+    /// consumer. Two live integrations demonstrated both halves of that contract during
+    /// the 2026-05 feed outage: Euler applied its own check and froze correctly, while
+    /// Morpho applied none and kept quoting the last pushed price. Reverting here would
+    /// have punished Euler for behaving correctly, destroyed the `updatedAt` signal that
+    /// made the outage diagnosable, and — worst — frozen Morpho *liquidations*, the one
+    /// operation that must keep working while a market is unhealthy, with no way to
+    /// unwind it. The defence belongs in consumers (see GyldAtomicSwap.StaleNav) and in
+    /// ops alerting, not in the read path.
+    ///
+    /// If a future requirement genuinely needs a reverting feed, deploy a separate
+    /// wrapper contract; do not change these semantics under integrators already live.
+    function test_noStalenessRevertPathExists() public {
+        // Absolute timestamps — see test_latestRoundData_byDesignDoesNotRevertOnStaleness.
+        vm.warp(1_000_000);
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+
+        // Far beyond any plausible threshold: 1000 days, ~250x MAX_STALENESS.
+        vm.warp(1_000_000 + 1000 days);
+
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            feed.latestRoundData();
+        assertEq(answer, ANSWER, "latestRoundData must still return the last NAV");
+        assertEq(updatedAt, 1_000_000, "and must report the true, ancient updatedAt");
+        assertEq(startedAt, 1_000_000);
+        assertEq(roundId, 1);
+        assertEq(answeredInRound, roundId);
+
+        assertEq(feed.latestAnswer(), ANSWER, "latestAnswer (Aave V3 path) must not revert either");
+
+        (, int256 histAnswer,, uint256 histUpdatedAt,) = feed.getRoundData(1);
+        assertEq(histAnswer, ANSWER, "getRoundData must not revert either");
+        assertEq(histUpdatedAt, 1_000_000);
+
+        // Staleness is reported, not enforced.
+        assertFalse(feed.isFresh(), "isFresh is the signal that this price is unusable");
+        assertEq(feed.stalenessSeconds(), 1000 days);
+    }
+
     function test_latestRoundData_recoversAfterNewUpdate() public {
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + THIRTY_SIX_HOURS + 1);
-        // stale — new update (within 10% of original, but first update has
-        // no interval check; this is the second so we need to warp enough)
-        // We already warped 36h+1s which is >> 1h interval requirement
+        // Warp well past MAX_STALENESS, then push again. 97 h is >> the 1 h
+        // MIN_UPDATE_INTERVAL, so the second push is unobstructed.
+        vm.warp(block.timestamp + 97 hours);
         vm.prank(owner);
         feed.updateAnswer(ANSWER_PLUS_SMALL);
         (, int256 answer,,,) = feed.latestRoundData();
@@ -331,7 +434,8 @@ contract KaleidoscopeNAVFeedTest is Test {
 
     function test_getRoundData_revertsBeforeFirstUpdate() public {
         // roundId 0 matches _roundId (both zero), so the roundId check passes;
-        // _requireFresh() then fires because _updatedAt == 0.
+        // the `_updatedAt == 0` guard then fires with NoPriceSet. That is the ONLY
+        // revert path on this read — there is no freshness gate here.
         vm.expectRevert(KaleidoscopeNAVFeed.NoPriceSet.selector);
         feed.getRoundData(0);
     }
@@ -485,6 +589,54 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.expectEmit(true, true, false, false);
         emit EmergencyUpdaterSet(emergencyUpdater, newOwner);
         feed.setEmergencyUpdater(newOwner);
+    }
+
+    // ── key separation: owner() != emergencyUpdater (GYL-961) ─────────────────
+
+    function test_setEmergencyUpdater_ownerAddressReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.setEmergencyUpdater(owner);
+    }
+
+    function test_transferOwnership_toEmergencyUpdaterReverts() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.transferOwnership(emergencyUpdater);
+    }
+
+    function test_acceptOwnership_intoEmergencyUpdaterReverts() public {
+        // Drive the completion funnel (_transferOwnership) directly: start a
+        // transfer to `newOwner`, THEN promote that same address to emergency
+        // updater, so the fail-fast transferOwnership guard is bypassed and the
+        // invariant must be caught at acceptOwnership().
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        vm.prank(owner);
+        feed.setEmergencyUpdater(newOwner);
+        vm.prank(newOwner);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
+        feed.acceptOwnership();
+    }
+
+    function test_renounceOwnership_stillWorks() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.renounceOwnership();
+        assertEq(feed.owner(), address(0));
+    }
+
+    function test_transferOwnership_toDifferentAddressStillWorks() public {
+        vm.prank(owner);
+        feed.setEmergencyUpdater(emergencyUpdater);
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        feed.acceptOwnership();
+        assertEq(feed.owner(), newOwner);
     }
 
     // ── emergencyUpdateAnswer — access control ────────────────────────────────

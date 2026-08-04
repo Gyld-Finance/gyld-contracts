@@ -26,9 +26,12 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///      Safety constraints:
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
-///        - MAX_STALENESS:           threshold for isFresh() monitoring view;
+///        - MAX_STALENESS:           threshold for the isFresh() monitoring view;
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
-///                                   so DeFi integrations work over weekends and holidays
+///                                   so DeFi integrations work over weekends and holidays.
+///                                   Staleness is SURFACED (isFresh, stalenessSeconds),
+///                                   never ENFORCED here — every consumer must age-check
+///                                   `updatedAt` itself. See latestRoundData for why.
 ///
 
 // ── Chainlink AggregatorV3Interface (inlined — no @chainlink/contracts dep) ──
@@ -102,8 +105,11 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     error PriceDeviationTooLarge(int256 submitted, int256 previous);
     error HistoricalRoundsNotStored(uint80 requested, uint80 current);
     error NoPriceSet();
-    error PriceStale(uint256 updatedAt, uint256 currentTime);
+    // NOTE (GYL-1135): there is deliberately no `PriceStale` error. A declared-but-
+    // never-thrown one used to live here and led readers (and two design docs) to
+    // believe reads revert on staleness. They do not — see latestRoundData below.
     error NotEmergencyUpdater();
+    error EmergencyUpdaterCannotBeOwner();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -137,9 +143,34 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     ///         owner. A compromised KMS key must not be able to call
     ///         emergencyUpdateAnswer. Pass address(0) to disable the path.
     function setEmergencyUpdater(address newUpdater) external onlyOwner {
+        // Key-separation invariant: the emergency updater must be a different
+        // key from the owner (see design doc §4). address(0) disables the path
+        // and is always allowed — the owner is never address(0) while set.
+        if (newUpdater == owner()) revert EmergencyUpdaterCannotBeOwner();
         address previous = _emergencyUpdater;
         _emergencyUpdater = newUpdater;
         emit EmergencyUpdaterSet(previous, newUpdater);
+    }
+
+    // ── Ownership (key-separation guards) ─────────────────────────────────────
+
+    /// @dev Fail-fast guard: reject starting an ownership transfer to the current
+    ///      emergency updater so the two roles can never collapse into one key.
+    ///      address(0) is allowed (cancels a pending transfer).
+    function transferOwnership(address newOwner) public virtual override onlyOwner {
+        if (newOwner != address(0) && newOwner == _emergencyUpdater)
+            revert EmergencyUpdaterCannotBeOwner();
+        super.transferOwnership(newOwner);
+    }
+
+    /// @dev Single funnel that actually changes owner() (acceptOwnership /
+    ///      renounceOwnership). Enforce the key-separation invariant here so it
+    ///      holds regardless of the path. address(0) is allowed so
+    ///      renounceOwnership() keeps working.
+    function _transferOwnership(address newOwner) internal virtual override {
+        if (newOwner != address(0) && newOwner == _emergencyUpdater)
+            revert EmergencyUpdaterCannotBeOwner();
+        super._transferOwnership(newOwner);
     }
 
     // ── Price update ──────────────────────────────────────────────────────────
@@ -221,6 +252,17 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         return (_roundId, _latestAnswer, _updatedAt, _updatedAt, _roundId);
     }
 
+    /// @notice Latest round. Reverts ONLY when no price has ever been pushed.
+    /// @dev    Deliberately does NOT revert on staleness (GYL-1135). Chainlink's own
+    ///         aggregators return the last answer with its `updatedAt`; consumers are
+    ///         expected to age-check `updatedAt` themselves. Two live consumers prove
+    ///         both halves of that contract: Euler froze correctly on its own
+    ///         `PriceOracle_TooStale` check, while Morpho — which does not age-check —
+    ///         kept quoting the last pushed answer. Making this revert would break the
+    ///         consumers that check correctly, destroy the diagnosability of `updatedAt`,
+    ///         and unfixably freeze Morpho *liquidations* during an outage. Integrators
+    ///         MUST enforce their own max-age (GyldAtomicSwap does, via StaleNav).
+    ///         `stalenessSeconds()` below is the monitoring entrypoint.
     function latestRoundData() external view override returns (
         uint80 roundId,
         int256 answer,
@@ -250,5 +292,27 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     function isFresh() external view returns (bool) {
         if (_updatedAt == 0) return false;
         return block.timestamp - _updatedAt <= MAX_STALENESS;
+    }
+
+    /// @notice Seconds elapsed since the last price push; type(uint256).max if a price
+    ///         has never been set.
+    /// @dev    Monitoring entrypoint (GYL-1135). Reads never revert on staleness by
+    ///         design — see latestRoundData — so freshness must be surfaced, not
+    ///         enforced. This returns a magnitude rather than the boolean `isFresh()`
+    ///         gives, which lets an alerting rule pick its own threshold (page at 26 h,
+    ///         escalate at 96 h) instead of being pinned to MAX_STALENESS, and lets a
+    ///         dashboard chart the gap. The sentinel for "never set" is
+    ///         type(uint256).max rather than 0 so a never-initialised feed can never be
+    ///         mistaken for a just-updated one.
+    ///
+    ///         NOT retrofittable: KaleidoscopeNAVFeed is not upgradeable (no proxy,
+    ///         Ownable2Step only), so feeds already deployed — including the Base
+    ///         mainnet feed — do not have this function. It benefits future deployments
+    ///         only. Monitoring of existing feeds must derive age off-chain from
+    ///         `latestRoundData().updatedAt` (or watch `AnswerUpdated` /
+    ///         `EmergencyAnswerUpdated`), which works on every version of this contract.
+    function stalenessSeconds() external view returns (uint256) {
+        if (_updatedAt == 0) return type(uint256).max;
+        return block.timestamp - _updatedAt;
     }
 }
