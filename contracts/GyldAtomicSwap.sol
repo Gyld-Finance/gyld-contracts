@@ -134,13 +134,33 @@ contract GyldAtomicSwap is
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     /// @dev Default cap on quote lifetime (finding F-4): executeSwap rejects quotes
-    ///      expiring further than maxQuoteTtl in the future, so a buggy or compromised
-    ///      signer cannot issue immortal quotes. Seeded in initialize; admin-adjustable
-    ///      via setMaxQuoteTtl, but only DOWNWARD — this value is also
-    ///      MAX_QUOTE_TTL_CEILING (GYL-1135). One hour comfortably covers the quote
-    ///      service's issue-to-submit window (spec S-4: expiry must be short-lived,
-    ///      near-term); the service itself issues in a ~60s TTL class.
-    uint64 public constant DEFAULT_MAX_QUOTE_TTL = 1 hours;
+    ///      expiring further than this far in the future, so a buggy or compromised
+    ///      signer cannot issue long-dated quotes. A long-dated quote is an AMERICAN
+    ///      OPTION — the taker holds a frozen price and picks the moment within its life
+    ///      when that price is most favourable to them, so the loss is not a random draw
+    ///      inside maxQuoteDeviationBps but reliably close to its full width.
+    ///
+    ///      This is a FALLBACK, not a seed. It is NOT written into storage by initialize;
+    ///      `_effectiveMaxQuoteTtl` returns it whenever the storage slot reads zero. That
+    ///      shape is deliberate and load-bearing: `maxQuoteTtl` is an APPEND-ONLY ERC-7201
+    ///      field added after the first deployments, so on a proxy upgraded from an
+    ///      implementation that predates the slot it reads 0 — and a seed-based design
+    ///      would then enforce `expiry <= block.timestamp + 0`, which contradicts the
+    ///      `block.timestamp > m.expiry` check one line above and rejects EVERY quote a
+    ///      real service can issue. That is a total executeSwap outage recoverable only
+    ///      through a timelocked setMaxQuoteTtl. Reading through the fallback makes the
+    ///      unset slot mean "use the audited default" instead of "reject everything",
+    ///      so a fresh deploy and an upgraded proxy behave identically with no migration
+    ///      step to forget. See GyldAtomicSwap.upgrade.t.sol.
+    ///
+    ///      15 minutes comfortably covers the quote service's issue-to-submit window
+    ///      (spec S-4: expiry must be short-lived, near-term); the service itself issues
+    ///      in a ~60s TTL class. Note the cap is measured against the EXECUTING block,
+    ///      not against signing time, so a cap below the issued TTL would not shorten a
+    ///      quote's life — it would forbid prompt execution and force the taker to wait
+    ///      until the quote was nearly expired. The cap must therefore always exceed the
+    ///      longest TTL the service issues.
+    uint64 public constant DEFAULT_MAX_QUOTE_TTL = 15 minutes;
 
     /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
     ///      `setMaxNavAgeSecs` only rejected zero — and `uint32` tops out at ~136 years,
@@ -195,23 +215,25 @@ contract GyldAtomicSwap is
     ///      executable indefinitely, which is precisely the failure mode the F-4 TTL was
     ///      added to prevent.
     ///
-    ///      This matters more than it looks because of WHO can contain a leak. In
-    ///      production DEFAULT_ADMIN_ROLE is a TimelockController, so `bumpQuoteEpoch`
-    ///      — the mass-invalidation path — is delayed by the governance window. Quote
-    ///      expiry is therefore the only containment that acts FASTER than the timelock,
-    ///      and it must not be removable by the same timelocked authority it backstops.
+    ///      Note what this guard is and is NOT. Quote expiry is one of THREE containments
+    ///      on a leaked quote, and the only one that is timelocked. The two faster paths
+    ///      both act in a single block on hot keys held outside the timelock: `pause()`
+    ///      (PAUSER_ROLE, the ops multisig) halts every quote because executeSwap is
+    ///      `whenNotPaused`; and `setAllowed(taker, false)` (ALLOWLIST_ADMIN_ROLE, split
+    ///      off DEFAULT_ADMIN_ROLE for exactly this reason) kills every outstanding quote
+    ///      naming that taker, since quotes are taker-bound. Nor does the TTL protect the
+    ///      NAV band — `_checkQuoteBand` re-reads the feed LIVE on every execution, so a
+    ///      long-dated quote does not outlive the band's freshness. What the TTL actually
+    ///      bounds is the WINDOW in which a leaked quote can be exercised as an option
+    ///      before anyone notices, which is the case the two hot keys do not cover: they
+    ///      require someone to already know.
     ///
-    ///      1 hour is anchored to two in-system facts: it equals DEFAULT_MAX_QUOTE_TTL
-    ///      (the shipped default, chosen to comfortably cover the quote service's
-    ///      issue-to-submit window) and it equals KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL
-    ///      — one NAV publication epoch. A quote must not outlive the NAV round it was
-    ///      priced against. The off-chain quote service issues in a ~60s TTL class, so
-    ///      this leaves roughly 60× operational headroom.
-    ///
-    ///      Deliberately equal to the default, which makes maxQuoteTtl a NARROW-ONLY
-    ///      knob: an admin may tighten quote expiry but can never loosen it beyond what
-    ///      was deployed and audited. Raising the ceiling requires a code change and a
-    ///      re-audit, not an admin transaction — the right cost for weakening a guard.
+    ///      1 hour is anchored to KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL — one NAV
+    ///      publication epoch. A quote must not outlive the NAV round it was priced
+    ///      against. The shipped default is DEFAULT_MAX_QUOTE_TTL (15 min), so the knob
+    ///      has room to be tuned operationally in both directions without an upgrade,
+    ///      while the catastrophic setting (`uint64` reaches ~584 billion years, which
+    ///      would restore unbounded quote life) stays unreachable.
     ///
     ///      What breaks at the ceiling: any taker workflow needing a quote to stay live
     ///      longer than an hour (e.g. collecting multisig signatures over an afternoon)
@@ -219,9 +241,11 @@ contract GyldAtomicSwap is
     ///      service to re-issue a fresh quote at the current price, not for the chain to
     ///      honour older paper.
     ///
-    ///      Zero remains permitted: that is the RESTRICTIVE end (expiry pinned to the
-    ///      current block — a soft-pause), and a soft-pause is safe.
-    ///      Enforced in BOTH initialize and setMaxQuoteTtl.
+    ///      Zero is permitted but no longer means "pin expiry to the current block" — it
+    ///      is the UNSET sentinel and falls back to DEFAULT_MAX_QUOTE_TTL (see that
+    ///      constant). Soft-pausing via the TTL was never usable anyway: setting it needs
+    ///      the 48 h timelock, whereas `pause()` is a hot key and one block.
+    ///      Enforced in setMaxQuoteTtl; initialize no longer writes the field at all.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 1 hours;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
@@ -239,7 +263,12 @@ contract GyldAtomicSwap is
         mapping(address => address) navForwarderOf; // bond token → NAVFeedForwarder (stable addr)
         mapping(address => bool) allowed; // executeSwap taker allowlist
         // APPEND-ONLY (ERC-7201): new fields go here, never insert/reorder above.
-        uint64 maxQuoteTtl; // quote expiry cap: expiry <= block.timestamp + maxQuoteTtl (F-4)
+        // Quote expiry cap (F-4): expiry <= block.timestamp + effective TTL.
+        // ZERO MEANS UNSET, not zero seconds — always read via _effectiveMaxQuoteTtl(),
+        // never directly, or a proxy upgraded from a pre-F-4 implementation (where this
+        // slot has never been written) will reject every quote. See the fallback rationale
+        // on DEFAULT_MAX_QUOTE_TTL.
+        uint64 maxQuoteTtl;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -249,6 +278,15 @@ contract GyldAtomicSwap is
         assembly {
             $.slot := _STORAGE_LOCATION
         }
+    }
+
+    /// @dev The quote-lifetime cap actually in force. Treats an unset slot (zero) as
+    ///      "use the compiled-in default" rather than "zero seconds". This is the ONLY
+    ///      permitted read path for `maxQuoteTtl` — see DEFAULT_MAX_QUOTE_TTL for why a
+    ///      raw read bricks executeSwap on a proxy upgraded across the field's addition.
+    function _effectiveMaxQuoteTtl(GyldAtomicSwapStorage storage $) private view returns (uint64) {
+        uint64 ttl = $.maxQuoteTtl;
+        return ttl == 0 ? DEFAULT_MAX_QUOTE_TTL : ttl;
     }
 
     // ── Errors ────────────────────────────────────────────────────────────────
@@ -263,11 +301,6 @@ contract GyldAtomicSwap is
     error NotTaker(address taker, address caller);
     error NotAllowed(address taker);
     error CannotRenounceAdminRole();
-    // Incident-response roles are equally non-renounceable (F-7): a sole holder
-    // self-renouncing would remove pause()/withdraw()-while-paused until the timelock
-    // re-grants — the very delay those roles exist to bypass.
-    error CannotRenouncePauserRole();
-    error CannotRenounceTreasurerRole();
     // NAV band / series registry (migrated from the former GyldSettlementVault).
     error UnregisteredSeries(address token);
     error NotOneBondLeg(address tokenIn, address tokenOut);
@@ -278,7 +311,8 @@ contract GyldAtomicSwap is
     error InsufficientUsdcLiquidity(uint256 requested, uint256 available);
     error InvalidDeviationBps(uint16 bps);
     error InvalidNavAge(uint32 secs);
-    /// @dev maxQuoteTtl above MAX_QUOTE_TTL_CEILING (GYL-1135). Zero is legal (soft-pause).
+    /// @dev maxQuoteTtl above MAX_QUOTE_TTL_CEILING (GYL-1135). Zero is legal and means
+    ///      "unset — fall back to DEFAULT_MAX_QUOTE_TTL", not zero seconds.
     error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
     error SeriesNotEmpty(address token);
@@ -334,7 +368,9 @@ contract GyldAtomicSwap is
     /// @dev    withdrawalWallet is deliberately NOT set here — it starts at address(0)
     ///         and must be set post-deploy by the admin via setWithdrawalWallet.
     ///         withdraw() reverts ZeroAddress until then (fail-closed).
-    ///         maxQuoteTtl is seeded to DEFAULT_MAX_QUOTE_TTL (1 hour, F-4).
+    ///         maxQuoteTtl is deliberately NOT seeded — it is read through a fallback to
+    ///         DEFAULT_MAX_QUOTE_TTL (15 min, F-4), so a fresh deploy and a proxy upgraded
+    ///         across the field's addition enforce the same cap with no migration step.
     function initialize(
         address defaultAdmin,
         address pauser,
@@ -350,10 +386,10 @@ contract GyldAtomicSwap is
         ) revert ZeroAddress();
         if (maxQuoteDeviationBps_ > MAX_QUOTE_DEVIATION_BPS_CEILING) revert InvalidDeviationBps(maxQuoteDeviationBps_);
         if (maxNavAgeSecs_ == 0 || maxNavAgeSecs_ > MAX_NAV_AGE_CEILING) revert InvalidNavAge(maxNavAgeSecs_);
-        // The TTL seed is a constant today, not a parameter — but validate the value we
-        // actually store, so the guard is real rather than an assumption a future
-        // refactor (seed becomes a caller-supplied argument) could silently drop.
-        if (DEFAULT_MAX_QUOTE_TTL > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(DEFAULT_MAX_QUOTE_TTL);
+        // No maxQuoteTtl seed here, deliberately: the field is read through
+        // _effectiveMaxQuoteTtl, which falls back to DEFAULT_MAX_QUOTE_TTL on an unset
+        // slot. Seeding it would make a fresh deploy differ from an upgraded proxy —
+        // the exact divergence that bricked executeSwap before this was a fallback.
         // Probe-before-store (house idiom, F-1): the cash token must report 6 decimals —
         // the /1e20 ladder in _checkQuoteBand assumes 18dp bond / 8dp NAV / 6dp USDC and
         // mis-scales silently for any other cash token.
@@ -370,7 +406,6 @@ contract GyldAtomicSwap is
         $.usdc = usdc_;
         $.maxQuoteDeviationBps = maxQuoteDeviationBps_;
         $.maxNavAgeSecs = maxNavAgeSecs_;
-        $.maxQuoteTtl = DEFAULT_MAX_QUOTE_TTL;
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
         _grantRole(PAUSER_ROLE, pauser);
         _grantRole(QUOTE_SIGNER_ROLE, quoteSigner);
@@ -428,20 +463,11 @@ contract GyldAtomicSwap is
 
     /// @notice Upper bound on quote lifetime (seconds). executeSwap rejects quotes
     ///         expiring further than this far in the future (F-4).
+    /// @dev    Returns the EFFECTIVE cap, so an unset slot reports DEFAULT_MAX_QUOTE_TTL
+    ///         rather than 0 — integrators reading this to size their own TTLs must see
+    ///         what the chain will actually enforce, not the raw storage word.
     function maxQuoteTtl() external view returns (uint64) {
-        return _getStorage().maxQuoteTtl;
-    }
-
-    /// @notice Number of registered bond series (length of the seriesList mirror, F-5).
-    function seriesCount() external view returns (uint256) {
-        return _getStorage().seriesList.length;
-    }
-
-    /// @notice Registered bond series at `index` (0 <= index < seriesCount()). The list
-    ///         is a swap-and-pop mirror of registeredSeries — order is NOT stable across
-    ///         deregistrations (F-5).
-    function seriesAt(uint256 index) external view returns (address) {
-        return _getStorage().seriesList[index];
+        return _effectiveMaxQuoteTtl(_getStorage());
     }
 
     // ── Swap execution ────────────────────────────────────────────────────────
@@ -486,12 +512,14 @@ contract GyldAtomicSwap is
         }
 
         if (block.timestamp > m.expiry) revert QuoteExpired(m.expiry);
-        // F-4: expiry must also be NEAR-TERM. An immortal (or months-long) quote outlives
-        // the freshness assumption the NAV band relies on and could only be revoked via a
-        // timelocked bumpQuoteEpoch — exactly when fast containment matters.
-        if (m.expiry > block.timestamp + $.maxQuoteTtl) {
+        // F-4: expiry must also be NEAR-TERM. A long-dated quote is an American option —
+        // the taker chooses the moment within its life when the frozen price is most
+        // favourable to them, so the leak costs close to the full band width rather than
+        // some fraction of it. Read through the fallback, never $.maxQuoteTtl directly.
+        uint64 ttlCap = _effectiveMaxQuoteTtl($);
+        if (m.expiry > block.timestamp + ttlCap) {
             // forge-lint: disable-next-line(unsafe-typecast)
-            revert QuoteExpiryTooFar(m.expiry, uint64(block.timestamp + $.maxQuoteTtl));
+            revert QuoteExpiryTooFar(m.expiry, uint64(block.timestamp + ttlCap));
         }
         if (m.epoch != $.quoteEpoch) revert QuoteEpochStale(m.epoch, $.quoteEpoch);
 
@@ -699,9 +727,10 @@ contract GyldAtomicSwap is
     ///         feed follows Chainlink read semantics and never reverts on a stale
     ///         answer — so an admin must not be able to widen it to a value that
     ///         effectively disables it. maxQuoteDeviationBps and maxQuoteTtl are bounded
-    ///         for the same reason (GYL-1135) — in all three the RESTRICTIVE end is a
-    ///         soft-pause and therefore safe, while the permissive end disables a guard:
-    ///         here it is "accept an arbitrarily old price".
+    ///         for the same reason (GYL-1135) — in each the permissive end disables a
+    ///         guard, here "accept an arbitrarily old price". (For this setter and the
+    ///         deviation band the restrictive end is a safe soft-pause; maxQuoteTtl
+    ///         differs — its zero is the UNSET sentinel, not a pause.)
     /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
@@ -712,17 +741,26 @@ contract GyldAtomicSwap is
     /// @notice Set the upper bound on quote lifetime (seconds).
     /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. executeSwap rejects quotes expiring
     ///         further than this far in the future (F-4), so a buggy or compromised
-    ///         signer cannot issue immortal quotes. Capped at MAX_QUOTE_TTL_CEILING
+    ///         signer cannot issue long-dated quotes. Capped at MAX_QUOTE_TTL_CEILING
     ///         (1 hour) — the setter previously had NO validation at all, and `uint64`
     ///         reaches ~584 billion years, so one admin call could defeat quote expiry
-    ///         outright and leave a leaked signed quote executable forever. The knob is
-    ///         asymmetric (GYL-1135): the restrictive end (0) pins expiry to the current
-    ///         block and is merely a soft-pause, whereas the permissive end removes the
-    ///         only containment that acts faster than the timelock guarding
-    ///         bumpQuoteEpoch. Since the ceiling equals DEFAULT_MAX_QUOTE_TTL, this knob
-    ///         is narrow-only: expiry can be tightened, never loosened past what was
-    ///         deployed and audited. See the constant for the full rationale.
-    /// @param newTtl Max quote lifetime in seconds (e.g. 3600 = 1 hour). 0 <= newTtl <= 1 h.
+    ///         outright and leave a leaked signed quote executable forever.
+    ///
+    ///         PASSING ZERO DOES NOT PAUSE ANYTHING. Zero is the unset sentinel and
+    ///         resets the cap to DEFAULT_MAX_QUOTE_TTL (15 min) — the fallback that keeps
+    ///         an upgraded proxy working. To halt swaps use `pause()`, which is a hot key
+    ///         (PAUSER_ROLE) and lands in one block, rather than this setter, which in
+    ///         production waits on the 48 h timelock.
+    ///
+    ///         The knob is genuinely two-way between 1 second and the 1 h ceiling, so the
+    ///         TTL can be tuned operationally without an upgrade while the catastrophic
+    ///         setting stays unreachable. Note the cap is compared against the EXECUTING
+    ///         block, not signing time: setting it below the TTL the quote service issues
+    ///         does not shorten quote life, it forbids prompt execution until the quote
+    ///         is nearly expired. Keep this above the service's longest issued TTL
+    ///         (~60s class today). See the constant for the full rationale.
+    /// @param newTtl Max quote lifetime in seconds (e.g. 900 = 15 min). 0 resets to the
+    ///               default; otherwise 0 < newTtl <= 1 h.
     function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newTtl > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(newTtl);
         _getStorage().maxQuoteTtl = newTtl;
@@ -802,16 +840,21 @@ contract GyldAtomicSwap is
 
     /// DEFAULT_ADMIN_ROLE cannot be renounced — losing it permanently bricks UUPS
     /// upgrades, unpause, series registration, withdrawal-wallet control, and all role
-    /// management, including quote-signer rotation.
-    /// PAUSER_ROLE and TREASURER_ROLE cannot be renounced either (F-7): they are the
-    /// incident-response pair, and a sole holder self-renouncing would remove the fast
-    /// halt (pause) and the paused-state evacuation path (withdraw) until the timelock
-    /// re-grants — the very delay those roles exist to bypass.
-    /// Intentional removal must go through revokeRole (explicit, two-party action).
+    /// management, including quote-signer rotation. There is no other holder by
+    /// construction, so this one really is unrecoverable.
+    ///
+    /// Every OTHER role stays renounceable, deliberately. An earlier revision also blocked
+    /// PAUSER_ROLE and TREASURER_ROLE (F-7) on the theory that a sole holder self-renouncing
+    /// would strand incident response. That guard was inert and mildly harmful, so it was
+    /// removed: DEFAULT_ADMIN_ROLE administers every role (no `_setRoleAdmin` call anywhere,
+    /// `getRoleAdmin`/`grantRole` unoverridden), so a renounce is never permanent — it costs
+    /// one re-grant. Meanwhile OZ's `renounceRole` only ever affects the caller
+    /// (`callerConfirmation == msg.sender`), so there is no accidental or third-party path to
+    /// it, and both roles are held by M-of-N wallets in production. What the guard did remove
+    /// is the one case that matters: a holder who KNOWS their key is compromised could no
+    /// longer shed the role immediately and had to wait on a timelocked revokeRole instead.
     function renounceRole(bytes32 role, address callerConfirmation) public override {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
-        if (role == PAUSER_ROLE) revert CannotRenouncePauserRole();
-        if (role == TREASURER_ROLE) revert CannotRenounceTreasurerRole();
         super.renounceRole(role, callerConfirmation);
     }
 

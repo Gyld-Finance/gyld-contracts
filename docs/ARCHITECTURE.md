@@ -834,7 +834,8 @@ struct PermitData { uint256 value; uint256 deadline; uint8 v; bytes32 r; bytes32
 | `SWAP_MESSAGE_TYPEHASH` | `0x87423ed2b6ce38b5c2943920bccdd1f9e50d2e0493f61560b2302e7508b52f0b` |
 | `MIN_DRAW_BPS` | 100 → a **1 % dust floor** on `requestedAmountIn` relative to `maxAmountIn` |
 | `BPS_DENOMINATOR` | 10_000 |
-| `DEFAULT_MAX_QUOTE_TTL` | **1 hour** — seeded into `maxQuoteTtl` at `initialize` |
+| `DEFAULT_MAX_QUOTE_TTL` | **15 minutes** — the *fallback* for `maxQuoteTtl`, **not** a seed. `initialize` deliberately leaves the slot unset; `_effectiveMaxQuoteTtl` returns this constant whenever the slot reads zero, which is what keeps a proxy upgraded across the field's addition working (see below) |
+| `MAX_QUOTE_TTL_CEILING` | **1 hour** — structural upper bound on `maxQuoteTtl`, anchored to one NAV publication epoch (`KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL`) |
 | `MAX_NAV_AGE_CEILING` | **72 hours** — structural upper bound on `maxNavAgeSecs` |
 
 The typehash was verified by recomputation:
@@ -958,10 +959,18 @@ tolerance reachable.
 affect the ERC-7201 layout.
 
 Note the asymmetry in which parameters may be set permissively.
-`maxQuoteDeviationBps = 0` and `maxQuoteTtl = 0` are both *safe* extremes — they
-are soft-pauses, so the **restrictive** end of those two needs no guard. The
-permissive extreme of `maxNavAgeSecs` is "accept an arbitrarily old price", which
-is why it carries a hard ceiling.
+`maxQuoteDeviationBps = 0` is a *safe* extreme — a soft-pause — so its
+**restrictive** end needs no guard. The permissive extreme of `maxNavAgeSecs` is
+"accept an arbitrarily old price", which is why it carries a hard ceiling.
+
+`maxQuoteTtl = 0` is a different case and is **not** a soft-pause: zero is the
+*unset* sentinel and falls back to `DEFAULT_MAX_QUOTE_TTL`. Treating it as
+literal zero seconds would contradict the `block.timestamp > m.expiry` check
+immediately above it in `executeSwap` and reject **every** quote a real service
+can issue — which is exactly what an un-migrated proxy upgrade would have caused
+under the earlier seed-based design. Soft-pausing via the TTL was never usable
+anyway: setting it requires the 48 h timelock, whereas `pause()` is a hot key
+(`PAUSER_ROLE`, ops multisig) and lands in one block.
 
 > As of the commit this document was verified against (`54f0104`),
 > `MAX_NAV_AGE_CEILING` is the only such ceiling: `maxQuoteDeviationBps` is bounded
@@ -1051,16 +1060,38 @@ signing key, which is why it deviates from `GyldBondToken`'s symmetric pause.
 
 #### Non-renounceable roles
 
-`renounceRole` reverts for **three** roles, not one:
+`renounceRole` reverts for exactly **one** role:
 
 | Role | Error | Why |
 |---|---|---|
-| `DEFAULT_ADMIN_ROLE` | `CannotRenounceAdminRole` | Losing it bricks upgrades, unpause, series registration, withdrawal-wallet control and all role management including signer rotation. |
-| `PAUSER_ROLE` | `CannotRenouncePauserRole` | A sole holder self-renouncing removes the fast halt until the timelock re-grants — the very delay the role exists to bypass (F-7). |
-| `TREASURER_ROLE` | `CannotRenounceTreasurerRole` | Same argument for the paused-state evacuation path. |
+| `DEFAULT_ADMIN_ROLE` | `CannotRenounceAdminRole` | Losing it bricks upgrades, unpause, series registration, withdrawal-wallet control and all role management including signer rotation. There is no second holder by construction, so this one is genuinely unrecoverable. |
 
-`QUOTE_SIGNER_ROLE` and `ALLOWLIST_ADMIN_ROLE` stay renounceable — signer rotation
-and ops-key retirement are legitimate self-service actions.
+Every other role — `PAUSER_ROLE`, `TREASURER_ROLE`, `QUOTE_SIGNER_ROLE`,
+`ALLOWLIST_ADMIN_ROLE` — stays renounceable. Signer rotation and ops-key retirement
+are legitimate self-service actions, and so is shedding a role you believe is
+compromised.
+
+**F-7 proposed extending the block to `PAUSER_ROLE` and `TREASURER_ROLE`, and was
+rejected.** Recording why, because the argument looks persuasive until you check it:
+
+- **Nothing is stranded.** `DEFAULT_ADMIN_ROLE` administers every role — no
+  `_setRoleAdmin` call exists anywhere in the contract and `getRoleAdmin`/`grantRole`
+  are unoverridden — so a renounce costs one `grantRole`, not a permanent loss.
+- **There is no accidental path.** OZ's `renounceRole(role, callerConfirmation)`
+  requires `callerConfirmation == msg.sender`, so you cannot renounce someone else's
+  role or fat-finger an address into a self-renounce. Both roles are held by M-of-N
+  wallets in the deployed topology, so an "accident" would need a signing quorum to
+  approve a transaction whose only effect is surrendering their own role.
+- **A malicious renounce is pure self-harm.** A compromised `PAUSER` renouncing
+  removes the defenders' halt but gains the attacker nothing — they had no use for
+  `pause()`. A compromised `TREASURER` renouncing surrenders its own `withdraw()`,
+  which can only ever send to the admin-fixed `withdrawalWallet` and was never a
+  theft primitive.
+- **It removed the case that matters.** A holder who *knows* their key is compromised
+  could no longer shed the role immediately, and had to wait on a timelocked
+  `revokeRole` instead. The guard traded one exposure window for a worse one.
+
+Pinned by `test_renounceRole_onlyAdminRoleIsBlocked` so it is not reintroduced.
 
 #### Permit is never load-bearing
 
@@ -1135,9 +1166,11 @@ production. This is the table to read first if you are auditing the system.
 - **The emergency NAV override is key-separated by the contract itself**, in all
   three directions (`setEmergencyUpdater`, `transferOwnership`,
   `_transferOwnership`), not by convention.
-- **Incident-response roles cannot be renounced.** On the swap, `PAUSER_ROLE` and
-  `TREASURER_ROLE` join `DEFAULT_ADMIN_ROLE` as non-renounceable, so a sole holder
-  cannot accidentally remove the halt or the evacuation path.
+- **Only `DEFAULT_ADMIN_ROLE` is non-renounceable.** `PAUSER_ROLE` and
+  `TREASURER_ROLE` stay renounceable deliberately — the admin re-grants either in one
+  transaction, so a renounce strands nothing, and a holder who knows their key is
+  compromised must be able to shed the role without waiting on the timelock. See
+  §Non-renounceable roles for why F-7 was rejected.
 
 ### 6.3 What a single key compromise buys
 
@@ -1370,7 +1403,7 @@ BUY, worked end to end
 | **Taker allowlist** (`allowed[msg.sender]`, `ALLOWLIST_ADMIN_ROLE`) | An un-onboarded address executing at all, even with a validly signed quote. |
 | **Single-use `quoteId`** (BitInvalidator, consumed *before* any transfer) | Replay, including replay on a different leg inside the expiry window. 256 quotes per storage slot. |
 | **Quote expiry** | Sitting on a favourable price while NAV moves. The TTL policy itself (~60 s class) is off-chain; the chain checks the timestamp. |
-| **TTL bound** (`expiry <= now + maxQuoteTtl`, default 1 h) | An immortal or months-long quote from a buggy or compromised signer, which would outlive the freshness assumption the NAV band relies on and could only be revoked by a *timelocked* `bumpQuoteEpoch` — exactly when fast containment matters (F-4). |
+| **TTL bound** (`expiry <= now + maxQuoteTtl`, default **15 min**) | A long-dated quote from a buggy or compromised signer. Such a quote is an **American option**: the taker holds a frozen price and picks the moment within its life when that price is most favourable to them, so the leak costs close to the full `maxQuoteDeviationBps` width rather than a fraction of it. Note this guard does **not** protect the NAV band — `_checkQuoteBand` re-reads the feed live on every execution — and it is **not** the only containment faster than the timelock: `pause()` (`PAUSER_ROLE`) and `setAllowed(taker,false)` (`ALLOWLIST_ADMIN_ROLE`) both act in one block on hot keys, and quotes are taker-bound. What the TTL bounds is the window before anyone *notices* (F-4). |
 | **`quoteEpoch` mass-kill** (`bumpQuoteEpoch`, admin) | Signer-key compromise: one transaction invalidates every outstanding quote (the 1inch epoch pattern). |
 | **NAV band** (`maxQuoteDeviationBps`) | A fully compromised quote signer. Even a valid signature moves price at most ±2 % off on-chain NAV per trade, and the feed is written by a *different* key under a ±10 %/hour cap — one stolen key cannot both move the reference and exploit the band. `setMaxQuoteDeviationBps(0)` is a documented on-chain soft-pause. |
 | **`StaleNav`, ceilinged at 72 h** | Pricing against a NAV nobody refreshed. The only staleness defence in the path, since the feed never reverts. |
@@ -2587,12 +2620,12 @@ references resolve to something.
 | **I-16** | Withdrawal target — `withdraw` can only ever send to the admin-fixed `withdrawalWallet` | `test_withdraw_*` family |
 | **I-17** | Reentrancy exclusion covers `withdraw` too — it shares the guard with `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap` |
 | **I-18** | Pause asymmetry — `PAUSER_ROLE` halts, only `DEFAULT_ADMIN_ROLE` resumes | `test_pause_asymmetric_onlyAdminUnpauses` |
-| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8 | `test_erc7201_storageLayout` |
+| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8 | `test_storageLayout_erc7201SlotAndPacking` |
 | **I-20** | Upgrade authority — `upgradeToAndCall` is admin-only | `test_upgradeToAndCall_onlyAdmin` |
 | **I-21** | Series deregistration then re-registration restores tradability | `test_deregisterSeries_thenReregister_restoresTradability` |
 | **I-22** | Permit is never load-bearing for authorization — a `tokenIn` with no `permit()` at all still settles via a plain approval | `test_executeSwap_permitOnTokenWithoutPermit_doesNotBrick` |
 | **I-23** | Quote expiry is TTL-bounded: `block.timestamp <= expiry <= block.timestamp + maxQuoteTtl`, upper edge **inclusive** | `test_executeSwap_quoteExpiryTtlBound_inclusiveEdge` |
-| **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | `test_seriesList_swapAndPop_midArrayAndLastElement` |
+| **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | **Not covered.** The `seriesCount`/`seriesAt` getters that made the list externally observable were dropped from this PR, and `seriesList` is read by no other contract logic — so the swap-and-pop loop (`registerSeries`/`deregisterSeries`) has no external assertion point. Pre-existing gap on `main`; restoring the two view functions is the cheapest fix. |
 
 Remediated findings:
 
@@ -2601,10 +2634,10 @@ Remediated findings:
 | **F-1** (was O-4) | The `/1e20` decimal ladder was an operational convention only | `initialize` probes USDC `decimals() == 6`; `registerSeries` probes forwarder `== 8` and bond token `== 18` |
 | F-2 | **Not recoverable** — no surviving reference | — |
 | **F-3** | The usage bitmap is not epoch-scoped, so id reuse after a bump would silently break | Documented invariant I-5 + test; the quote service must use one monotonic counter |
-| **F-4** | A signer could issue immortal quotes, revocable only via a *timelocked* epoch bump | `maxQuoteTtl` (default 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment |
+| **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **15 min**, ceiling 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
 | **F-5** | `seriesList` was unobservable, so swap-and-pop was untestable | `seriesCount()` / `seriesAt(i)` getters + test |
 | **F-6** | A future-dated `updatedAt` satisfies `now > updatedAt + maxAge` forever | Explicit `updatedAt > block.timestamp` → `StaleNav`; plus the forwarder's configuration-time probe |
-| **F-7** | A sole `PAUSER`/`TREASURER` holder could renounce, removing the halt and the paused-state evacuation path | Both roles made non-renounceable |
+| **F-7** | A sole `PAUSER`/`TREASURER` holder could renounce, removing the halt and the paused-state evacuation path | **Rejected, not implemented.** The guard was inert (the admin administers both roles and re-grants in one tx; `renounceRole` is self-only; both roles are M-of-N in production) and mildly harmful — it blocked a holder with a known-compromised key from shedding it immediately. See §Non-renounceable roles. |
 
 ### 16.3 Constants independently verified for this document
 

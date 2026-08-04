@@ -24,6 +24,19 @@ interface ISanctionsList {
 /// UUPS-upgradeable — the proxy pattern keeps bond token addresses stable post-issuance.
 /// Upgrades require DEFAULT_ADMIN_ROLE (a TimelockController in production).
 ///
+/// ⚠ DECIMALS ARE LOAD-BEARING OFF-CONTRACT — DO NOT OVERRIDE `decimals()`.
+/// This contract deliberately does not override `decimals()`, so it inherits
+/// {ERC20Upgradeable}'s hard-coded `return 18` (no storage slot, nothing to drift).
+/// `GyldAtomicSwap._checkQuoteBand` prices every quote with a single hard-coded divisor —
+/// `navValue = tokenAmount * nav / 1e20` — where the 20 is `18 (bond) + 8 (NAV) - 6 (cash)`.
+/// A series reporting anything in 7..17 decimals silently UNDER-prices: a 12-decimal token
+/// makes the band value 10^6 too small, so a taker can pay ~$0.001 for ~$1,000 of bonds.
+/// `GyldAtomicSwap.registerSeries` staticcall-probes for exactly 18 and rejects otherwise,
+/// but that probe runs once at registration — an implementation upgrade that added an
+/// override would bypass it for series already registered. If a future series genuinely
+/// needs different precision, change the swap's scaling FIRST (per-series factor), not
+/// this function. Pinned by `test_decimals_is18_swapBandDependsOnIt`.
+///
 /// Compliance:
 ///   - All secondary transfers check sender, receiver, AND spender (msg.sender in transferFrom)
 ///     against the Chainalysis on-chain sanctions oracle.

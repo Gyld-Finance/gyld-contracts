@@ -454,6 +454,41 @@ contract GyldBondTokenTest is Test {
         token.renounceRole(pauserRole, pauser2);
         assertFalse(token.hasRole(pauserRole, pauser2));
     }
+
+    // ── decimals() is a cross-contract invariant ──────────────────────────────
+
+    /// GyldAtomicSwap prices every quote with a hard-coded divisor:
+    ///     navValue = tokenAmount * nav / 1e20,   20 = 18 (bond) + 8 (NAV) - 6 (cash)
+    /// so 18 decimals here is not cosmetic — it is an input to someone else's arithmetic.
+    /// A series reporting 7..17 decimals silently UNDER-prices (a 12dp token makes navValue
+    /// 10^6 too small, letting a taker pay ~$0.001 for ~$1,000 of bonds); <=6 truncates
+    /// navValue to zero and bricks the series.
+    ///
+    /// registerSeries staticcall-probes for exactly 18, but only ONCE at registration — an
+    /// implementation upgrade adding a `decimals()` override would bypass that probe for
+    /// every series already registered, and nothing on-chain would notice. This test is
+    /// that missing tripwire: it fails in CI before such an override could ship.
+    /// If a series ever genuinely needs different precision, change the swap's scaling to a
+    /// per-series factor FIRST, then this test.
+    function test_decimals_is18_swapBandDependsOnIt() public view {
+        assertEq(token.decimals(), 18, "GyldAtomicSwap's /1e20 band divisor assumes 18 decimals");
+    }
+
+    /// The same invariant, stated the way it can actually break: `decimals()` is inherited
+    /// from ERC20Upgradeable as a hard-coded `return 18` with no storage behind it, so it
+    /// cannot drift at runtime — only a new implementation can change it. Prove an upgrade
+    /// that does NOT touch decimals leaves it intact, so this test isolates the override
+    /// case rather than incidentally passing because nothing was upgraded.
+    function test_decimals_survivesUpgrade() public {
+        assertEq(token.decimals(), 18);
+
+        GyldBondTokenV2 v2 = new GyldBondTokenV2();
+        vm.prank(admin);
+        token.upgradeToAndCall(address(v2), "");
+
+        assertEq(GyldBondTokenV2(address(token)).version(), 2, "precondition: the upgrade landed");
+        assertEq(token.decimals(), 18, "decimals must not move across an upgrade");
+    }
 }
 
 /// @dev A deployed contract with no isSanctioned() function — used to test the probe rejection.

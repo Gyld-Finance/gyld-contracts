@@ -116,15 +116,19 @@ Exactly two genuine gaps, both narrow, and neither on the hot path:
   failure branch (`!usdcOk || usdcData.length != 32`). Its wrong-decimals
   sibling on line 363 *is* covered, and the analogous guard on
   `registerSeries` is covered for both the wrong-decimals and the
-  no-`decimals()`-at-all cases. Only the initializer's "USDC address has no
-  `decimals()`" case is untested. Low severity: one-shot at deploy, fails loud.
+  no-`decimals()`-at-all cases. The initializer's "cash token has no `decimals()`"
+  case is now covered too, by `test_initialize_cashTokenWithoutDecimals_reverts` —
+  worth having because `usdc` has no setter, so a bad cash token bricks the proxy
+  permanently rather than failing loud on one series.
 - **`GyldBondToken.sol:192`** — `mint(to, 0)` → `ZeroAmount`. `burn(x, 0)` and
   `mint(address(0), …)` are both tested; this one is a symmetry gap.
 
-`GyldAtomicSwap.sol:356` (`DEFAULT_MAX_QUOTE_TTL > MAX_QUOTE_TTL_CEILING`) is
-a comparison of two constants — the revert side is structurally dead and cannot
-be covered without changing the constants. It is a deliberate future-proofing
-guard; leave it.
+*(An earlier revision of this note flagged a constant-vs-constant comparison in
+`initialize` as structurally dead. That guard has since been removed: `initialize`
+no longer seeds `maxQuoteTtl` at all — the field is read through
+`_effectiveMaxQuoteTtl`, which falls back to `DEFAULT_MAX_QUOTE_TTL` on an unset
+slot, so there is no seeded value left to validate. See the constant's docstring
+for why the fallback shape is load-bearing on an upgraded proxy.)*
 
 **The reassuring part:** `executeSwap` (lines 471-570) and `_checkQuoteBand`
 (571-632) — the value-moving hot path — contain **zero** uncovered lines and

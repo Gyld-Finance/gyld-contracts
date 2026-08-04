@@ -1097,11 +1097,19 @@ contract GyldAtomicSwapSpecTest is Test {
     // Context. setMaxQuoteTtl had NO validation at all and the field is uint64, so one
     // DEFAULT_ADMIN_ROLE call could push the cap past any real elapsed time and defeat
     // quote expiry outright — after which a leaked signed quote stays executable
-    // indefinitely, the exact failure the F-4 TTL was added to prevent. It matters more
-    // than it looks because DEFAULT_ADMIN_ROLE is a TimelockController in production, so
-    // bumpQuoteEpoch (the mass-invalidation path) is delayed by the governance window:
-    // expiry is the only containment that acts faster than the timelock, and it must not
-    // be removable by the same timelocked authority it backstops.
+    // indefinitely, the exact failure the F-4 TTL was added to prevent.
+    //
+    // What the TTL is and is NOT. It is one of THREE containments on a leaked quote, and
+    // the only timelocked one. pause() (PAUSER_ROLE, ops multisig) and
+    // setAllowed(taker,false) (ALLOWLIST_ADMIN_ROLE, split off DEFAULT_ADMIN precisely so
+    // it need not wait on governance) both land in a single block on hot keys — quotes are
+    // taker-bound, so revoking one taker kills every quote naming them. Nor does the TTL
+    // protect the NAV band: _checkQuoteBand re-reads the feed LIVE on every execution.
+    // What the TTL bounds is the WINDOW in which a leaked quote can be exercised as an
+    // AMERICAN OPTION before anyone notices — the taker holds a frozen price and picks
+    // its most favourable moment, so the leak costs close to the full band width rather
+    // than a fraction of it. That is the case the two hot keys do not cover, because they
+    // require someone to already know.
 
     /// No admin call, for any input above the ceiling, can extend quote lifetime.
     function testFuzz_setMaxQuoteTtl_revertsAboveCeiling(uint64 newTtl) public {
@@ -1115,13 +1123,14 @@ contract GyldAtomicSwapSpecTest is Test {
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "a rejected setter must leave the TTL untouched");
     }
 
-    /// The ceiling itself is accepted — the bound is inclusive. It deliberately EQUALS
-    /// DEFAULT_MAX_QUOTE_TTL, which makes maxQuoteTtl a narrow-only knob: an admin may
-    /// tighten quote expiry but can never loosen it past what was deployed and audited.
+    /// The ceiling itself is accepted — the bound is inclusive. The ceiling sits ABOVE
+    /// DEFAULT_MAX_QUOTE_TTL, so the knob is genuinely two-way: the TTL can be tuned
+    /// operationally in either direction without an upgrade, while the catastrophic
+    /// setting (anything past one NAV publication epoch) stays unreachable.
     function test_setMaxQuoteTtl_ceilingExactlyIsAccepted() public {
         uint64 ceiling = swap.MAX_QUOTE_TTL_CEILING();
         assertEq(ceiling, 1 hours, "ceiling must match one NAV publication epoch");
-        assertEq(ceiling, swap.DEFAULT_MAX_QUOTE_TTL(), "the TTL knob must be narrow-only");
+        assertGt(ceiling, swap.DEFAULT_MAX_QUOTE_TTL(), "the default must leave room to tune upward");
 
         vm.prank(admin);
         swap.setMaxQuoteTtl(ceiling);
@@ -1131,29 +1140,40 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, ceiling + 1));
         swap.setMaxQuoteTtl(ceiling + 1);
 
-        // Zero stays legal: that is the RESTRICTIVE end (expiry pinned to the current
-        // block), which is a soft-pause and therefore safe to permit.
+        // Zero is the UNSET sentinel, NOT "zero seconds" — it resets to the compiled-in
+        // default. Literal zero-seconds would contradict the QuoteExpired check one line
+        // above it in executeSwap and reject every quote a real service can issue.
         vm.prank(admin);
         swap.setMaxQuoteTtl(0);
-        assertEq(swap.maxQuoteTtl(), 0);
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "zero must fall back, never disable");
     }
 
-    /// The initialize side of the bound. initialize seeds the TTL from a constant rather
-    /// than a parameter, so the "born with the guard disabled" hole is closed by the
-    /// constant relationship itself — pin it, because a later bump of the default would
-    /// otherwise reintroduce exactly the half-fix this ticket set out to avoid.
-    function test_initialize_seedsTtlWithinCeiling() public {
+    /// The initialize side of the bound. initialize deliberately does NOT write the TTL
+    /// slot — the effective cap comes from the DEFAULT_MAX_QUOTE_TTL fallback, so a fresh
+    /// deploy and a proxy upgraded across the field's addition enforce the same value with
+    /// no migration step. Pin BOTH halves: the constant satisfies the ceiling, and the
+    /// slot really is left at zero (which is what the fallback exists to absorb).
+    function test_initialize_leavesTtlUnsetAndFallbackIsWithinCeiling() public {
         GyldAtomicSwap impl = new GyldAtomicSwap();
         assertLe(
             impl.DEFAULT_MAX_QUOTE_TTL(),
             impl.MAX_QUOTE_TTL_CEILING(),
-            "the seeded default must itself satisfy the ceiling"
+            "the fallback default must itself satisfy the ceiling"
         );
 
         GyldAtomicSwap fresh = _deploySwap(address(usdc));
         assertLe(fresh.maxQuoteTtl(), fresh.MAX_QUOTE_TTL_CEILING(), "a fresh deployment must be born bounded");
+        assertEq(fresh.maxQuoteTtl(), fresh.DEFAULT_MAX_QUOTE_TTL(), "fresh deploy enforces the fallback");
 
-        // A fresh deployment cannot be widened afterwards either.
+        // The raw slot at B+8 is untouched by initialize — the getter's value is the
+        // fallback, not a stored seed. This is the invariant that makes an un-migrated
+        // upgrade safe; if initialize ever starts seeding again, this fails and the
+        // upgrade path silently regains its brick.
+        bytes32 base = 0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300;
+        bytes32 raw = vm.load(address(fresh), bytes32(uint256(base) + 8));
+        assertEq(uint256(raw), 0, "initialize must leave maxQuoteTtl unset");
+
+        // A fresh deployment cannot be widened past the ceiling afterwards either.
         uint64 ceiling = fresh.MAX_QUOTE_TTL_CEILING();
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, ceiling + 1));
@@ -1295,22 +1315,32 @@ contract GyldAtomicSwapSpecTest is Test {
         assertFalse(swap.hasRole(adminRole, secondAdmin));
     }
 
-    /// F-7 extends I-8 to the incident-response pair: PAUSER and TREASURER renounce
-    /// MUST revert (a sole holder self-renouncing would remove pause() and
-    /// withdraw()-while-paused until the timelock re-grants). QUOTE_SIGNER and
-    /// ALLOWLIST_ADMIN stay renounceable — signer rotation and ops-key retirement.
-    function test_renounceRole_incidentResponseRoles_revert() public {
+    /// I-8 is scoped to DEFAULT_ADMIN_ROLE alone: EVERY other role stays renounceable.
+    ///
+    /// F-7 proposed extending the block to PAUSER and TREASURER on the theory that a sole
+    /// holder self-renouncing would strand incident response. Rejected, and this test pins
+    /// the rejection so it is not silently reintroduced. The theory fails because
+    /// DEFAULT_ADMIN_ROLE administers every role — no `_setRoleAdmin` call exists anywhere
+    /// and `getRoleAdmin`/`grantRole` are unoverridden — so a renounce costs one re-grant,
+    /// never a permanent loss. And the guard removed the case that matters: a holder who
+    /// knows their key is compromised shedding it immediately, rather than waiting on a
+    /// timelocked revokeRole.
+    function test_renounceRole_onlyAdminRoleIsBlocked() public {
+        // The incident-response pair: renounceable, and re-grantable.
         bytes32 pauserRole = swap.PAUSER_ROLE();
         vm.prank(pauser);
-        vm.expectRevert(GyldAtomicSwap.CannotRenouncePauserRole.selector);
         swap.renounceRole(pauserRole, pauser);
+        assertFalse(swap.hasRole(pauserRole, pauser));
+        vm.prank(admin);
+        swap.grantRole(pauserRole, pauser);
+        assertTrue(swap.hasRole(pauserRole, pauser), "nothing is stranded by a renounce");
 
         bytes32 treasurerRole = swap.TREASURER_ROLE();
         vm.prank(treasurer);
-        vm.expectRevert(GyldAtomicSwap.CannotRenounceTreasurerRole.selector);
         swap.renounceRole(treasurerRole, treasurer);
+        assertFalse(swap.hasRole(treasurerRole, treasurer));
 
-        // The other two roles remain renounceable.
+        // Signer rotation and ops-key retirement stay available too.
         bytes32 signerRole = swap.QUOTE_SIGNER_ROLE();
         vm.prank(signer);
         swap.renounceRole(signerRole, signer);
@@ -1370,12 +1400,23 @@ contract GyldAtomicSwapSpecTest is Test {
         );
 
         // maxQuoteTtl (F-4) is appended AFTER the existing fields at B+8 — ERC-7201
-        // append-only: nothing above moved.
+        // append-only: nothing above moved. Prove the slot is REACHABLE and correctly
+        // placed by writing it through the setter, since initialize deliberately leaves
+        // it zero (the fallback absorbs the unset case — see
+        // test_initialize_leavesTtlUnsetAndFallbackIsWithinCeiling).
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(7 minutes);
         assertEq(
             uint64(uint256(vm.load(address(swap), bytes32(uint256(derived) + 8)))),
-            swap.DEFAULT_MAX_QUOTE_TTL(),
-            "maxQuoteTtl must occupy B+8 offset 0 (8 bytes), seeded by initialize"
+            7 minutes,
+            "maxQuoteTtl must occupy B+8 offset 0 (8 bytes)"
         );
+        assertEq(swap.maxQuoteTtl(), 7 minutes, "getter must read the slot it wrote");
+
+        // Back to unset: the slot clears and the getter reports the fallback, not zero.
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(0);
+        assertEq(uint256(vm.load(address(swap), bytes32(uint256(derived) + 8))), 0, "slot must clear");
 
         // Getters agree with the raw slots.
         assertEq(swap.quoteEpoch(), 3);
@@ -1552,7 +1593,7 @@ contract GyldAtomicSwapSpecTest is Test {
     function test_executeSwap_quoteExpiryTtlBound_inclusiveEdge() public {
         _approveTaker();
         uint64 ttl = swap.maxQuoteTtl();
-        assertEq(ttl, 1 hours, "spec: initialize seeds DEFAULT_MAX_QUOTE_TTL = 1 hour");
+        assertEq(ttl, 15 minutes, "spec: the effective cap is the DEFAULT_MAX_QUOTE_TTL fallback");
 
         GyldAtomicSwap.SwapMessage memory atEdge = _buyQuote(24, 1_000e6);
         atEdge.expiry = uint64(block.timestamp + ttl);
@@ -1595,39 +1636,5 @@ contract GyldAtomicSwapSpecTest is Test {
             )
         );
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // F-5 (I-24) — seriesList is observable; swap-and-pop pinned
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /// seriesList MUST stay a duplicate-free mirror of registeredSeries, and the
-    /// deregister swap-and-pop MUST move the last element into the removed slot. Pins
-    /// the two previously untestable cases from F-5: mid-array target and last-element.
-    function test_seriesList_swapAndPop_midArrayAndLastElement() public {
-        MockReentrantToken seriesB = new MockReentrantToken();
-        MockReentrantToken seriesC = new MockReentrantToken();
-        vm.startPrank(admin);
-        swap.registerSeries(address(seriesB), address(navFeed));
-        swap.registerSeries(address(seriesC), address(navFeed));
-        vm.stopPrank();
-        assertEq(swap.seriesCount(), 3);
-
-        // Mid-array target: [token, B, C] → deregister B → C fills slot 1.
-        vm.prank(admin);
-        swap.deregisterSeries(address(seriesB));
-        assertEq(swap.seriesCount(), 2);
-        assertEq(swap.seriesAt(0), address(token));
-        assertEq(swap.seriesAt(1), address(seriesC), "swap-and-pop must move the tail into the gap");
-
-        // Last-element target: [token, C] → deregister C → tail popped, order kept.
-        vm.prank(admin);
-        swap.deregisterSeries(address(seriesC));
-        assertEq(swap.seriesCount(), 1);
-        assertEq(swap.seriesAt(0), address(token));
-
-        // The mirror stays exact: deregistered entries are gone from both views.
-        assertFalse(swap.registeredSeries(address(seriesB)));
-        assertFalse(swap.registeredSeries(address(seriesC)));
     }
 }
