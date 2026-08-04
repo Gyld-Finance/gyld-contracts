@@ -75,7 +75,7 @@ contract AtomicSettlementFlow is Script {
         vm.startBroadcast();
 
         // ── Step 1: minimal base stack ───────────────────────────────────────
-        MockSanctionsList sanctions = new MockSanctionsList();
+        MockSanctionsList sanctions = new MockSanctionsList(deployer);
         MockUSDC usdc = new MockUSDC();
 
         IssuanceManager issuanceMgr = IssuanceManager(
@@ -88,7 +88,7 @@ contract AtomicSettlementFlow is Script {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), deployer);
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions));
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // CAT-style series — deployer is factory owner so deployToken is called directly

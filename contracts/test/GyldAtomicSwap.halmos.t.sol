@@ -100,7 +100,7 @@ contract GyldAtomicSwapHalmosTest is Test {
         signer = vm.addr(SIGNER_PK);
         vm.assume(signer != address(0)); // prunes the ECDSAInvalidSignature branch
 
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDC();
         navFeed = new MockNavForwarder(NAV);
 

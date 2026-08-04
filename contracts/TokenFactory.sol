@@ -69,7 +69,18 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         address issuanceManager
     );
 
-    constructor(address bondTokenLogic_, address sanctionsList_) Ownable(msg.sender) {
+    /// @param bondTokenLogic_ GyldBondToken implementation every proxy delegates to.
+    /// @param sanctionsList_  on-chain sanctions oracle baked into every token deployed here.
+    /// @param owner_          initial owner (Ownable2Step). Passed EXPLICITLY rather than
+    ///                        taken from `msg.sender` (GYL-1135): the bootstrap contracts are
+    ///                        deployed through the canonical CREATE2 proxy
+    ///                        (0x4e59…4956C) so that the same address can never be a
+    ///                        different contract type on another chain, and `Ownable(msg.sender)`
+    ///                        would have made THAT PROXY the factory owner — permanently
+    ///                        bricking `transferOwnership` and with it the hand-over to the
+    ///                        TimelockController. In production this must be a
+    ///                        TimelockController (or an address that hands over to one).
+    constructor(address bondTokenLogic_, address sanctionsList_, address owner_) Ownable(owner_) {
         if (bondTokenLogic_ == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
         (bool ok, bytes memory data) = sanctionsList_.staticcall(
             abi.encodeWithSignature("isSanctioned(address)", address(0))

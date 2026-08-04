@@ -66,7 +66,7 @@ contract AtomicSettlementDeployTest is Test {
 
         // ── Minimal DevNet stack (mirrors DeployDevNet; no timelock — the test
         //    contract stays factory owner so deployToken is called directly) ─────
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
 
         issuanceMgr = IssuanceManager(
@@ -79,7 +79,7 @@ contract AtomicSettlementDeployTest is Test {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), address(this));
 
-        factory = new TokenFactory(address(new GyldBondToken()), address(mockSanctions));
+        factory = new TokenFactory(address(new GyldBondToken()), address(mockSanctions), address(this));
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // Real bond series deployed through the factory (CAT, same params as DeployDevNet).

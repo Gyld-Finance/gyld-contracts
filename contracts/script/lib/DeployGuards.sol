@@ -215,6 +215,42 @@ library DeployGuards {
         }
     }
 
+    /// @notice On production, `target` must not be one of the dev mocks compiled into
+    ///         this repo. No-op on dev chains.
+    /// @dev    {requireProdContract} can only see `code.length != 0`, which a mock trivially
+    ///         satisfies — that is how a writable MockSanctionsList could pass as the
+    ///         production `SANCTIONS_LIST`. This closes the gap for the mocks we ship by
+    ///         comparing EXTCODEHASH against the mock's runtime bytecode taken from THE SAME
+    ///         COMPILATION, e.g.
+    ///
+    ///             requireProdNotMock(oracle, type(MockSanctionsList).runtimeCode, "SANCTIONS_LIST")
+    ///
+    ///         so the expected hash cannot drift from the artifact it protects against
+    ///         (a compiler or optimiser change moves both together). It is deliberately
+    ///         NOT a general "is this a mock" oracle: any third-party writable oracle still
+    ///         passes, so this is a second line of defence behind the mock's own access
+    ///         control and the dev-only chain guard on its deploy script — not a substitute.
+    /// @param  devMockRuntimeCode `type(SomeMock).runtimeCode` of a mock that must never be
+    ///         wired in on production.
+    function requireProdNotMock(address target, bytes memory devMockRuntimeCode, string memory label)
+        internal
+        view
+    {
+        if (isDevChain()) return;
+        if (target.codehash == keccak256(devMockRuntimeCode)) {
+            revert(
+                string.concat(
+                    "DeployGuards: ",
+                    label,
+                    " (",
+                    vm.toString(target),
+                    ") is a DEV MOCK whose sanctions list is writable - it must never be used on production chainId ",
+                    vm.toString(block.chainid)
+                )
+            );
+        }
+    }
+
     // ── Post-deploy assertions (run in-band, inside the broadcast) ─────────────
 
     /// @notice Asserts a role handover actually happened: `holder` HAS `role` on

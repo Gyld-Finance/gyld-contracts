@@ -82,7 +82,7 @@ contract GyldAtomicSwapSpecTest is Test {
         signer = vm.addr(SIGNER_PK);
         taker = vm.addr(TAKER_PK);
 
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
         navFeed = new MockNavForwarder(NAV);
 

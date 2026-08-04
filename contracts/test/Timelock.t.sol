@@ -32,10 +32,10 @@ contract TimelockTest is Test {
 
     function setUp() public {
         GyldBondToken bondTokenImpl     = new GyldBondToken();
-        MockSanctionsList mockSanctions = new MockSanctionsList();
+        MockSanctionsList mockSanctions = new MockSanctionsList(address(this));
         IssuanceManager issuanceMgrImpl = new IssuanceManager();
 
-        factory = new TokenFactory(address(bondTokenImpl), address(mockSanctions));
+        factory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
 
         // Deploy IssuanceManager proxy — test contract is admin and registrar
         issuanceMgr = IssuanceManager(address(new ERC1967Proxy(

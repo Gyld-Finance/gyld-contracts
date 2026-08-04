@@ -36,7 +36,7 @@ contract GyldBondTokenTest is Test {
 
     function setUp() public {
         holderAddr    = vm.addr(HOLDER_PK);
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
 
         // ── GyldBondToken proxy ───────────────────────────────────────────────
         GyldBondToken tokenImpl = new GyldBondToken();
@@ -400,7 +400,7 @@ contract GyldBondTokenTest is Test {
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
     function test_setSanctionsList_validOracle_succeeds() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(admin);
         token.setSanctionsList(address(newOracle));
         assertEq(address(token.sanctionsList()), address(newOracle));
@@ -428,7 +428,7 @@ contract GyldBondTokenTest is Test {
     }
 
     function test_setSanctionsList_onlyAdmin_reverts() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(address(0xDEAD));
         vm.expectRevert();
         token.setSanctionsList(address(newOracle));

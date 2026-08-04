@@ -11,11 +11,13 @@ import {DeployDevNet} from "../script/DeployDevNet.s.sol";
 import {DeployTimelock} from "../script/DeployTimelock.s.sol";
 import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
 import {DeployNAVFeed} from "../script/DeployNAVFeed.s.sol";
+import {DeployMockSanctionsList} from "../script/DeployMockSanctionsList.s.sol";
 
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
 import {MockUSDC} from "./MockUSDC.sol";
 
 /// @dev External wrapper around the library.
@@ -70,12 +72,16 @@ contract DeployGuardsTest is Test {
     /// which is why `0x7c1798…70ad` is a live GyldBondToken on Base and a
     /// MockSanctionsList on Sepolia. The salt now carries `block.chainid`.
     function test_saltFor_isChainScoped() public {
-        string[5] memory names = [
+        string[6] memory names = [
             "DeployDevNet:TimelockController",
             "DeployDevNet:IssuanceManager.impl",
             "DeployDevNet:IssuanceManager.proxy",
             "DeployDevNet:GyldBondToken.impl",
-            "DeployDevNet:MockSanctionsList"
+            "DeployDevNet:MockSanctionsList",
+            // The last bootstrap contract to move off plain CREATE (GYL-1135): its
+            // constructor was `Ownable(msg.sender)`, so CREATE2 would have made the
+            // canonical proxy its owner until `owner_` became an explicit parameter.
+            "DeployDevNet:TokenFactory"
         ];
         for (uint256 i = 0; i < names.length; i++) {
             vm.chainId(8453);
@@ -151,7 +157,10 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     address constant ALLOWLIST_ADMIN = address(0xA110);
     address constant WITHDRAWAL = address(0x7DA5);
 
+    /// The dev mock. Production scenarios must REFUSE this contract as SANCTIONS_LIST.
     MockSanctionsList sanctions;
+    /// The real production oracle (GYL-1051) — what a production run must be given.
+    SanctionsOracleMirror prodOracle;
     MockUSDC usdc;
     uint256 snap;
 
@@ -159,7 +168,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         // TimelockController treats timestamp 1 as its "done" sentinel, and forge starts
         // tests at timestamp 1, so a delay-0 schedule+execute would look already-executed.
         vm.warp(1_750_000_000);
-        sanctions = new MockSanctionsList();
+        sanctions = new MockSanctionsList(address(this));
+        prodOracle = new SanctionsOracleMirror(GOVERNANCE, OPS, address(0));
         usdc = new MockUSDC();
     }
 
@@ -175,6 +185,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_devNet_unsetTimelockDelayOnBase);
         _run(this.reject_devNet_unsetSanctionsListOnBase);
         _run(this.reject_devNet_sanctionsListWithoutCode);
+        _run(this.reject_devNet_sanctionsListIsADevMock);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
         _run(this.accept_devNet_productionHappyPath);
         _run(this.accept_devNet_anvilDevPathStillWorks);
@@ -262,6 +273,24 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _expectRunRevert(address(new DeployDevNet()), "SANCTIONS_LIST (0x000000000000000000000000000000000000dEaD) has no code");
     }
 
+    /// Catches: an ALREADY-DEPLOYED dev mock handed to a production run as SANCTIONS_LIST.
+    ///
+    /// `requireProdContract` only proves `code.length != 0`, which a MockSanctionsList
+    /// satisfies — so before {DeployGuards.requireProdNotMock} the whole production path
+    /// accepted a writable fake oracle as long as it was already on chain (and
+    /// `DeployMockSanctionsList.s.sol` had no chain guard at all, so putting one there was
+    /// a single unguarded `forge script` away). Screening is fail-closed in GyldBondToken,
+    /// so whoever can write that list can freeze every holder of every series.
+    function reject_devNet_sanctionsListIsADevMock() external {
+        vm.chainId(BASE);
+        _devNetProdEnv();
+        _setAddr("SANCTIONS_LIST", address(sanctions));
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "is a DEV MOCK whose sanctions list is writable - it must never be used on production chainId 8453"
+        );
+    }
+
     /// Catches: collapsing the deliberate mint/burn two-key quorum into one address.
     function reject_devNet_subscriberEqualsRedeemer() external {
         vm.chainId(BASE);
@@ -329,7 +358,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
         // The real oracle was used — no mock deployed — and Anvil account[1], whose
         // private key is printed in the Anvil banner, is not a whitelisted AP.
-        assertEq(script.sanctionsOracle(), address(sanctions), "sanctions oracle mismatch");
+        assertEq(script.sanctionsOracle(), address(prodOracle), "sanctions oracle mismatch");
         assertFalse(
             im.whitelisted(DeployGuards.ANVIL_ACCOUNT_1),
             "publicly-known Anvil key was whitelisted on a production chain"
@@ -358,32 +387,50 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         assertFalse(im.hasRole(im.DEFAULT_ADMIN_ROLE(), DEFAULT_SENDER), "deployer kept admin on Anvil");
     }
 
-    /// Catches: identical bootstrap addresses on different chains.
+    /// Catches: identical bootstrap addresses on different chains — the H-3 finding, where
+    /// `0x7c1798…70ad` is a MockSanctionsList on Sepolia but a live GyldBondToken on Base,
+    /// and `0x18ce55…6317` is a GyldBondToken on Sepolia but a TokenFactory on Base.
     ///
     /// Deployed through the canonical CREATE2 proxy, an address depends ONLY on
     /// (salt, initcode) — the deployer's nonce is irrelevant. The constructor arguments
     /// below are byte-identical across the two runs, so without the `block.chainid` term
     /// in the salt these deployments would land on exactly the same addresses (and the
     /// second run would revert on the collision).
+    ///
+    /// EVM state is rolled back between the two runs on purpose. That is what reproduces
+    /// the real-world shape of the incident: the SAME deployer at the SAME nonce, running
+    /// on two chains. Without it a plain-CREATE contract would land on two different
+    /// addresses merely because the second script instance sits at a different address,
+    /// and the collision this test exists to catch would be invisible — TokenFactory,
+    /// which used plain CREATE until GYL-1135, collides here if the salted CREATE2 path
+    /// is removed.
     function accept_bootstrapAddressesDifferAcrossChains() external {
         _devNetProdEnv();
+        uint256 pristine = vm.snapshotState();
 
         vm.chainId(BASE);
         DeployDevNet onBase = new DeployDevNet();
         onBase.run();
+        address baseScript = address(onBase);
+        address baseTimelock = address(onBase.timelock());
+        address baseIssuance = address(onBase.issuanceMgr());
+        address baseFactory = address(onBase.factory());
+
+        // Rewind everything the Base run touched, including nonces, so the Sepolia run
+        // starts from a byte-identical world with only `block.chainid` differing.
+        vm.revertToState(pristine);
 
         vm.chainId(SEPOLIA);
         DeployDevNet onSepolia = new DeployDevNet();
         onSepolia.run();
 
-        assertTrue(
-            address(onBase.timelock()) != address(onSepolia.timelock()),
-            "TimelockController collides across chains"
-        );
-        assertTrue(
-            address(onBase.issuanceMgr()) != address(onSepolia.issuanceMgr()),
-            "IssuanceManager proxy collides across chains"
-        );
+        // Guard on the premise: if the two runs did not start from the same deployer+nonce
+        // the divergence assertions below would pass for the wrong reason.
+        assertEq(baseScript, address(onSepolia), "the two runs must model the same deployer at the same nonce");
+
+        assertTrue(baseTimelock != address(onSepolia.timelock()), "TimelockController collides across chains");
+        assertTrue(baseIssuance != address(onSepolia.issuanceMgr()), "IssuanceManager proxy collides across chains");
+        assertTrue(baseFactory != address(onSepolia.factory()), "TokenFactory collides across chains");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -556,7 +603,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _setAddr("REDEEMER_ADDRESS", REDEEMER);
         _setAddr("WHITELIST_ADMIN", WHITELIST_ADMIN);
         _setAddr("NAV_FEED_OWNER", NAV_OWNER);
-        _setAddr("SANCTIONS_LIST", address(sanctions));
+        _setAddr("SANCTIONS_LIST", address(prodOracle));
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "172800");
     }
 
@@ -566,7 +613,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     function _timelockProdEnv() internal returns (TokenFactory factory, IssuanceManager im) {
         _clearEnv();
         vm.startPrank(DEFAULT_SENDER, DEFAULT_SENDER);
-        factory = new TokenFactory(address(new GyldBondToken()), address(sanctions));
+        factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), DEFAULT_SENDER);
         im = _issuanceManager();
         vm.stopPrank();
 
@@ -667,4 +714,69 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     // Revert assertions (_expectRunRevert / _revertReason / _contains) live in
     // {ScriptRevertAsserts}.
+}
+
+/// @title DeployMockSanctionsListTest
+/// @notice The one script whose entire product is a FAKE compliance oracle.
+///
+/// It shipped with no chain guard of any kind — not even the `block.chainid != 1` denylist
+/// the other scripts had — so `forge script DeployMockSanctionsList --rpc-url <base>` put a
+/// writable sanctions oracle on a production chain. Combined with
+/// {DeployGuards.requireProdContract}, which can only assert `code.length != 0`, that mock
+/// then SATISFIED the production `SANCTIONS_LIST` requirement: a live route straight around
+/// the rest of the GYL-1135 hardening. GyldBondToken screening is fail-closed, so anyone
+/// able to write that list can freeze transfers for every holder of every series.
+///
+/// Safe to split into parallel test functions: this script reads no environment variables,
+/// so unlike {DeployScriptsTest} there is no process-global state to race on.
+contract DeployMockSanctionsListTest is ScriptRevertAsserts {
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
+    /// including chains that do not exist yet (999_999_999 stands in for one).
+    function test_run_refusedOnEveryProductionChain() public {
+        uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
+        for (uint256 i = 0; i < production.length; i++) {
+            vm.chainId(production[i]);
+            _expectRunRevert(
+                address(new DeployMockSanctionsList()),
+                string.concat(
+                    "deploying a MockSanctionsList (a writable fake compliance oracle) is dev-only",
+                    " and is NOT production-safe on chainId ",
+                    vm.toString(production[i])
+                )
+            );
+        }
+    }
+
+    /// Base Sepolia (84532) is NOT on the dev allowlist — only Anvil and Ethereum Sepolia
+    /// are. A near-miss chain id must not slip through.
+    function test_run_refusedOnBaseSepolia() public {
+        vm.chainId(84532);
+        _expectRunRevert(address(new DeployMockSanctionsList()), "is dev-only and is NOT production-safe on chainId 84532");
+    }
+
+    /// The dev path still works, and the deployed mock is owned by the broadcaster — not
+    /// by whoever calls it. Nobody else can mutate the list.
+    function test_run_deploysAnOwnedMockOnADevChain() public {
+        vm.chainId(31337);
+        DeployMockSanctionsList script = new DeployMockSanctionsList();
+        script.run();
+
+        MockSanctionsList mock = script.mock();
+        assertGt(address(mock).code.length, 0, "no mock deployed on Anvil");
+        assertEq(mock.owner(), DEFAULT_SENDER, "mock owner is not the broadcaster");
+
+        address stranger = address(0xBAD);
+        address[] memory addrs = new address[](1);
+        addrs[0] = address(0xB0B);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, stranger));
+        mock.addToSanctionsList(addrs);
+    }
+
+    function test_run_deploysOnSepolia() public {
+        vm.chainId(11155111);
+        DeployMockSanctionsList script = new DeployMockSanctionsList();
+        script.run();
+        assertGt(address(script.mock()).code.length, 0, "no mock deployed on Sepolia");
+    }
 }

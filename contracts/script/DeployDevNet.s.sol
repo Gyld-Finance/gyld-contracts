@@ -56,8 +56,9 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 /// ── Deterministic addresses ───────────────────────────────────────────────────
 /// Bootstrap contracts are deployed through the canonical CREATE2 proxy with a
 /// chain-scoped salt (see {DeployGuards.saltFor}) so the same deployer+nonce can no
-/// longer produce the SAME address for DIFFERENT contracts on two chains.
-/// TokenFactory is the one exception — see the note at its deployment site.
+/// longer produce the SAME address for DIFFERENT contracts on two chains. Every bootstrap
+/// contract goes through it, TokenFactory included (it took an explicit `owner_` parameter
+/// in GYL-1135 so that the CREATE2 proxy does not end up owning it).
 ///
 /// Usage — Anvil (local):
 ///   anvil &
@@ -181,6 +182,12 @@ contract DeployDevNet is Script {
         c.sanctionsList = DeployGuards.envAddressProdRequired("SANCTIONS_LIST", address(0));
         if (c.sanctionsList != address(0)) {
             DeployGuards.requireProdContract(c.sanctionsList, "SANCTIONS_LIST");
+            // `code.length != 0` cannot tell a real oracle from a mock, and a mock the
+            // scripts deployed earlier (on a chain where they used to be ungated) would
+            // otherwise sail through as SANCTIONS_LIST. Refuse this repo's mock by bytecode.
+            DeployGuards.requireProdNotMock(
+                c.sanctionsList, type(MockSanctionsList).runtimeCode, "SANCTIONS_LIST"
+            );
         }
     }
 
@@ -242,15 +249,20 @@ contract DeployDevNet is Script {
             // whole sanctions model, so it is allowed on dev chains ONLY. This replaces
             // the old `block.chainid != 1` check, which every L2 walked straight past.
             DeployGuards.requireProdSafe("deploying a MockSanctionsList as the compliance oracle");
+            // The mock's list is writable by its OWNER only, and the owner is passed
+            // explicitly: deployed through the CREATE2 proxy, `msg.sender` inside the
+            // constructor is 0x4e59…4956C, so an `owner = msg.sender` mock would be owned
+            // by the proxy and unusable by the gateway.
+            bytes memory mockInit =
+                abi.encodePacked(type(MockSanctionsList).creationCode, abi.encode(c.deployer));
             sanctionsOracle = address(
-                new MockSanctionsList{
-                    salt: DeployGuards.vacantSalt(
-                        "DeployDevNet:MockSanctionsList", type(MockSanctionsList).creationCode
-                    )
-                }()
+                new MockSanctionsList{salt: DeployGuards.vacantSalt("DeployDevNet:MockSanctionsList", mockInit)}(
+                    c.deployer
+                )
             );
             console.log("MOCK_SANCTIONS_ADDRESS=%s", sanctionsOracle);
             console.log("  (set CHAINALYSIS_SANCTIONS_CONTRACT=%s for the gateway)", sanctionsOracle);
+            console.log("  (sanctions list is writable by MOCK_SANCTIONS_OWNER=%s only)", c.deployer);
         }
 
         address bondImpl = address(
@@ -259,12 +271,19 @@ contract DeployDevNet is Script {
             }()
         );
 
-        // NOTE (GYL-1135): TokenFactory is deliberately NOT deployed through the CREATE2
-        // proxy. Its constructor is `Ownable(msg.sender)`, so routing it through the
-        // shared deterministic proxy would make 0x4e59…4956C the owner and permanently
-        // brick `transferOwnership`. Giving TokenFactory an explicit `owner_` constructor
-        // parameter is the fix; that file is out of scope for this pass.
-        factory = new TokenFactory(bondImpl, sanctionsOracle);
+        // TokenFactory now takes an explicit `owner_` (GYL-1135), so it can join the other
+        // bootstrap contracts on the chain-salted CREATE2 proxy: previously
+        // `Ownable(msg.sender)` would have made 0x4e59…4956C the owner and permanently
+        // bricked `transferOwnership`. Deployed with plain CREATE it was the LAST bootstrap
+        // contract whose address was `keccak(deployer, nonce)` — no chain component — which
+        // is exactly how `0x18ce55…6317` ended up a GyldBondToken on Sepolia and a
+        // TokenFactory on Base. The deployer owns it only transiently; {_handOverToTimelock}
+        // moves ownership to the timelock inside this same broadcast.
+        bytes memory factoryInit =
+            abi.encodePacked(type(TokenFactory).creationCode, abi.encode(bondImpl, sanctionsOracle, c.deployer));
+        factory = new TokenFactory{salt: DeployGuards.vacantSalt("DeployDevNet:TokenFactory", factoryInit)}(
+            bondImpl, sanctionsOracle, c.deployer
+        );
         console.log("FACTORY_ADDRESS=%s", address(factory));
     }
 
@@ -359,6 +378,7 @@ contract DeployDevNet is Script {
         // 5. The compliance oracle must be a real contract on production — never a mock,
         //    never an EOA, never an empty address that silently screens nothing.
         DeployGuards.requireProdContract(sanctionsOracle, "sanctions oracle");
+        DeployGuards.requireProdNotMock(sanctionsOracle, type(MockSanctionsList).runtimeCode, "sanctions oracle");
         require(factory.sanctionsList() == sanctionsOracle, "DeployDevNet: factory sanctions oracle mismatch");
 
         // 6. The publicly-known Anvil key is not an AP on a production chain.

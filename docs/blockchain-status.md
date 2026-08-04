@@ -67,7 +67,7 @@ the full breakdown.
 | `TokenFactory` | `contracts/TokenFactory.sol` | Platform (MIT) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series |
 | `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (MIT) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
 | `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (MIT) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
-| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the on-chain sanctions oracle |
+| `MockSanctionsList` | `contracts/test/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the on-chain sanctions oracle. Writes are gated on an `owner` set at construction (the deploying key), and its deploy script refuses every non-dev chain (GYL-1135) |
 | `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Platform-operated Chainalysis-compatible sanctions oracle (local list + optional composite forwarding) |
 
 **Compliance model:** `GyldBondToken` reads from the platform-operated
@@ -107,8 +107,8 @@ for secondary transfers is enforced by the configured sanctions oracle inside `G
 | `is_paused()` | ✅ | Calls `GyldBondToken.paused()` |
 | `pause_token()` | ✅ | Calls `GyldBondToken.pause()` |
 | `unpause_token()` | ✅ | Calls `GyldBondToken.unpause()` |
-| `freeze_token_holder()` | ✅ | Calls `MockSanctionsList.addToSanctionsList()` (dev only); prod writes go to the platform `SanctionsOracleMirror` via the keeper |
-| `thaw_token_holder()` | ✅ | Calls `MockSanctionsList.removeFromSanctionsList()` (dev only) |
+| `freeze_token_holder()` | ✅ | Calls `MockSanctionsList.addToSanctionsList()` (dev only; the signing key must be the mock's `owner`, i.e. the key that deployed it); prod writes go to the platform `SanctionsOracleMirror` via the keeper |
+| `thaw_token_holder()` | ✅ | Calls `MockSanctionsList.removeFromSanctionsList()` (dev only; owner-gated as above) |
 | `forced_transfer()` | ✅ removed | Removed — sanctioned addresses are frozen in place by the oracle; no on-chain recovery function exists |
 | `send_tx()` | ✅ | Works with `PRIVKEY_SIGNING_KEY`; KMS path not yet implemented |
 | `finality()` | ✅ | Maps confirmations: <6 Processed, 6–63 Confirmed, ≥64 Finalized |
@@ -203,7 +203,7 @@ To wire it, bootstrap needs:
 | `TimelockTest` | 15 | 48h delay enforcement, cancel, IssuanceManager admin wiring |
 | `GyldBondTokenFuzzTest` | 11 | mint/burn round-trip, transfer conservation, sanctions, pause, NAV model |
 | `GyldBondTokenInvariantsTest` | 3 | totalSupply == sum(balances), per-actor balance bounds |
-| `MockSanctionsListTest` | 6 | dev stub behaviour |
+| `MockSanctionsListTest` | 14 | dev stub behaviour + owner-only write access |
 
 ---
 

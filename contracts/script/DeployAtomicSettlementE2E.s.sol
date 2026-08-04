@@ -64,7 +64,7 @@ contract DeployAtomicSettlementE2E is Script {
         vm.startBroadcast();
 
         // ── 1. Minimal base stack ────────────────────────────────────────────
-        MockSanctionsList sanctions = new MockSanctionsList();
+        MockSanctionsList sanctions = new MockSanctionsList(deployer);
         MockUSDC usdc = new MockUSDC();
 
         IssuanceManager issuanceMgr = IssuanceManager(
@@ -77,7 +77,7 @@ contract DeployAtomicSettlementE2E is Script {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), deployer);
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions));
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // CAT-style series — deployer is factory owner so deployToken is direct.

@@ -74,7 +74,7 @@ contract TokenFactoryTest is Test {
 
     function setUp() public {
         bondTokenImpl       = new GyldBondToken();
-        mockSanctions       = new MockSanctionsList();
+        mockSanctions       = new MockSanctionsList(address(this));
         issuanceManagerImpl = new IssuanceManager();
 
         // Deploy IssuanceManager proxy — test contract is admin and issuer
@@ -83,7 +83,7 @@ contract TokenFactoryTest is Test {
             abi.encodeCall(IssuanceManager.initialize, (address(this), address(this), address(this)))
         )));
 
-        factory = new TokenFactory(address(bondTokenImpl), address(mockSanctions));
+        factory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
 
         // Grant factory REGISTRAR_ROLE so deployToken can call registerToken
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
@@ -103,24 +103,24 @@ contract TokenFactoryTest is Test {
 
     function test_constructor_zeroBondLogic_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        new TokenFactory(address(0), address(mockSanctions));
+        new TokenFactory(address(0), address(mockSanctions), address(this));
     }
 
     function test_constructor_zeroSanctionsList_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        new TokenFactory(address(bondTokenImpl), address(0));
+        new TokenFactory(address(bondTokenImpl), address(0), address(this));
     }
 
     function test_constructor_eoa_sanctionsList_reverts() public {
         address eoa = address(0xEEEE);
         vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, eoa));
-        new TokenFactory(address(bondTokenImpl), eoa);
+        new TokenFactory(address(bondTokenImpl), eoa, address(this));
     }
 
     function test_constructor_wrongContract_sanctionsList_reverts() public {
         address wrongContract = address(new MockWrongSanctionsList());
         vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, wrongContract));
-        new TokenFactory(address(bondTokenImpl), wrongContract);
+        new TokenFactory(address(bondTokenImpl), wrongContract, address(this));
     }
 
     // ── deployToken input guards ──────────────────────────────────────────────
@@ -160,7 +160,7 @@ contract TokenFactoryTest is Test {
     function test_deployToken_missingRegistrarRole_revertsEarly() public {
         // A factory that has never been granted REGISTRAR_ROLE on the
         // IssuanceManager must revert before any contracts are deployed.
-        TokenFactory freshFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions));
+        TokenFactory freshFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
         vm.expectRevert();
         freshFactory.deployToken(
             "Test Bond", "tBOND", "US000000001", 0,
@@ -607,7 +607,7 @@ contract TokenFactoryTest is Test {
     // ── re-entrancy guard ─────────────────────────────────────────────────────
 
     function test_deployToken_nonReentrant() public {
-        TokenFactory malFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions));
+        TokenFactory malFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
 
         // Attacker owns the factory and acts as issuanceManager (has registerToken)
         ReentrantAttacker reentrancyAttacker = new ReentrantAttacker(address(malFactory), navFeedOwner);
@@ -724,7 +724,7 @@ contract GyldBondTokenUnitTest is Test {
     address outsider = address(0xFF);
 
     function setUp() public {
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         GyldBondToken impl = new GyldBondToken();
         token = GyldBondToken(address(new ERC1967Proxy(
             address(impl),
@@ -795,7 +795,7 @@ contract GyldBondTokenUnitTest is Test {
     // ── setSanctionsList ──────────────────────────────────────────────────────
 
     function test_setSanctionsList_byAdmin_succeeds() public {
-        address newOracle = address(new MockSanctionsList());
+        address newOracle = address(new MockSanctionsList(address(this)));
         vm.expectEmit(true, false, false, false);
         emit SanctionsListUpdated(newOracle);
         vm.prank(admin);
@@ -804,7 +804,7 @@ contract GyldBondTokenUnitTest is Test {
     }
 
     function test_setSanctionsList_byNonAdmin_reverts() public {
-        address newOracle = address(new MockSanctionsList());
+        address newOracle = address(new MockSanctionsList(address(this)));
         vm.prank(outsider);
         vm.expectRevert();
         token.setSanctionsList(newOracle);
@@ -890,11 +890,80 @@ contract MockSanctionsListTest is Test {
     address bob   = address(0xA2);
 
     function setUp() public {
-        sanctions = new MockSanctionsList();
+        sanctions = new MockSanctionsList(address(this));
     }
 
     function test_isSanctioned_falseByDefault() public view {
         assertFalse(sanctions.isSanctioned(alice));
+    }
+
+    // ── Access control (GYL-1135) ─────────────────────────────────────────────
+    //
+    // Every write function used to be plain `external`. Since GyldBondToken screening is
+    // fail-closed and {DeployGuards.requireProdContract} cannot tell a mock from a real
+    // oracle by code size, an ownerless mock reachable on any chain meant ANY address
+    // could sanction ANY holder — a permissionless transfer freeze on every series.
+
+    function test_owner_isTheConstructorArgument() public {
+        assertEq(sanctions.owner(), address(this), "owner must be the constructor argument");
+        assertEq(new MockSanctionsList(bob).owner(), bob, "owner must not be msg.sender");
+    }
+
+    function test_constructor_zeroOwnerReverts() public {
+        vm.expectRevert(MockSanctionsList.ZeroOwner.selector);
+        new MockSanctionsList(address(0));
+    }
+
+    function test_addToSanctionsList_nonOwnerReverts() public {
+        address[] memory addrs = new address[](1);
+        addrs[0] = bob;
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, alice));
+        sanctions.addToSanctionsList(addrs);
+        assertFalse(sanctions.isSanctioned(bob), "a stranger sanctioned an address");
+    }
+
+    /// Un-sanctioning is just as privileged: a stranger who could clear the list would
+    /// walk a designated address straight through compliance screening.
+    function test_removeFromSanctionsList_nonOwnerReverts() public {
+        address[] memory addrs = new address[](1);
+        addrs[0] = bob;
+        sanctions.addToSanctionsList(addrs);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, alice));
+        sanctions.removeFromSanctionsList(addrs);
+        assertTrue(sanctions.isSanctioned(bob), "a stranger un-sanctioned an address");
+    }
+
+    function test_setSanctioned_nonOwnerReverts() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, alice));
+        sanctions.setSanctioned(bob, true);
+        assertFalse(sanctions.isSanctioned(bob), "a stranger sanctioned an address");
+    }
+
+    /// An empty array is a no-op for the owner, but must still be refused for a stranger:
+    /// the guard belongs on the function, not on whether it happens to write anything.
+    function test_addToSanctionsList_emptyArray_nonOwnerStillReverts() public {
+        address[] memory empty = new address[](0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, alice));
+        sanctions.addToSanctionsList(empty);
+    }
+
+    function testFuzz_onlyOwnerCanSanction(address caller) public {
+        vm.assume(caller != address(this));
+        vm.prank(caller);
+        vm.expectRevert(abi.encodeWithSelector(MockSanctionsList.NotOwner.selector, caller));
+        sanctions.setSanctioned(bob, true);
+    }
+
+    function test_owner_canSanctionAndUnsanction() public {
+        sanctions.setSanctioned(bob, true);
+        assertTrue(sanctions.isSanctioned(bob));
+        sanctions.setSanctioned(bob, false);
+        assertFalse(sanctions.isSanctioned(bob));
     }
 
     function test_addToSanctionsList_emptyArray_noOp() public {
