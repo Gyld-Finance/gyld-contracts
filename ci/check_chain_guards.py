@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a denylist-style chain guard reappears in contracts/script/.
+"""Fail if a deploy script has a denylist chain guard — or no chain guard at all.
 
 Why this exists (GYL-1135)
 --------------------------
@@ -27,6 +27,19 @@ Comments and string literals are stripped before matching, so prose that
 *describes* the old bug (as DeployGuards.sol and DeployDevNet.s.sol do) does
 not trip the check.
 
+Check 2 — a MISSING guard (GYL-1135 follow-up)
+----------------------------------------------
+Check 1 can only see a guard that is written badly; it is structurally blind to
+a script with no guard at all. That blindness is what let `DeployMockUSDC.s.sol`
+survive the first pass of this ticket: it had no chain check of any kind, so it
+deployed a fake "USD Coin" on any chain and minted it to publicly-keyed Anvil
+accounts. Every script under contracts/script/ must therefore carry at least one
+of:
+
+  - a `DeployGuards.<guard>()` call — the dev/production allowlist path; or
+  - a positive `block.chainid == <id>` pin — for scripts written for exactly one
+    chain (the Euler steps on Base, the Anvil-only flow scripts).
+
 Usage: python3 ci/check_chain_guards.py [script-dir]   (default: contracts/script)
 Exit codes: 0 = clean, 1 = violation found, 2 = script dir missing.
 """
@@ -38,6 +51,19 @@ from pathlib import Path
 FORBIDDEN = re.compile(
     r"block\s*\.\s*chainid\s*!=|!=\s*block\s*\.\s*chainid"
 )
+
+# A guard that classifies the chain: either the shared library (whose entire
+# surface is production-aware) or an explicit single-chain pin.
+GUARD_PRESENT = re.compile(
+    r"DeployGuards\s*\.\s*[A-Za-z_]\w*\s*\("
+    r"|block\s*\.\s*chainid\s*=="
+    r"|==\s*block\s*\.\s*chainid"
+)
+
+# Files that are not deploy scripts and so need no chain guard of their own.
+# DeployGuards.sol IS the guard library: it defines isDevChain, and requiring it
+# to "call a guard" would be circular.
+GUARD_EXEMPT = {"lib/DeployGuards.sol"}
 
 
 def strip_comments_and_strings(src: str) -> str:
@@ -106,11 +132,32 @@ def main() -> int:
 
     files = sorted(root.rglob("*.sol"))
     violations = []
+    unguarded = []
     for path in files:
         code = strip_comments_and_strings(path.read_text(encoding="utf-8"))
         for lineno, line in enumerate(code.splitlines(), start=1):
             if FORBIDDEN.search(line):
                 violations.append((path, lineno, line.strip()))
+        rel = path.relative_to(root).as_posix()
+        if rel not in GUARD_EXEMPT and not GUARD_PRESENT.search(code):
+            unguarded.append(path)
+
+    if unguarded:
+        print("FAIL: deploy script with NO chain guard at all.\n")
+        for path in unguarded:
+            print(f"  {path}")
+        print(
+            "\nA script with no chain check runs on EVERY chain, which is how an"
+            "\nungated DeployMockUSDC could mint a fake 'USD Coin' to publicly-keyed"
+            "\nAnvil accounts on Base mainnet (GYL-1135). The denylist scan above"
+            "\ncannot catch this: it only sees guards that are written, never guards"
+            "\nthat are absent."
+            "\n"
+            "\nEvery script under contracts/script/ must carry one of:"
+            "\n  - DeployGuards.requireProdSafe(..)   -- dev-only script, fails closed"
+            "\n  - DeployGuards.envAddressProdRequired -- production path, strict env"
+            "\n  - require(block.chainid == <id>)      -- pin a script to one chain"
+        )
 
     if violations:
         print("FAIL: denylist-style chain guard found in deploy scripts.\n")
@@ -129,9 +176,11 @@ def main() -> int:
             "\n  - DeployGuards.requireProdSafe(..) -- revert unless on a dev chain"
             "\n  - require(block.chainid == <id>)   -- pin a script to one chain"
         )
+
+    if violations or unguarded:
         return 1
 
-    print(f"OK: no denylist chain guards in {len(files)} file(s) under {root}/")
+    print(f"OK: every one of {len(files)} file(s) under {root}/ carries an allowlist chain guard")
     return 0
 
 

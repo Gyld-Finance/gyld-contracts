@@ -11,8 +11,8 @@ in a separate workflow so this one stays trustless.
 
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
-| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 483 tests across 19 suites) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
-| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/` for any `block.chainid !=` comparison | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`) |
+| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 492 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
+| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
 
 ## Why full fuzz intensity on every push
 
@@ -56,17 +56,17 @@ CI log if you need the exact case.
 - **Gas snapshots** — no `.gas-snapshot` baseline exists, most hot paths are
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.
-- **Broadcast-without-guard job** — a check that every script using
-  `vm.startBroadcast` also calls `DeployGuards` would start red today: 8 of 14
-  broadcasting scripts don't reference the library — the six `DeployEulerStep*`
-  scripts plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. All eight
-  pin a single chain with a bare equality `require` (e.g.
-  `require(block.chainid == 8453)`), which is an allowlist and so not the bug
-  class the incident came from, but they miss the env-var, not-the-deployer,
-  min-delay and post-deploy-assertion coverage. Worth
-  revisiting once the GYL-1135 refactor covers all scripts; until then the
-  `chain-guard` job catches the denylist pattern that actually caused the
-  incident.
+- ~~**Broadcast-without-guard job**~~ — **adopted**, and it starts green. The
+  earlier objection was that 8 of 14 broadcasting scripts (the
+  `DeployEulerStep*` family) pin their chain with a bare
+  `require(block.chainid == 8453)` and never reference `DeployGuards`, so a
+  check for a `DeployGuards` *call* would start red. The fix was to check for
+  a **chain guard**, not for the library: a positive `block.chainid ==` pin is
+  a fail-closed allowlist of exactly one chain and counts. Both forms are
+  accepted, so no script needed rewriting and the job is green at adoption.
+  This matters because the `chain-guard` denylist scan is structurally blind
+  to a script with no guard at all — which is how the ungated
+  `DeployMockUSDC.s.sol` survived the first pass of GYL-1135.
 
 The bar for adding a job: it must start green, fail only for real defects, and
 carry an error message that explains itself two years from now.
