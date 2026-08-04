@@ -42,7 +42,7 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 /// ── Run (start anvil --chain-id 31337 first) ────────────────────────────────
 ///   forge script contracts/script/DeployAtomicSettlementE2E.s.sol \
 ///     --rpc-url http://127.0.0.1:8545 --broadcast \
-///     --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+///     --private-key $ANVIL_ACCT0_KEY   # from the Anvil startup banner; 31337-guarded
 ///
 /// ── Outputs (grep the `KEY=VALUE` lines; feed to the Rust test env) ─────────
 ///   E2E_SWAP  E2E_TOKEN  E2E_USDC  E2E_NAVFEED  E2E_FORWARDER

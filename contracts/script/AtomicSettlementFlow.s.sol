@@ -28,8 +28,10 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 ///   forge script contracts/script/AtomicSettlementFlow.s.sol \
 ///     --rpc-url http://127.0.0.1:8545 \
 ///     --broadcast \
-///     --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-///   # ^ Anvil account[0] default key. Local dev only — never reuse anywhere else.
+///     --private-key $ANVIL_ACCT0_KEY
+///   # Anvil prints its deterministic keys in the startup banner. This script is
+///   # hard-guarded to chainId 31337, so those keys can never reach a real chain —
+///   # but do not paste a key literal on a command line as a habit.
 ///
 /// ── The NAV-FIRST gotcha (documented, enforced below) ───────────────────────
 ///   A NAV price MUST be pushed to the feed BEFORE the first executeSwap. The swap
@@ -50,10 +52,14 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 ///      back to taker, tokens back to the swap.
 ///   7. WITHDRAW: treasurer withdraws USDC out to the fixed withdrawalWallet.
 contract AtomicSettlementFlow is Script {
-    // Anvil deterministic keys. Local-only; account[0] is the broadcaster.
-    uint256 constant DEPLOYER_PK = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80; // acct[0]
-    uint256 constant TAKER_PK = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d; // acct[1]
-    uint256 constant SIGNER_PK = 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a; // acct[2]
+    // Anvil's deterministic accounts, DERIVED rather than pasted. Same addresses as
+    // the raw literals this replaced, but no private-key constant appears in the repo:
+    // a key literal in source trains people to paste keys, and a reader cannot tell a
+    // throwaway from a real one at a glance. Guarded to chainId 31337 regardless.
+    string constant ANVIL_MNEMONIC = "test test test test test test test test test test test junk";
+    uint256 immutable DEPLOYER_PK = vm.deriveKey(ANVIL_MNEMONIC, 0); // acct[0]
+    uint256 immutable TAKER_PK    = vm.deriveKey(ANVIL_MNEMONIC, 1); // acct[1]
+    uint256 immutable SIGNER_PK   = vm.deriveKey(ANVIL_MNEMONIC, 2); // acct[2]
 
     // NAV $100.00 per token (8dp): 1e18 token <-> 100e6 USDC. 8 decimals.
     int256 constant NAV = 100e8; // 10000000000
