@@ -44,7 +44,7 @@ library DeployGuards {
     // ── Chain allowlist ───────────────────────────────────────────────────────
     /// Local Anvil / Hardhat devnet.
     uint256 internal constant ANVIL_CHAIN_ID = 31337;
-    /// The single supported public testnet (docs/atomic-settlement-testnet-runbook.md).
+    /// The single supported public testnet (docs/ARCHITECTURE.md).
     uint256 internal constant SEPOLIA_CHAIN_ID = 11155111;
 
     /// Minimum TimelockController delay on any production chain.

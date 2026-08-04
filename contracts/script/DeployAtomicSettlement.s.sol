@@ -13,7 +13,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///         existing DeployDevNet deployment: a single GyldAtomicSwap (EIP-712 RFQ
 ///         settlement executor that HOLDS its own inventory — USDC, USDG, bond tokens).
 ///
-///         Design + run-book: docs/atomic-settlement.md. The swap is a UUPS singleton
+///         Design + run-book: docs/ARCHITECTURE.md. The swap is a UUPS singleton
 ///         (one across all series, like IssuanceManager); per-series NAV-band state
 ///         lives in the swap via registerSeries.
 ///
@@ -335,7 +335,7 @@ contract DeployAtomicSettlement is Script {
         console.log("QUOTE_SIGNER:          %s", c.quoteSigner);
         console.log("WITHDRAWAL_WALLET:     %s", c.withdrawal);
         console.log("");
-        console.log("=== Next steps (docs/atomic-settlement.md run-book) ===");
+        console.log("=== Next steps (docs/ARCHITECTURE.md run-book) ===");
         console.log("  1. Point the QuoteService signing key at QUOTE_SIGNER_ROLE");
         console.log("  2. Seed swap inventory: IssuanceManager.subscribe(token, swap, n)");
         console.log("     after broker fills (mint-at-fill; swap is now a whitelisted AP)");

@@ -129,7 +129,7 @@ contract GyldAtomicSwap is
 
     /// @dev Dust floor on `requestedAmountIn`, expressed as basis points of `maxAmountIn`.
     ///      Prevents a taker griefing the quote-signer's single-use quoteId budget with
-    ///      near-zero-value draws (docs/atomic-settlement.md "Proposed amendment").
+    ///      near-zero-value draws (docs/ARCHITECTURE.md "Proposed amendment").
     uint256 public constant MIN_DRAW_BPS = 100; // 1%
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
@@ -177,7 +177,7 @@ contract GyldAtomicSwap is
     ///      What breaks at the ceiling: a quote priced more than 10% away from the last
     ///      published NAV can never settle. That is intended — such a quote is either
     ///      stale-priced or wrong. The correct operational response to a real >10% gap is
-    ///      to publish the new NAV (KaleidoscopeNAVFeed.emergencyCorrect bypasses the
+    ///      to publish the new NAV (KaleidoscopeNAVFeed.emergencyUpdateAnswer bypasses the
     ///      feed's own interval/deviation guards for exactly this) and then trade at the
     ///      refreshed price — NOT to widen this band and trade against a dead one.
     ///
@@ -456,7 +456,7 @@ contract GyldAtomicSwap is
     ///         NAV band + leg classification → optional permit → PULL tokenIn →
     ///         inventory check + PUSH tokenOut. The quoteId is burned in full regardless
     ///         of how much of `maxAmountIn` is drawn — single-shot-capped sizing, not
-    ///         multi-draw (see docs/atomic-settlement.md). The optional permit is applied
+    ///         multi-draw (see docs/ARCHITECTURE.md). The optional permit is applied
     ///         with try/catch so a front-run permit() cannot brick the swap (standard
     ///         griefing mitigation) — the subsequent safeTransferFrom enforces the
     ///         allowance regardless. Real USDC permit is non-standard (version "2") and
@@ -501,7 +501,7 @@ contract GyldAtomicSwap is
         _consumeQuote($, m.quoteId);
 
         // Rounds down — this contract's favor; a taker-favorable direction would let a
-        // taker extract dust across many small draws (docs/atomic-settlement.md).
+        // taker extract dust across many small draws (docs/ARCHITECTURE.md).
         uint256 amountOut = (requestedAmountIn * m.price) / 1e18;
         if (amountOut == 0) revert ZeroAmount();
 

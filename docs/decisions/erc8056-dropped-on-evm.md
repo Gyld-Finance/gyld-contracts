@@ -3,8 +3,10 @@
 **Status:** Adopted  
 **Date:** 2026-08-03  
 **Applies to:** `contracts/GyldBondToken.sol` (extension removed), `docs/**`, `tools/**`  
-**Linear:** GYL-1201 (supersedes the GYL-956 addendum in
-[`gyld-bond-token-design.md`](gyld-bond-token-design.md) §3; resolves roadmap decision D-5)
+**Linear:** GYL-1201 (supersedes the GYL-956 display-multiplier addendum to the
+token-design ADR, now folded into
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) §8 and §17.3; resolves roadmap
+decision D-5)
 
 Gyld will **not** implement ERC-8056 (Scaled UI Amount) on any EVM chain. The
 extension has been removed from `GyldBondToken`, the demo tooling and runbooks
@@ -49,10 +51,10 @@ a feature.
 
 On the BSC testnet demo token, **MetaMask displayed 1,000.00 where BscScan
 displayed 1,040.00** — same wallet, same contract, same block (multiplier
-1.04×). The Anvil rehearsal in
-[`anvil-verification-erc8056-2026-07-31.md`](../anvil-verification-erc8056-2026-07-31.md)
-showed the identical divergence at 1.05×, and the (now-deleted) BNB runbook
-predicted it: MetaMask renders the raw `balanceOf`, full stop.
+1.04×). An Anvil rehearsal (verification notes, 2026-07-31, since deleted with
+the rest of the demo tooling) showed the identical divergence at 1.05×, and the
+(now-deleted) BNB runbook predicted it: MetaMask renders the raw `balanceOf`,
+full stop.
 
 That is the standard producing the exact harm it exists to prevent: two
 different numbers for one balance, both apparently authoritative. A display
@@ -123,9 +125,9 @@ it — no mainnet cleanup is required.
 
 - Do not add `uiMultiplier`, `balanceOfUI()`, `totalSupplyUI()`,
   `toUIAmount()`, `fromUIAmount()`, or a `UI_MULTIPLIER_ROLE` to
-  `GyldBondToken`. The Section 3 prohibition in
-  [`gyld-bond-token-design.md`](gyld-bond-token-design.md) applies again
-  without the GYL-956 carve-out.
+  `GyldBondToken`. The plain-ERC-20 prohibition in
+  [`../ARCHITECTURE.md`](../ARCHITECTURE.md) §8.1 applies again without the
+  GYL-956 carve-out.
 - Displayed value is `balanceOf × NAV` from `NAVFeedForwarder`. Anything that
   needs a scaled number reads the feed; nothing reads it from the token.
 - Any future request for wallet-native display scaling starts from this

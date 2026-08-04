@@ -11,7 +11,7 @@ in a separate workflow so this one stays trustless.
 
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
-| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 471 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
+| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 483 tests across 19 suites) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
 | `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/` for any `block.chainid !=` comparison | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`) |
 
 ## Why full fuzz intensity on every push
@@ -57,9 +57,13 @@ CI log if you need the exact case.
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.
 - **Broadcast-without-guard job** — a check that every script using
-  `vm.startBroadcast` also calls `DeployGuards` would start red today: 10 of 14
-  broadcasting scripts (the `DeployEulerStep*` family pins chains with bare
-  `require(block.chainid == 8453)` instead) don't reference the library. Worth
+  `vm.startBroadcast` also calls `DeployGuards` would start red today: 8 of 14
+  broadcasting scripts don't reference the library — the six `DeployEulerStep*`
+  scripts plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. All eight
+  pin a single chain with a bare equality `require` (e.g.
+  `require(block.chainid == 8453)`), which is an allowlist and so not the bug
+  class the incident came from, but they miss the env-var, not-the-deployer,
+  min-delay and post-deploy-assertion coverage. Worth
   revisiting once the GYL-1135 refactor covers all scripts; until then the
   `chain-guard` job catches the denylist pattern that actually caused the
   incident.

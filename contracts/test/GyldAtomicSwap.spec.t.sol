@@ -12,7 +12,7 @@ import {MockNavForwarder} from "./MockNavForwarder.sol";
 import {MockReentrantToken, ISwapReentryTarget} from "./MockReentrantToken.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Spec-conformance suite for docs/atomic-swap-spec.md.
+// Spec-conformance suite for docs/ARCHITECTURE.md.
 //
 // Every test here pins a numbered invariant (I-n), a normative test vector, or a
 // §10 finding remediation (F-n) from that document, and covers ONLY properties
@@ -58,7 +58,7 @@ contract GyldAtomicSwapSpecTest is Test {
     bytes32 constant PERMIT_TYPEHASH =
         keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 
-    // ── docs/atomic-swap-spec.md §5 normative constants ──────────────────────
+    // ── docs/ARCHITECTURE.md §5 normative constants ──────────────────────
     bytes32 constant SPEC_TYPEHASH = 0x87423ed2b6ce38b5c2943920bccdd1f9e50d2e0493f61560b2302e7508b52f0b;
     bytes32 constant SPEC_STORAGE_LOCATION = 0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300;
     bytes32 constant SPEC_DOMAIN_TYPEHASH =
@@ -585,7 +585,7 @@ contract GyldAtomicSwapSpecTest is Test {
     // ═════════════════════════════════════════════════════════════════════════
 
     /// Vector 1 (BUY) and vector 2 (REDEEM): the struct hashes published in
-    /// docs/atomic-swap-spec.md must be exactly reproducible from the CONTRACT's own
+    /// docs/ARCHITECTURE.md must be exactly reproducible from the CONTRACT's own
     /// SWAP_MESSAGE_TYPEHASH. Struct hashes are chain- and address-independent, so a
     /// third-party signer can check these directly.
     function test_specVectors_structHashes_matchPublishedLiterals() public view {

@@ -42,7 +42,7 @@ contract Sha3Warmer {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Halmos symbolic-verification suite for the core economic invariants of
-// GyldAtomicSwap (docs/atomic-swap-spec.md §8: I-1, I-2, I-3, I-10, I-11).
+// GyldAtomicSwap (docs/ARCHITECTURE.md §8: I-1, I-2, I-3, I-10, I-11).
 //
 // Functions use the check_ prefix: `forge test` ignores them (it only runs
 // test*), halmos runs them (its default --function prefix is (check|invariant)_).
