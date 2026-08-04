@@ -56,9 +56,13 @@ interface INavForwarder {
 ///
 /// Roles:
 ///   DEFAULT_ADMIN_ROLE   — upgrades, unpause, registerSeries/deregisterSeries,
-///                          setMaxQuoteDeviationBps, setMaxNavAgeSecs, setWithdrawalWallet,
-///                          bumpQuoteEpoch, role grants; should be a
-///                          TimelockController in production
+///                          setMaxQuoteDeviationBps, setMaxNavAgeSecs, setMaxQuoteTtl,
+///                          setWithdrawalWallet, bumpQuoteEpoch, role grants; should be a
+///                          TimelockController in production. Note that all three
+///                          band/staleness/TTL knobs are bounded by `public constant`
+///                          ceilings (GYL-1134/1135): this role can TIGHTEN a guard but
+///                          cannot widen one into a no-op. Weakening a guard past its
+///                          ceiling requires a code change and a re-audit, not an admin tx.
 ///   ALLOWLIST_ADMIN_ROLE — KYC/compliance ops key (`EVM_KMS_SWAP_ADMIN_`); setAllowed
 ///                          ONLY — the live taker allowlist. Deliberately split off
 ///                          DEFAULT_ADMIN_ROLE (GYL-1050) so per-taker allowlisting stays
@@ -132,8 +136,10 @@ contract GyldAtomicSwap is
     /// @dev Default cap on quote lifetime (finding F-4): executeSwap rejects quotes
     ///      expiring further than maxQuoteTtl in the future, so a buggy or compromised
     ///      signer cannot issue immortal quotes. Seeded in initialize; admin-adjustable
-    ///      via setMaxQuoteTtl. One hour comfortably covers the quote service's
-    ///      issue-to-submit window (spec S-4: expiry must be short-lived, near-term).
+    ///      via setMaxQuoteTtl, but only DOWNWARD — this value is also
+    ///      MAX_QUOTE_TTL_CEILING (GYL-1135). One hour comfortably covers the quote
+    ///      service's issue-to-submit window (spec S-4: expiry must be short-lived,
+    ///      near-term); the service itself issues in a ~60s TTL class.
     uint64 public constant DEFAULT_MAX_QUOTE_TTL = 1 hours;
 
     /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
@@ -148,6 +154,75 @@ contract GyldAtomicSwap is
     ///      Enforced in BOTH initialize and setMaxNavAgeSecs — a `constant` costs no
     ///      storage slot, so the ERC-7201 layout is unchanged.
     uint32 public constant MAX_NAV_AGE_CEILING = 72 hours;
+
+    /// @dev Structural upper bound on `maxQuoteDeviationBps` (GYL-1135). Previously the
+    ///      only bound was BPS_DENOMINATOR itself — a ±100% band, which admits any price
+    ///      from zero to 2× NAV and makes the band decorative. Together with the quote
+    ///      TTL, this band is the containment on a COMPROMISED QUOTE-SIGNER KEY: it caps
+    ///      how far a validly-signed quote may sit from the published NAV, and therefore
+    ///      the value extractable per swap. An admin must not be able to widen it to the
+    ///      point where a signed quote is unconstrained.
+    ///
+    ///      1000 bps (10%) is anchored to KaleidoscopeNAVFeed.MAX_PRICE_DEVIATION_BPS,
+    ///      which is this system's own codified definition of the largest plausible
+    ///      single-step price move for these instruments — the feed REJECTS any push
+    ///      beyond it. A quote band wider than that would let this contract settle
+    ///      against a price the NAV oracle itself would refuse to publish, so 10% is
+    ///      simultaneously the widest defensible band and the smallest ceiling that never
+    ///      blocks a legitimate configuration: NAV publishes at most hourly
+    ///      (MIN_UPDATE_INTERVAL), so a quote struck off live market during a genuine
+    ///      dislocation can legitimately sit up to one full update step from the last
+    ///      published NAV. The deployed default is 200 bps (2%).
+    ///
+    ///      What breaks at the ceiling: a quote priced more than 10% away from the last
+    ///      published NAV can never settle. That is intended — such a quote is either
+    ///      stale-priced or wrong. The correct operational response to a real >10% gap is
+    ///      to publish the new NAV (KaleidoscopeNAVFeed.emergencyCorrect bypasses the
+    ///      feed's own interval/deviation guards for exactly this) and then trade at the
+    ///      refreshed price — NOT to widen this band and trade against a dead one.
+    ///
+    ///      Zero remains permitted: that is the RESTRICTIVE end (quotes must match NAV
+    ///      exactly — effectively a soft-pause), and a soft-pause is safe.
+    ///      Enforced in BOTH initialize and setMaxQuoteDeviationBps — bounding only the
+    ///      setter would let a fresh deployment be born with the band already disabled.
+    ///      A `constant` costs no storage slot, so the ERC-7201 layout is unchanged.
+    uint16 public constant MAX_QUOTE_DEVIATION_BPS_CEILING = 1000; // 10%
+
+    /// @dev Structural upper bound on `maxQuoteTtl` (GYL-1135). `setMaxQuoteTtl` had NO
+    ///      validation whatsoever and the field is `uint64`, so a single
+    ///      DEFAULT_ADMIN_ROLE call could push the cap past any real elapsed time and
+    ///      defeat quote expiry entirely — after which a leaked signed quote stays
+    ///      executable indefinitely, which is precisely the failure mode the F-4 TTL was
+    ///      added to prevent.
+    ///
+    ///      This matters more than it looks because of WHO can contain a leak. In
+    ///      production DEFAULT_ADMIN_ROLE is a TimelockController, so `bumpQuoteEpoch`
+    ///      — the mass-invalidation path — is delayed by the governance window. Quote
+    ///      expiry is therefore the only containment that acts FASTER than the timelock,
+    ///      and it must not be removable by the same timelocked authority it backstops.
+    ///
+    ///      1 hour is anchored to two in-system facts: it equals DEFAULT_MAX_QUOTE_TTL
+    ///      (the shipped default, chosen to comfortably cover the quote service's
+    ///      issue-to-submit window) and it equals KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL
+    ///      — one NAV publication epoch. A quote must not outlive the NAV round it was
+    ///      priced against. The off-chain quote service issues in a ~60s TTL class, so
+    ///      this leaves roughly 60× operational headroom.
+    ///
+    ///      Deliberately equal to the default, which makes maxQuoteTtl a NARROW-ONLY
+    ///      knob: an admin may tighten quote expiry but can never loosen it beyond what
+    ///      was deployed and audited. Raising the ceiling requires a code change and a
+    ///      re-audit, not an admin transaction — the right cost for weakening a guard.
+    ///
+    ///      What breaks at the ceiling: any taker workflow needing a quote to stay live
+    ///      longer than an hour (e.g. collecting multisig signatures over an afternoon)
+    ///      cannot be served by extending the TTL. The correct fix is for the quote
+    ///      service to re-issue a fresh quote at the current price, not for the chain to
+    ///      honour older paper.
+    ///
+    ///      Zero remains permitted: that is the RESTRICTIVE end (expiry pinned to the
+    ///      current block — a soft-pause), and a soft-pause is safe.
+    ///      Enforced in BOTH initialize and setMaxQuoteTtl.
+    uint64 public constant MAX_QUOTE_TTL_CEILING = 1 hours;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -203,6 +278,8 @@ contract GyldAtomicSwap is
     error InsufficientUsdcLiquidity(uint256 requested, uint256 available);
     error InvalidDeviationBps(uint16 bps);
     error InvalidNavAge(uint32 secs);
+    /// @dev maxQuoteTtl above MAX_QUOTE_TTL_CEILING (GYL-1135). Zero is legal (soft-pause).
+    error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
     error SeriesNotEmpty(address token);
     // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
@@ -248,7 +325,8 @@ contract GyldAtomicSwap is
     /// @param usdc_                  USDC token (6 decimals, probed on-chain — F-1) —
     ///                               the cash leg every quote is priced against.
     /// @param maxQuoteDeviationBps_  Quote-vs-NAV band width in basis points (e.g. 200 =
-    ///                               2%). Capped at BPS_DENOMINATOR; 0 is permitted and
+    ///                               2%). Must be at most MAX_QUOTE_DEVIATION_BPS_CEILING
+    ///                               (1000 bps = 10%) — see GYL-1135; 0 is permitted and
     ///                               forces quotes to match NAV exactly (soft-pause).
     /// @param maxNavAgeSecs_         Max NAV feed age before executeSwap fails closed
     ///                               with StaleNav. Must be non-zero and at most
@@ -270,8 +348,12 @@ contract GyldAtomicSwap is
             defaultAdmin == address(0) || pauser == address(0) || quoteSigner == address(0) || treasurer == address(0)
                 || usdc_ == address(0)
         ) revert ZeroAddress();
-        if (maxQuoteDeviationBps_ > BPS_DENOMINATOR) revert InvalidDeviationBps(maxQuoteDeviationBps_);
+        if (maxQuoteDeviationBps_ > MAX_QUOTE_DEVIATION_BPS_CEILING) revert InvalidDeviationBps(maxQuoteDeviationBps_);
         if (maxNavAgeSecs_ == 0 || maxNavAgeSecs_ > MAX_NAV_AGE_CEILING) revert InvalidNavAge(maxNavAgeSecs_);
+        // The TTL seed is a constant today, not a parameter — but validate the value we
+        // actually store, so the guard is real rather than an assumption a future
+        // refactor (seed becomes a caller-supplied argument) could silently drop.
+        if (DEFAULT_MAX_QUOTE_TTL > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(DEFAULT_MAX_QUOTE_TTL);
         // Probe-before-store (house idiom, F-1): the cash token must report 6 decimals —
         // the /1e20 ladder in _checkQuoteBand assumes 18dp bond / 8dp NAV / 6dp USDC and
         // mis-scales silently for any other cash token.
@@ -594,12 +676,18 @@ contract GyldAtomicSwap is
     // ── Admin: band params, allowlist, withdrawal wallet ──────────────────────
 
     /// @notice Set the quote-vs-NAV sanity band in basis points.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Capped at 10_000 (100%); zero is
-    ///         permitted and forces quotes to match NAV exactly (effectively a
-    ///         soft-pause of executeSwap given rounding).
-    /// @param newBps Band width in basis points, e.g. 200 = 2%.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Capped at
+    ///         MAX_QUOTE_DEVIATION_BPS_CEILING (1000 bps = 10%), NOT at BPS_DENOMINATOR.
+    ///         The ceiling is deliberate (GYL-1135) and the knob is asymmetric: the
+    ///         restrictive end (0) forces quotes to match NAV exactly and is merely a
+    ///         soft-pause of executeSwap, whereas the permissive end is "accept a signed
+    ///         quote at an arbitrary price". A ±100% band — the old bound — admits
+    ///         anything from zero to 2× NAV, i.e. no band at all. Since this band and the
+    ///         quote TTL are the containment on a compromised quote-signer key, an admin
+    ///         must not be able to widen it into a no-op. See the constant for why 10%.
+    /// @param newBps Band width in basis points, e.g. 200 = 2%. 0 <= newBps <= 1000.
     function setMaxQuoteDeviationBps(uint16 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newBps > BPS_DENOMINATOR) revert InvalidDeviationBps(newBps);
+        if (newBps > MAX_QUOTE_DEVIATION_BPS_CEILING) revert InvalidDeviationBps(newBps);
         _getStorage().maxQuoteDeviationBps = newBps;
         emit MaxQuoteDeviationUpdated(newBps);
     }
@@ -610,9 +698,10 @@ contract GyldAtomicSwap is
     ///         StaleNav check is the ONLY staleness defence in this system — the NAV
     ///         feed follows Chainlink read semantics and never reverts on a stale
     ///         answer — so an admin must not be able to widen it to a value that
-    ///         effectively disables it. Unlike maxQuoteDeviationBps and maxQuoteTtl,
-    ///         where the permissive end (0) is a soft-pause and therefore safe, the
-    ///         permissive end here is "accept an arbitrarily old price".
+    ///         effectively disables it. maxQuoteDeviationBps and maxQuoteTtl are bounded
+    ///         for the same reason (GYL-1135) — in all three the RESTRICTIVE end is a
+    ///         soft-pause and therefore safe, while the permissive end disables a guard:
+    ///         here it is "accept an arbitrarily old price".
     /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
@@ -623,10 +712,19 @@ contract GyldAtomicSwap is
     /// @notice Set the upper bound on quote lifetime (seconds).
     /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. executeSwap rejects quotes expiring
     ///         further than this far in the future (F-4), so a buggy or compromised
-    ///         signer cannot issue immortal quotes. Zero is permitted and pins expiry to
-    ///         the current block (effectively a soft-pause of executeSwap).
-    /// @param newTtl Max quote lifetime in seconds (e.g. 3600 = 1 hour).
+    ///         signer cannot issue immortal quotes. Capped at MAX_QUOTE_TTL_CEILING
+    ///         (1 hour) — the setter previously had NO validation at all, and `uint64`
+    ///         reaches ~584 billion years, so one admin call could defeat quote expiry
+    ///         outright and leave a leaked signed quote executable forever. The knob is
+    ///         asymmetric (GYL-1135): the restrictive end (0) pins expiry to the current
+    ///         block and is merely a soft-pause, whereas the permissive end removes the
+    ///         only containment that acts faster than the timelock guarding
+    ///         bumpQuoteEpoch. Since the ceiling equals DEFAULT_MAX_QUOTE_TTL, this knob
+    ///         is narrow-only: expiry can be tightened, never loosened past what was
+    ///         deployed and audited. See the constant for the full rationale.
+    /// @param newTtl Max quote lifetime in seconds (e.g. 3600 = 1 hour). 0 <= newTtl <= 1 h.
     function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newTtl > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(newTtl);
         _getStorage().maxQuoteTtl = newTtl;
         emit MaxQuoteTtlUpdated(newTtl);
     }

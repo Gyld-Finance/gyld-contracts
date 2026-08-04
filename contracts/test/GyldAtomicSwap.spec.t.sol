@@ -213,6 +213,15 @@ contract GyldAtomicSwapSpecTest is Test {
         return (maxAmountIn * swap.MIN_DRAW_BPS()) / swap.BPS_DENOMINATOR();
     }
 
+    /// The navValue _checkQuoteBand will compute for a BUY drawing `amountIn` USDC at
+    /// `price` — mirrors the contract's 18dp bond / 8dp NAV / 6dp USDC /1e20 ladder.
+    /// Lets the band tests state their fixtures in dollars instead of magic constants.
+    function _navValueForBuy(uint256 amountIn, uint256 price) internal pure returns (uint256) {
+        uint256 amountOut = (amountIn * price) / 1e18;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return (amountOut * uint256(NAV)) / 1e20;
+    }
+
     /// The spec's §5.3 struct-hash formula, instantiated from the CONTRACT's typehash.
     function _specStructHash(
         uint256 quoteId,
@@ -898,6 +907,338 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.prank(taker);
         swap.executeSwap(m2, sig2, _noPermit(), m2.maxAmountIn);
         assertTrue(swap.isQuoteUsed(92), "a refreshed NAV must restore tradability");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // I-15b (GYL-1135) — the NAV band is structurally bounded
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    // Context. The NAV band and the quote TTL are the two defences against a
+    // COMPROMISED QUOTE-SIGNER KEY: the signer can mint arbitrarily-priced valid
+    // signatures, and the band is what caps the value extractable per swap. Until
+    // GYL-1135 the only bound on setMaxQuoteDeviationBps was BPS_DENOMINATOR itself —
+    // a ±100% band, which admits any price from zero to 2× NAV and makes the band
+    // decorative while every getter still reported it as "enforced".
+    // MAX_QUOTE_DEVIATION_BPS_CEILING (1000 bps) closes that.
+
+    /// No admin call, for any input above the ceiling, can widen the band.
+    function testFuzz_setMaxQuoteDeviationBps_revertsAboveCeiling(uint16 newBps) public {
+        uint16 ceiling = swap.MAX_QUOTE_DEVIATION_BPS_CEILING();
+        newBps = uint16(bound(uint256(newBps), uint256(ceiling) + 1, uint256(type(uint16).max)));
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, newBps));
+        swap.setMaxQuoteDeviationBps(newBps);
+
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS, "a rejected setter must leave the band untouched");
+    }
+
+    /// The ceiling itself is accepted — the bound is inclusive, so a deliberately wide
+    /// band for a volatile session remains configurable. 1000 bps is not arbitrary: it
+    /// is KaleidoscopeNAVFeed.MAX_PRICE_DEVIATION_BPS, this system's own definition of
+    /// the largest plausible single-step price move (the feed rejects any push beyond it).
+    function test_setMaxQuoteDeviationBps_ceilingExactlyIsAccepted() public {
+        uint16 ceiling = swap.MAX_QUOTE_DEVIATION_BPS_CEILING();
+        assertEq(ceiling, 1000, "ceiling must match the NAV feed's own per-update deviation cap");
+        assertLt(
+            uint256(ceiling), swap.BPS_DENOMINATOR(), "the ceiling must be strictly tighter than the old +-100% bound"
+        );
+
+        vm.prank(admin);
+        swap.setMaxQuoteDeviationBps(ceiling);
+        assertEq(swap.maxQuoteDeviationBps(), ceiling);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, ceiling + 1));
+        swap.setMaxQuoteDeviationBps(ceiling + 1);
+
+        // Zero stays legal: that is the RESTRICTIVE end (quotes must match NAV exactly),
+        // which is a soft-pause and therefore safe to permit.
+        vm.prank(admin);
+        swap.setMaxQuoteDeviationBps(0);
+        assertEq(swap.maxQuoteDeviationBps(), 0);
+    }
+
+    /// The same bound applies at construction — otherwise a fresh deployment could be
+    /// born with the band already decorative and never trip the setter check.
+    function test_initialize_revertsAboveDeviationCeiling() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        uint16 ceiling = impl.MAX_QUOTE_DEVIATION_BPS_CEILING();
+
+        uint16 tooWide = ceiling + 1;
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, tooWide));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(usdc), tooWide, MAX_NAV_AGE)
+            )
+        );
+
+        // REGRESSION: BPS_DENOMINATOR (10_000 = +-100%) was the old permitted maximum, so
+        // this exact call used to SUCCEED and produce a live deployment with no band.
+        uint16 hundredPercent = uint16(impl.BPS_DENOMINATOR());
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, hundredPercent));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(usdc), hundredPercent, MAX_NAV_AGE)
+            )
+        );
+
+        // uint16 max — the "just make it never trip" value — is rejected too.
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, type(uint16).max));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize,
+                (admin, pauser, signer, treasurer, address(usdc), type(uint16).max, MAX_NAV_AGE)
+            )
+        );
+
+        // The ceiling still deploys, and so does zero (soft-pause).
+        GyldAtomicSwap atCeiling = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(impl),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (admin, pauser, signer, treasurer, address(usdc), ceiling, MAX_NAV_AGE)
+                    )
+                )
+            )
+        );
+        assertEq(atCeiling.maxQuoteDeviationBps(), ceiling);
+    }
+
+    /// REGRESSION TEST FOR THE DEFECT CLASS (GYL-1135), band edition.
+    ///
+    /// A ±100% band is not a band. Under the old bound an admin could set 10_000 bps and
+    /// every price from zero to 2× NAV would validate — so a compromised quote signer
+    /// could hand a taker 20 bond tokens for the price of 10 and the contract would call
+    /// it in-band. This test asserts the band survives a full-authority attempt to remove
+    /// it: hold DEFAULT_ADMIN_ROLE, fail to set an absurd width, widen to the maximum
+    /// permitted, and confirm the 2×-NAV steal STILL fails closed.
+    function test_navBandCannotBeDisabledByAdmin() public {
+        _approveTaker();
+
+        // Full authority: a fresh admin account holding DEFAULT_ADMIN_ROLE, i.e. the
+        // strongest caller that exists on this contract.
+        address rogueAdmin = address(0xBADBA9D);
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        vm.prank(admin);
+        swap.grantRole(adminRole, rogueAdmin);
+        assertTrue(swap.hasRole(adminRole, rogueAdmin));
+
+        // Attempt 1: the direct "never trip" value.
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, type(uint16).max));
+        swap.setMaxQuoteDeviationBps(type(uint16).max);
+
+        // Attempt 2: 10_000 bps — the value the OLD bound explicitly allowed.
+        uint16 hundredPercent = uint16(swap.BPS_DENOMINATOR());
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, hundredPercent));
+        swap.setMaxQuoteDeviationBps(hundredPercent);
+
+        // Attempt 3: one basis point past the ceiling.
+        // Cache the ceiling before pranking — a getter call would consume the prank.
+        uint16 ceiling = swap.MAX_QUOTE_DEVIATION_BPS_CEILING();
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, ceiling + 1));
+        swap.setMaxQuoteDeviationBps(ceiling + 1);
+
+        // The band is unchanged, and is still meaningfully narrow.
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS);
+        assertLe(swap.maxQuoteDeviationBps(), ceiling);
+
+        // The widest the admin CAN go is 10% — apply it, to prove the band still bites
+        // even at maximum permitted laxity.
+        vm.prank(rogueAdmin);
+        swap.setMaxQuoteDeviationBps(ceiling);
+        assertEq(swap.maxQuoteDeviationBps(), ceiling);
+
+        // The widening was real, not cosmetic: a 5%-off-NAV quote is rejected under the
+        // 2% default but settles under the 10% ceiling. (price 1.05e28 → 10.5 tokens for
+        // 1_000 USDC, i.e. navValue 1_050 USDC against 1_000 paid.)
+        uint256 draw = 1_000e6;
+        GyldAtomicSwap.SwapMessage memory inBand = _buyQuote(101, draw);
+        inBand.price = 1.05e28;
+        assertEq(_navValueForBuy(draw, inBand.price), 1_050e6, "fixture: 5% off NAV");
+        // Sign BEFORE pranking — _sign calls hashSwapMessage, which would consume the prank.
+        bytes memory inBandSig = _sign(inBand);
+        vm.prank(taker);
+        swap.executeSwap(inBand, inBandSig, _noPermit(), draw);
+        assertTrue(swap.isQuoteUsed(101), "a 5%-off quote must settle under a 10% band");
+
+        // Now the compromised-signer steal that a +-100% band would have waved through:
+        // 20 bond tokens (navValue 2_000 USDC) for 1_000 USDC paid — 50% off NAV.
+        GyldAtomicSwap.SwapMessage memory steal = _buyQuote(102, draw);
+        steal.price = 2e28;
+        uint256 stolenNavValue = _navValueForBuy(draw, steal.price);
+        assertEq(stolenNavValue, 2_000e6, "fixture: 2x NAV, the extreme a +-100% band admits");
+        bytes memory stealSig = _sign(steal);
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuotePriceOutOfBand.selector, draw, stolenNavValue));
+        swap.executeSwap(steal, stealSig, _noPermit(), draw);
+        assertFalse(swap.isQuoteUsed(102), "no swap may settle 50% off NAV at any admin setting");
+
+        // And a quote AT NAV still settles — the band is a band, not a brick.
+        GyldAtomicSwap.SwapMessage memory atNav = _buyQuote(103, draw);
+        bytes memory atNavSig = _sign(atNav);
+        vm.prank(taker);
+        swap.executeSwap(atNav, atNavSig, _noPermit(), draw);
+        assertTrue(swap.isQuoteUsed(103), "an at-NAV quote must remain tradable");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // I-15c (GYL-1135) — the quote TTL is structurally bounded
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    // Context. setMaxQuoteTtl had NO validation at all and the field is uint64, so one
+    // DEFAULT_ADMIN_ROLE call could push the cap past any real elapsed time and defeat
+    // quote expiry outright — after which a leaked signed quote stays executable
+    // indefinitely, the exact failure the F-4 TTL was added to prevent. It matters more
+    // than it looks because DEFAULT_ADMIN_ROLE is a TimelockController in production, so
+    // bumpQuoteEpoch (the mass-invalidation path) is delayed by the governance window:
+    // expiry is the only containment that acts faster than the timelock, and it must not
+    // be removable by the same timelocked authority it backstops.
+
+    /// No admin call, for any input above the ceiling, can extend quote lifetime.
+    function testFuzz_setMaxQuoteTtl_revertsAboveCeiling(uint64 newTtl) public {
+        uint64 ceiling = swap.MAX_QUOTE_TTL_CEILING();
+        newTtl = uint64(bound(uint256(newTtl), uint256(ceiling) + 1, uint256(type(uint64).max)));
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, newTtl));
+        swap.setMaxQuoteTtl(newTtl);
+
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "a rejected setter must leave the TTL untouched");
+    }
+
+    /// The ceiling itself is accepted — the bound is inclusive. It deliberately EQUALS
+    /// DEFAULT_MAX_QUOTE_TTL, which makes maxQuoteTtl a narrow-only knob: an admin may
+    /// tighten quote expiry but can never loosen it past what was deployed and audited.
+    function test_setMaxQuoteTtl_ceilingExactlyIsAccepted() public {
+        uint64 ceiling = swap.MAX_QUOTE_TTL_CEILING();
+        assertEq(ceiling, 1 hours, "ceiling must match one NAV publication epoch");
+        assertEq(ceiling, swap.DEFAULT_MAX_QUOTE_TTL(), "the TTL knob must be narrow-only");
+
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(ceiling);
+        assertEq(swap.maxQuoteTtl(), ceiling);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, ceiling + 1));
+        swap.setMaxQuoteTtl(ceiling + 1);
+
+        // Zero stays legal: that is the RESTRICTIVE end (expiry pinned to the current
+        // block), which is a soft-pause and therefore safe to permit.
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(0);
+        assertEq(swap.maxQuoteTtl(), 0);
+    }
+
+    /// The initialize side of the bound. initialize seeds the TTL from a constant rather
+    /// than a parameter, so the "born with the guard disabled" hole is closed by the
+    /// constant relationship itself — pin it, because a later bump of the default would
+    /// otherwise reintroduce exactly the half-fix this ticket set out to avoid.
+    function test_initialize_seedsTtlWithinCeiling() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        assertLe(
+            impl.DEFAULT_MAX_QUOTE_TTL(),
+            impl.MAX_QUOTE_TTL_CEILING(),
+            "the seeded default must itself satisfy the ceiling"
+        );
+
+        GyldAtomicSwap fresh = _deploySwap(address(usdc));
+        assertLe(fresh.maxQuoteTtl(), fresh.MAX_QUOTE_TTL_CEILING(), "a fresh deployment must be born bounded");
+
+        // A fresh deployment cannot be widened afterwards either.
+        uint64 ceiling = fresh.MAX_QUOTE_TTL_CEILING();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, ceiling + 1));
+        fresh.setMaxQuoteTtl(ceiling + 1);
+    }
+
+    /// REGRESSION TEST FOR THE DEFECT CLASS (GYL-1135), TTL edition.
+    ///
+    /// An unbounded TTL defeats quote expiry, so a leaked signed quote stays executable
+    /// indefinitely — and with bumpQuoteEpoch behind the production timelock, expiry is
+    /// the only fast containment. This test asserts it survives a full-authority attempt
+    /// to remove it: hold DEFAULT_ADMIN_ROLE, fail to set an immortal TTL, widen to the
+    /// maximum permitted, and confirm a long-dated quote STILL fails closed.
+    function test_quoteTtlCannotBeDisabledByAdmin() public {
+        _approveTaker();
+
+        address rogueAdmin = address(0xBADDA7E); // "bad date"
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        vm.prank(admin);
+        swap.grantRole(adminRole, rogueAdmin);
+        assertTrue(swap.hasRole(adminRole, rogueAdmin));
+
+        // Attempt 1: the direct "never expire" value.
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, type(uint64).max));
+        swap.setMaxQuoteTtl(type(uint64).max);
+
+        // Attempt 2: a plausible-looking but still guard-defeating 10 years.
+        uint64 tenYears = 3650 days;
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, tenYears));
+        swap.setMaxQuoteTtl(tenYears);
+
+        // Attempt 3: a merely "operationally convenient" 1 day — still 24x the audited cap.
+        vm.prank(rogueAdmin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(1 days)));
+        swap.setMaxQuoteTtl(1 days);
+
+        // The TTL is unchanged, and is still meaningfully short.
+        // Cache the ceiling before pranking — a getter call would consume the prank.
+        uint64 ceiling = swap.MAX_QUOTE_TTL_CEILING();
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
+        assertLe(swap.maxQuoteTtl(), ceiling);
+
+        // The widest the admin CAN go is 1 hour — apply it, to prove expiry still bites
+        // even at maximum permitted laxity.
+        vm.prank(rogueAdmin);
+        swap.setMaxQuoteTtl(ceiling);
+
+        // Now the leaked-quote scenario: a 30-day quote from a compromised signer. Under
+        // an unbounded TTL this executes; it must fail closed at every admin setting.
+        uint256 draw = 1_000e6;
+        GyldAtomicSwap.SwapMessage memory immortal = _buyQuote(111, draw);
+        immortal.expiry = uint64(block.timestamp + 30 days);
+        // Sign BEFORE pranking — _sign calls hashSwapMessage, which would consume the prank.
+        bytes memory immortalSig = _sign(immortal);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, immortal.expiry, uint64(block.timestamp + ceiling)
+            )
+        );
+        swap.executeSwap(immortal, immortalSig, _noPermit(), draw);
+        assertFalse(swap.isQuoteUsed(111), "a 30-day quote must not settle at any admin setting");
+
+        // Even one second past the widest permitted TTL is refused.
+        GyldAtomicSwap.SwapMessage memory oneOver = _buyQuote(112, draw);
+        oneOver.expiry = uint64(block.timestamp + ceiling + 1);
+        bytes memory oneOverSig = _sign(oneOver);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, oneOver.expiry, uint64(block.timestamp + ceiling)
+            )
+        );
+        swap.executeSwap(oneOver, oneOverSig, _noPermit(), draw);
+        assertFalse(swap.isQuoteUsed(112));
+
+        // A quote inside the TTL still settles — the cap is a bound, not a brick.
+        GyldAtomicSwap.SwapMessage memory nearTerm = _buyQuote(113, draw);
+        nearTerm.expiry = uint64(block.timestamp + ceiling);
+        bytes memory nearTermSig = _sign(nearTerm);
+        vm.prank(taker);
+        swap.executeSwap(nearTerm, nearTermSig, _noPermit(), draw);
+        assertTrue(swap.isQuoteUsed(113), "a quote at exactly the TTL edge must remain tradable");
     }
 
     // ═════════════════════════════════════════════════════════════════════════

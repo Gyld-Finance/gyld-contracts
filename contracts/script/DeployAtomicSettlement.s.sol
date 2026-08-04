@@ -79,6 +79,12 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   WITHDRAWAL_WALLET      Fixed treasury destination for withdraw(). Defaults to
 ///                          TREASURER_ADDRESS on a dev chain.
 ///   MAX_QUOTE_DEVIATION_BPS  Quote-vs-NAV band, basis points. Default 200 (2%).
+///                            MUST be <= GyldAtomicSwap.MAX_QUOTE_DEVIATION_BPS_CEILING
+///                            (1000 = 10%); a larger value fails closed at initialize()
+///                            with InvalidDeviationBps. The ceiling matches
+///                            KaleidoscopeNAVFeed.MAX_PRICE_DEVIATION_BPS — a band wider
+///                            than that would settle against a price the NAV oracle would
+///                            itself refuse to publish.
 ///   MAX_NAV_AGE_SECS       Max NAV feed age before StaleNav. Default 86400 (1 day).
 ///   EVM_FACTORY_ADDRESS    TokenFactory; required only when SERIES_TOKENS is set
 ///                          (used to look up forwarderOf per token).

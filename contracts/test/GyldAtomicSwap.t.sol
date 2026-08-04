@@ -1051,10 +1051,38 @@ contract GyldAtomicSwapTest is Test {
         swap.setMaxQuoteDeviationBps(300);
     }
 
-    function test_setMaxQuoteDeviationBps_aboveDenominator_reverts() public {
+    /// GYL-1135: the bound is MAX_QUOTE_DEVIATION_BPS_CEILING (1000 bps), NOT
+    /// BPS_DENOMINATOR. 10_001 was always rejected; 10_000 (±100%, i.e. no band at all)
+    /// and everything else above the ceiling now is too.
+    function test_setMaxQuoteDeviationBps_aboveCeiling_reverts() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(10_001)));
         swap.setMaxQuoteDeviationBps(10_001);
+
+        // The old permitted maximum — a ±100% band — is no longer settable.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(10_000)));
+        swap.setMaxQuoteDeviationBps(10_000);
+
+        // One basis point past the ceiling.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(1001)));
+        swap.setMaxQuoteDeviationBps(1001);
+
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS, "rejected setters must not move the band");
+    }
+
+    /// GYL-1135: setMaxQuoteTtl previously had no validation at all.
+    function test_setMaxQuoteTtl_aboveCeiling_reverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(1 hours + 1)));
+        swap.setMaxQuoteTtl(1 hours + 1);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, type(uint64).max));
+        swap.setMaxQuoteTtl(type(uint64).max);
+
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "rejected setters must not move the TTL");
     }
 
     function test_setMaxNavAgeSecs_zero_reverts() public {
