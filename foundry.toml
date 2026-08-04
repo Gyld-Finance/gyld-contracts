@@ -18,6 +18,14 @@ remappings = [
 
 [etherscan]
 sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
+# BscScan is served by the Etherscan V2 unified API, so the SAME ETHERSCAN_API_KEY covers
+# it — there is no separate BSCSCAN_API_KEY. `url` is deliberately omitted: Foundry 1.5.1
+# already resolves bsc/bsc-testnet to https://api.etherscan.io/v2/api?chainid=<id>.
+# Etherscan removed BNB Chain from free-tier coverage (2025-11-22) for ACCOUNT/tx
+# endpoints, but contract source/ABI/verification endpoints stay free on every chain, so
+# `forge verify-contract` works on a free key. Use the HYPHENATED table key: `--chain
+# bsc_testnet` is rejected by the CLI, `--chain bsc-testnet` is not.
+bsc-testnet = { key = "${ETHERSCAN_API_KEY}", chain = 97 }
 
 [fuzz]
 runs = 10000
