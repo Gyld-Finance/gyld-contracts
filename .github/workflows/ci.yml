@@ -1,0 +1,79 @@
+# Gyld contracts CI — see docs/ci.md for what runs, why, and how to reproduce
+# failures locally.
+#
+# This workflow is structurally incapable of touching a real network:
+#   - it references no secrets, so no RPC URL and no key material ever exist
+#     on the runner (a broadcast needs a funded key; there is none);
+#   - the test suite contains no fork cheatcodes (no vm.createFork / ffi);
+#   - GITHUB_TOKEN is restricted to contents: read.
+# Keep it that way. If a future job genuinely needs a secret, put it in a
+# separate workflow so this one stays trustless.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Full-intensity suite on every push: 471 tests, fuzz runs = 10000,
+  # invariant runs = 1000 x depth 50 (the foundry.toml defaults — nothing is
+  # dialled down; the whole suite runs in seconds, see docs/ci.md).
+  test:
+    name: forge test (full fuzz + invariants)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (lib/ dependencies are git submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Foundry (pinned to the version the team runs locally)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.5.1
+          # The toolchain's built-in cache stores RPC responses; this workflow
+          # never makes an RPC call, so it would only add noise.
+          cache: false
+
+      - name: Cache build artifacts (via_ir compiles are the slow part)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            cache
+            out
+            ~/.svm
+          key: foundry-build-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            foundry-build-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-
+
+      - name: Build
+        run: forge build
+
+      - name: Test
+        # -vvv prints traces for failing tests only; passing tests stay one line.
+        run: forge test -vvv
+
+  # Guards against the GYL-1135 bug class: denylist chain guards
+  # (`block.chainid != 1`) in deploy scripts, which every L2 walks straight
+  # past. See ci/check_chain_guards.py for the full story.
+  chain-guard:
+    name: no denylist chain guards in deploy scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (no submodules needed — plain text scan)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan contracts/script for block.chainid != guards
+        run: python3 ci/check_chain_guards.py
