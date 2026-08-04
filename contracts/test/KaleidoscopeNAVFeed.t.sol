@@ -59,18 +59,31 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(answer, ANSWER);
     }
 
+    // Absolute timestamp literals, deliberately — see the note on
+    // test_updateAnswer_emitsAnswerUpdated_secondRound below. `uint256 t0 =
+    // block.timestamp` is NOT a snapshot under viaIR: solc treats `timestamp()`
+    // as a movable, side-effect-free builtin and rematerialises it at each use
+    // site, because it cannot model `vm.warp` (an opaque external call) as
+    // mutating block context. A read of such a local after a warp therefore
+    // yields the *current* time, not the captured one. Pinning both edges to
+    // literals is strictly stronger than the relative arithmetic it replaces:
+    // the expected values are now compile-time constants that no optimiser
+    // setting can re-derive.
+    uint256 constant T0 = 1_700_000_000;
+    uint256 constant T1 = 1_700_086_400; // T0 + 1 days
+
     function test_updateAnswer_updatedAtAdvances() public {
-        uint256 t0 = block.timestamp;
+        vm.warp(T0);
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
         (,,, uint256 updatedAt,) = feed.latestRoundData();
-        assertEq(updatedAt, t0);
+        assertEq(updatedAt, 1_700_000_000);
 
-        vm.warp(t0 + 1 days);
+        vm.warp(T1);
         vm.prank(owner);
         feed.updateAnswer(ANSWER_PLUS_SMALL);
         (,,, uint256 updatedAt2,) = feed.latestRoundData();
-        assertEq(updatedAt2, t0 + 1 days);
+        assertEq(updatedAt2, 1_700_086_400);
     }
 
     function test_updateAnswer_roundIdIncrements() public {

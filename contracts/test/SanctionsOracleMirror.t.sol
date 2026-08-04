@@ -483,6 +483,15 @@ contract SanctionsOracleMirrorTest is Test {
 
         // Should use well under 100k despite the oracle attempting to burn 1M+
         assertLt(gasUsed, 100_000);
+
+        // Lower bound: the griefer must actually have reached its burn loop.
+        // Without this, the assertion above would also pass if GasGriefingOracle
+        // silently stopped griefing (which is exactly how the --ir-minimum
+        // breakage hid itself). The griefer burns FORWARDING_GAS minus its
+        // return reserve, so ~35_000 lands here regardless of optimiser
+        // settings — the loop is bounded by gasleft(), not by an iteration
+        // count, so its consumption does not move with codegen.
+        assertGt(gasUsed, 25_000, "griefing oracle never burned its budget - test is vacuous");
     }
 
     // ── fuzz: forwarding-path invariant ──────────────────────────────────────
@@ -527,10 +536,28 @@ contract MalformedReturnOracle {
 }
 
 contract GasGriefingOracle {
+    /// Gas this oracle keeps back so it can still ABI-encode and return its
+    /// bool after burning everything else.
+    ///
+    /// This reserve must exceed the cost of the callee's own return epilogue,
+    /// which is COMPILER-DEPENDENT. The original value was 100, which is just
+    /// barely enough under `via_ir` + optimizer but not under
+    /// `forge coverage --ir-minimum`, whose unoptimised IR needs ~450. Under
+    /// --ir-minimum the griefer therefore ran out of gas mid-return, the
+    /// `setForwardingOracle` probe saw `ok == false`, and installing this
+    /// oracle reverted `InvalidForwardingOracle` before the test could measure
+    /// anything. 5_000 is ~10x the measured worst case, so the double behaves
+    /// identically under every optimiser setting.
+    ///
+    /// This does not soften the test. The oracle is handed FORWARDING_GAS =
+    /// 40_000 by the staticcall, so it still burns ~35_000 — the entire
+    /// forwarded budget bar the reserve — and the assertion below is unchanged.
+    uint256 constant RETURN_RESERVE = 5_000;
+
     function isSanctioned(address) external view returns (bool) {
         // Attempt to burn all gas via an infinite-ish loop
         uint256 i;
-        while (gasleft() > 100) { unchecked { i++; } }
+        while (gasleft() > RETURN_RESERVE) { unchecked { i++; } }
         return false;
     }
 }
