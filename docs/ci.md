@@ -56,13 +56,17 @@ CI log if you need the exact case.
 - **Gas snapshots** — no `.gas-snapshot` baseline exists, most hot paths are
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.
-- **Broadcast-without-guard job** — a check that every script using
-  `vm.startBroadcast` also calls `DeployGuards` would start red today: 10 of 14
-  broadcasting scripts (the `DeployEulerStep*` family pins chains with bare
-  `require(block.chainid == 8453)` instead) don't reference the library. Worth
-  revisiting once the GYL-1135 refactor covers all scripts; until then the
-  `chain-guard` job catches the denylist pattern that actually caused the
-  incident.
+- ~~**Broadcast-without-guard job**~~ — **adopted**, and it starts green. The
+  earlier objection was that 10 of 14 broadcasting scripts (the
+  `DeployEulerStep*` family) pin their chain with a bare
+  `require(block.chainid == 8453)` and never reference `DeployGuards`, so a
+  check for a `DeployGuards` *call* would start red. The fix was to check for
+  a **chain guard**, not for the library: a positive `block.chainid ==` pin is
+  a fail-closed allowlist of exactly one chain and counts. Both forms are
+  accepted, so no script needed rewriting and the job is green at adoption.
+  This matters because the `chain-guard` denylist scan is structurally blind
+  to a script with no guard at all — which is how the ungated
+  `DeployMockUSDC.s.sol` survived the first pass of GYL-1135.
 
 The bar for adding a job: it must start green, fail only for real defects, and
 carry an error message that explains itself two years from now.
