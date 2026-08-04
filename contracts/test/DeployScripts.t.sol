@@ -12,6 +12,7 @@ import {DeployTimelock} from "../script/DeployTimelock.s.sol";
 import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
 import {DeployNAVFeed} from "../script/DeployNAVFeed.s.sol";
 import {DeployMockSanctionsList} from "../script/DeployMockSanctionsList.s.sol";
+import {DeployMockUSDC} from "../script/DeployMockUSDC.s.sol";
 
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
@@ -778,5 +779,66 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
         DeployMockSanctionsList script = new DeployMockSanctionsList();
         script.run();
         assertGt(address(script.mock()).code.length, 0, "no mock deployed on Sepolia");
+    }
+}
+
+/// @title DeployMockUSDCTest
+/// @notice The last ungated deploy script in the repo (GYL-1135 follow-up).
+///
+/// It shipped with no chain guard of any kind — not even the `block.chainid != 1` denylist
+/// the other scripts had — so `forge script DeployMockUSDC --rpc-url <base>` deployed a
+/// fake USDC on a production chain and minted 100,000 of it to three hardcoded Anvil
+/// accounts, including `0x7099…79C8` whose private key is printed in the Anvil banner.
+/// The mock token itself is worthless, but a "USDC" contract at a plausible address that
+/// anyone with a public key can mint from is exactly the confusion the rest of this ticket
+/// exists to prevent — and `ci/check_chain_guards.py` structurally could not catch it,
+/// because it bans denylist guards and cannot see a MISSING one (fixed alongside this).
+///
+/// Safe to split into parallel test functions: this script reads no environment variables,
+/// so unlike {DeployScriptsTest} there is no process-global state to race on.
+contract DeployMockUSDCTest is ScriptRevertAsserts {
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
+    /// including chains that do not exist yet (999_999_999 stands in for one).
+    function test_run_refusedOnEveryProductionChain() public {
+        uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
+        for (uint256 i = 0; i < production.length; i++) {
+            vm.chainId(production[i]);
+            _expectRunRevert(
+                address(new DeployMockUSDC()),
+                string.concat(
+                    "deploying MockUSDC and minting to publicly-keyed Anvil accounts is dev-only",
+                    " and is NOT production-safe on chainId ",
+                    vm.toString(production[i])
+                )
+            );
+        }
+    }
+
+    /// Base Sepolia (84532) is NOT on the dev allowlist — only Anvil and Ethereum Sepolia
+    /// are. A near-miss chain id must not slip through.
+    function test_run_refusedOnBaseSepolia() public {
+        vm.chainId(84532);
+        _expectRunRevert(address(new DeployMockUSDC()), "is dev-only and is NOT production-safe on chainId 84532");
+    }
+
+    /// The dev path still works and still funds the three Anvil accounts the local
+    /// docker-compose flow expects — gating must not break local development.
+    function test_run_mintsToTheAnvilAccountsOnADevChain() public {
+        vm.chainId(31337);
+        DeployMockUSDC script = new DeployMockUSDC();
+        script.run();
+
+        MockUSDC usdc = script.usdc();
+        assertGt(address(usdc).code.length, 0, "no MockUSDC deployed on Anvil");
+        assertEq(usdc.balanceOf(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266), 100_000 * 1e6, "account0 not funded");
+        assertEq(usdc.balanceOf(DeployGuards.ANVIL_ACCOUNT_1), 100_000 * 1e6, "account1 not funded");
+        assertEq(usdc.balanceOf(0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC), 100_000 * 1e6, "account2 not funded");
+    }
+
+    function test_run_deploysOnSepolia() public {
+        vm.chainId(11155111);
+        DeployMockUSDC script = new DeployMockUSDC();
+        script.run();
+        assertGt(address(script.usdc()).code.length, 0, "no MockUSDC deployed on Sepolia");
     }
 }

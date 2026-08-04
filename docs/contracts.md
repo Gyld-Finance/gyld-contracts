@@ -406,7 +406,7 @@ Slot: `0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300`
 | `script/DeployDevNet.s.sol` | Full stack to Anvil or Hoodi — deploys impl contracts, proxies, MockSanctionsList, 3 dev bond tokens |
 | `script/DeployTimelock.s.sol` | Deploys TimelockController, transfers factory ownership + IssuanceManager DEFAULT_ADMIN |
 | `script/DeployNAVFeed.s.sol` | Standalone NAVFeed + Forwarder deployment |
-| `script/DeployMockUSDC.s.sol` | Mock USDC for local dev |
+| `script/DeployMockUSDC.s.sol` | Mock USDC for local dev — **dev-chain only** (`DeployGuards.requireProdSafe`); it mints to publicly-keyed Anvil accounts |
 
 ### DeployDevNet example
 

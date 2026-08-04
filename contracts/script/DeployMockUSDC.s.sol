@@ -5,25 +5,41 @@ import {Script, console} from "forge-std/Script.sol";
 import {MockUSDC} from "../test/MockUSDC.sol";
 import {DeployGuards} from "./lib/DeployGuards.sol";
 
-/// @dev Dev-only. This script mints to the three well-known Anvil accounts,
-///      whose private keys are PUBLIC, so anyone could spend the balance. It also
-///      deploys a MockUSDC with an unrestricted mint. Neither belongs on a chain
-///      anybody else can reach.
+/// @title DeployMockUSDC
+/// @notice Dev-only: deploys a {MockUSDC} and funds the standard Anvil accounts used by
+///         the local docker-compose flow.
 ///
-///      Note this script previously had NO chain guard of any kind — not even the
-///      `block.chainid != 1` denylist the rest of the suite used. The CI check
-///      (ci/check_chain_guards.py) cannot catch that class: it flags a WRONG guard,
-///      not a MISSING one. Found by reading the scripts rather than by tooling.
+/// ── Why the chain guard exists (GYL-1135) ─────────────────────────────────────
+/// This was the LAST script under `contracts/script/` with no chain guard of any kind —
+/// not even the `block.chainid != 1` denylist the others had. `forge script DeployMockUSDC
+/// --rpc-url <base>` therefore deployed a fake "USD Coin" on a production chain and minted
+/// 100,000 of it to three hardcoded Anvil accounts, one of which (`0x7099…79C8`,
+/// {DeployGuards.ANVIL_ACCOUNT_1}) has a private key published in the Anvil banner. The
+/// token is worthless, so the direct blast radius is small — but {MockUSDC} has a
+/// permissionless `mint`, no EIP-2612 permit and a name that reads as the real thing, and
+/// an ungated deploy script is precisely the defect class this ticket exists to close.
+///
+/// It is now gated on the same dev ALLOWLIST every other script uses (Anvil 31337 /
+/// Sepolia 11155111); anything else fails closed, before any gas is spent.
+///
+/// Note this script is for LOCAL dev only even where it is permitted: on Sepolia, use real
+/// Circle USDC (`0x1c7D…7238`) — {MockUSDC} has no permit, so the `permitIn` settlement
+/// path cannot be exercised against it (see docs/atomic-settlement-testnet-runbook.md).
 contract DeployMockUSDC is Script {
+    /// Output — public so tests and follow-up scripts can read it.
+    MockUSDC public usdc;
+
     function run() external {
-        DeployGuards.requireProdSafe("deploying MockUSDC and minting to public Anvil keys is");
+        // Guard BEFORE the broadcast: a dry run names the problem instead of the
+        // transaction reverting mid-flight.
+        DeployGuards.requireProdSafe("deploying MockUSDC and minting to publicly-keyed Anvil accounts");
 
         address account0 = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
-        address account1 = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
+        address account1 = DeployGuards.ANVIL_ACCOUNT_1;
         address account2 = 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC;
 
         vm.startBroadcast();
-        MockUSDC usdc = new MockUSDC();
+        usdc = new MockUSDC();
 
         // Mint 100,000 USDC (6 decimals) to each test account
         usdc.mint(account0, 100_000 * 1e6);
