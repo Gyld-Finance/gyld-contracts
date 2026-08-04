@@ -36,7 +36,7 @@ contract GyldBondTokenTest is Test {
 
     function setUp() public {
         holderAddr    = vm.addr(HOLDER_PK);
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
 
         // ── GyldBondToken proxy ───────────────────────────────────────────────
         GyldBondToken tokenImpl = new GyldBondToken();
@@ -191,6 +191,46 @@ contract GyldBondTokenTest is Test {
     // ═════════════════════════════════════════════════════════════════════════
     // Gap 3 — storage layout compatibility after a UUPS upgrade
     // ═════════════════════════════════════════════════════════════════════════
+
+    /// Pin every field of the ERC-7201 namespaced struct against its raw storage slot.
+    ///
+    /// This is the test that fails if someone INSERTS or REORDERS a field rather than
+    /// appending one. `sanctionsList` / `isin` / `maturityTimestamp` must keep offsets
+    /// 0/1/2 forever — every live proxy already has data there, so a reordering silently
+    /// reinterprets that storage on the next upgrade.
+    ///
+    /// The namespace root is DERIVED here from the same expression the contract uses
+    /// rather than copy-pasted as a literal, so the test cannot drift from the contract's
+    /// declared storage-location namespace while still appearing to pass.
+    ///
+    /// The final assertion pins the END of the struct: `GyldBondTokenStorage` has exactly
+    /// three fields, so offset 3 must be untouched. A future field MUST be APPENDED at
+    /// offset 3 (never inserted) — doing so is expected to fail this assertion, which is
+    /// the intended prompt to extend the pins below rather than a reason to delete them.
+    function test_storageLayout_erc7201OffsetsArePinned() public view {
+        bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1))
+            & ~bytes32(uint256(0xff));
+
+        assertEq(
+            address(uint160(uint256(vm.load(address(token), bytes32(uint256(root) + 0))))),
+            address(mockSanctions),
+            "offset 0 is not sanctionsList"
+        );
+        // Short strings are stored inline as (data | 2*length) in the same slot.
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(root) + 1))) & 0xff,
+            2 * bytes(token.isin()).length,
+            "offset 1 is not isin"
+        );
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(root) + 2))),
+            token.maturityTimestamp(),
+            "offset 2 is not maturityTimestamp"
+        );
+
+        // Nothing is written past the struct's three fields.
+        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 3))), 0, "wrote past offset 2");
+    }
 
     /// Upgrading to V2 preserves all existing state: balances, ISIN, maturity,
     /// sanctions list pointer. This is the regression net for future upgrades.
@@ -360,7 +400,7 @@ contract GyldBondTokenTest is Test {
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
     function test_setSanctionsList_validOracle_succeeds() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(admin);
         token.setSanctionsList(address(newOracle));
         assertEq(address(token.sanctionsList()), address(newOracle));
@@ -388,7 +428,7 @@ contract GyldBondTokenTest is Test {
     }
 
     function test_setSanctionsList_onlyAdmin_reverts() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(address(0xDEAD));
         vm.expectRevert();
         token.setSanctionsList(address(newOracle));

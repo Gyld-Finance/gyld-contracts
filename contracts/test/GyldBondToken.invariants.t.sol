@@ -67,7 +67,7 @@ contract GyldBondTokenInvariantsTest is StdInvariant, Test {
     address dave  = address(0xA4);
 
     function setUp() public {
-        MockSanctionsList mockSanctions = new MockSanctionsList();
+        MockSanctionsList mockSanctions = new MockSanctionsList(address(this));
 
         GyldBondToken tokenImpl = new GyldBondToken();
         bytes memory tokenInit = abi.encodeCall(
@@ -136,7 +136,7 @@ contract GyldBondTokenFuzzTest is Test {
     address bob    = address(0xA2);
 
     function setUp() public {
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
 
         GyldBondToken tokenImpl = new GyldBondToken();
         bytes memory tokenInit = abi.encodeCall(

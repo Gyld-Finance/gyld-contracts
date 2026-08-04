@@ -7,13 +7,19 @@ OpenZeppelin upgradeable contracts with a read-only, platform-operated sanctions
 
 | Contract | File | Origin | Upgrade | Purpose |
 |----------|------|--------|---------|---------|
-| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (MIT) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; reads the configured platform sanctions oracle |
-| `IssuanceManager` | `contracts/IssuanceManager.sol` | Platform (MIT) | UUPS | AP whitelist; mint (subscribe) and burn (redeem) gate |
-| `TokenFactory` | `contracts/TokenFactory.sol` | Platform (MIT) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series; wires roles atomically |
-| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (MIT) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
-| `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (MIT) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
-| `MockSanctionsList` | `contracts/MockSanctionsList.sol` | Platform (MIT) | None | Dev/test stub for the on-chain sanctions oracle |
-| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (MIT) | None | Production sanctions oracle on **every** EVM chain including Ethereum mainnet (GYL-1051); keeper-fed local list plus an optional gas-capped, fail-closed `forwardingOracle`; Chainalysis-compatible interface |
+| `GyldBondToken` | `contracts/GyldBondToken.sol` | Platform (BUSL-1.1) | UUPS | Standard ERC-20 per bond series; fixed balances; value reflected in NAV feed only; reads the configured platform sanctions oracle |
+| `IssuanceManager` | `contracts/IssuanceManager.sol` | Platform (BUSL-1.1) | UUPS | AP whitelist; mint (subscribe) and burn (redeem) gate |
+| `TokenFactory` | `contracts/TokenFactory.sol` | Platform (BUSL-1.1) | None (Ownable2Step) | Deploys GyldBondToken proxy + KaleidoscopeNAVFeed per bond series; wires roles atomically |
+| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | Platform (BUSL-1.1) | None | Push oracle — publishes bond NAV in AggregatorV3Interface format |
+| `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | Platform (BUSL-1.1) | None | Permanent DeFi-facing oracle; delegates to swappable upstream |
+| `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | Platform (BUSL-1.1) | None | Production sanctions oracle on **every** EVM chain including Ethereum mainnet (GYL-1051); keeper-fed local list plus an optional gas-capped, fail-closed `forwardingOracle`; Chainalysis-compatible interface |
+| `GyldAtomicSwap` | `contracts/GyldAtomicSwap.sol` | Platform (BUSL-1.1) | UUPS | Self-custodial atomic USDC⇄bond settlement against platform-signed EIP-712 quotes; holds its own inventory (no vault); taker allowlist, single-use quotes, NAV sanity band |
+| `MockSanctionsList` | `contracts/test/MockSanctionsList.sol` | Platform test (MIT) | None | Dev/test stub for the on-chain sanctions oracle |
+
+> **Licence:** the seven core contracts above are **BUSL-1.1** — Licensor Gyld
+> Finance, Change Date 2028-07-09, converting to `GPL-2.0-or-later`; see the
+> repository `LICENSE`. Files under `contracts/test/` and `contracts/script/`
+> (including `MockSanctionsList` and the deploy scripts) remain **MIT**.
 
 ---
 
@@ -63,8 +69,11 @@ Standard ERC-20 per bond series. **Token balances are fixed units of bond owners
 one token represents one unit of the underlying bond.**
 
 Value accrual (coupons, NAV appreciation) is reflected exclusively in the paired
-`KaleidoscopeNAVFeed` oracle. Token balances only change through `mint` (subscription)
-and `burn` (redemption). There is no on-chain rebasing or multiplier mechanism.
+`KaleidoscopeNAVFeed` oracle — the same model used by USYC, Spiko, Midas, OpenEden
+and Superstate. Token balances only change through `mint` (subscription)
+and `burn` (redemption). There is no on-chain rebasing or multiplier mechanism —
+display-only scaling (ERC-8056) was evaluated and dropped; see
+[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).
 
 ### Balance model
 
@@ -250,6 +259,13 @@ Implements `AggregatorV3Interface` for DeFi protocol compatibility.
 | `MIN_UPDATE_INTERVAL` | 1 hour | Prevents rapid price oscillation from a compromised KMS key |
 | `MAX_PRICE_DEVIATION_BPS` | 1000 (10%) | Single-update deviation cap after first push |
 
+**Monitoring views** (reported, never enforced — reads have no staleness revert path):
+
+| View | Returns |
+|------|---------|
+| `isFresh()` | `true` if the last push is within `MAX_STALENESS`; `false` if stale or never set |
+| `stalenessSeconds()` | Seconds since the last push; `type(uint256).max` if never set. Added GYL-1135 — this contract is **not upgradeable**, so already-deployed feeds do not have it; use `latestRoundData().updatedAt` for those. |
+
 **Emergency price correction:**
 
 If a wrong price is pushed within the 10 % band, `MIN_UPDATE_INTERVAL` and
@@ -277,6 +293,14 @@ rules can alert on any use. Every use should trigger an immediate ops review.
 Permanent DeFi-facing oracle address. Delegates all reads to a swappable upstream oracle.
 Owner calls `setUpstreamOracle(address)` to upgrade the data source without redeploying DeFi markets.
 
+**Upstream probes** (constructor and `setUpstreamOracle`): the candidate must return
+`decimals() == 8` and a well-formed `version()`, and its `latestRoundData()` must not
+report a **future-dated** `updatedAt` (`UpstreamFutureDated`, GYL-1135) — a future
+timestamp satisfies every consumer's `now - updatedAt <= maxAge` check unconditionally, so
+one pointer swap would silently disarm every integrator's staleness defence at once. An
+upstream with no price pushed yet is still accepted (`latestRoundData()` reverting
+`NoPriceSet` is a legitimate pre-first-push state).
+
 **Upgrade path:**
 
 | Phase | Upstream | When |
@@ -284,6 +308,94 @@ Owner calls `setUpstreamOracle(address)` to upgrade the data source without rede
 | 1 | `KaleidoscopeNAVFeed` (platform push) | Launch |
 | 2 | RedStone Classic feed | Weeks after launch |
 | 3 | Chainlink NAVLink feed | Institutional grade |
+
+---
+
+## GyldAtomicSwap
+
+Self-custodial atomic settlement of USDC ⇄ bond-token swaps against
+platform-signed EIP-712 quotes. **The contract holds its own inventory** —
+`executeSwap` pulls `tokenIn` from the taker and pushes `tokenOut` out of its
+own balance. There is no settlement vault and no escrow contract; earlier
+vault/DvP designs were removed.
+
+The normative spec is [`docs/atomic-swap-spec.md`](atomic-swap-spec.md); the
+third-party integrator guide is
+[`docs/integration/onchain-atomic-swap.md`](integration/onchain-atomic-swap.md).
+Deploy script: `contracts/script/DeployAtomicSettlement.s.sol` (env vars in
+`.env.example`).
+
+### Quote model
+
+- Quotes are signed off-chain by a `QUOTE_SIGNER_ROLE` key (the role registry
+  *is* the signer set) over a capped-allowance `SwapMessage`:
+  `{quoteId, taker, tokenIn, maxAmountIn, tokenOut, price, expiry, epoch}`.
+- EIP-712 domain: `("GyldAtomicSwap", "2")` + chainId + **proxy** address.
+- `maxAmountIn` is a ceiling; the taker picks `requestedAmountIn` at execution
+  (1% dust floor), and `amountOut = requestedAmountIn * price / 1e18` floors in
+  the contract's favour. First use burns the `quoteId` in full — single-shot,
+  no partial-balance carry-over.
+- The signed price is what executes; the series' NAV feed is only a sanity band
+  (`maxQuoteDeviationBps`), fail-closed on a stale or non-positive NAV.
+
+### NAV staleness bound
+
+`_checkQuoteBand` reverts `StaleNav` when `block.timestamp > updatedAt + maxNavAgeSecs`,
+and also when `updatedAt` is in the future. Because `KaleidoscopeNAVFeed` never reverts on
+a stale answer (Chainlink read semantics), **this consumer-side check is the only
+staleness defence in the swap path**.
+
+`maxNavAgeSecs` is admin-settable but structurally bounded:
+`0 < maxNavAgeSecs <= MAX_NAV_AGE_CEILING` (**72 hours**), enforced in both `initialize`
+and `setMaxNavAgeSecs` (GYL-1135). Deployed default is 86400 (24 h). Without the ceiling a
+single `DEFAULT_ADMIN_ROLE` call could raise the bound toward the `uint32` maximum
+(~136 years) and turn the guard into a no-op while every getter still reported it as
+configured. 72 h matches Euler's structural `MAX_STALENESS_UPPER_BOUND` and keeps
+3-day-holiday tolerance reachable. `MAX_NAV_AGE_CEILING` is a `constant`, so it adds no
+storage slot and does not affect the ERC-7201 layout.
+
+### Roles
+
+| Role | Holder | Capability |
+|------|--------|-----------|
+| `DEFAULT_ADMIN_ROLE` | TimelockController (prod) | Upgrades, unpause, series registry, band/age params, withdrawal wallet, epoch bumps, role grants. Cannot be renounced |
+| `ALLOWLIST_ADMIN_ROLE` | Compliance ops hot key | `setAllowed()` — the taker allowlist, **only**. Deliberately split from admin (GYL-1050) so allowlisting stays a same-day operational action after the timelock handover |
+| `QUOTE_SIGNER_ROLE` | Quote-service KMS key(s) | Passive — checked via `hasRole` against the recovered EIP-712 signer |
+| `TREASURER_ROLE` | Ops MPC wallet | `withdraw()` inventory — only to the admin-fixed withdrawal wallet; deliberately live while paused |
+| `PAUSER_ROLE` | Ops multisig | `pause()` only; resuming requires the admin |
+
+### Deployments
+
+| Network | Chain ID | Address | Status |
+|---------|----------|---------|--------|
+| Ethereum Sepolia | 11155111 | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` (proxy) | ✅ **Live for integrator testing** (2026-07-31). Dev-mode wiring: deployer EOA holds all roles (no timelock handover); deployed from pre-GYL-1135-hardened scripts — see caveat below |
+| Local Anvil | 31337 | — | Local development only (ephemeral) |
+
+Sepolia smoke-test series (throwaway, deployed alongside the swap for the
+end-to-end run — **not** a real bond series):
+
+| Contract | Address |
+|----------|---------|
+| `GyldBondToken` proxy (ISIN `TEST8056A00001`, "GTB8056") | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` |
+| `GyldBondToken` implementation (evaluation build) | `0x72FAE4fa227e7E28BF315BA363dE39E371a49C52` |
+| `KaleidoscopeNAVFeed` (NAV $100.00 pushed) | `0x4266a4A43Db435056f60C02b37fA8586E58597Fa` |
+| `NAVFeedForwarder` | `0x49be531A7C48077483997d92D7BeF759dd7b2b53` |
+| USDC (Circle Sepolia) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
+
+Verified on-chain 2026-07-31 (`contracts/script/SepoliaAtomicSwapSmoke.s.sol`):
+inventory seeded via `subscribe` (100 bonds + 2 USDC), signed BUY quote executed
+(2 USDC → 0.02 bonds, `quoteId 1` burned).
+Caveats: deployed before the GYL-1134/1135 hardening landed on this branch
+(NAV-age ceiling, fail-closed deploy guards) — redeploy/upgrade after the
+branch merges if this test instance is kept. The token implementation was an
+evaluation build carrying a since-dropped display extension; **do not reuse
+this proxy for a new series** — see
+[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md).
+
+### Storage layout
+
+ERC-7201 namespace `gyld.GyldAtomicSwap`  
+Slot: `0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300`
 
 ---
 

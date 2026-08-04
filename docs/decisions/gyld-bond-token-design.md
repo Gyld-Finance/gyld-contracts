@@ -4,10 +4,30 @@
 **Date:** 2026-05-06  
 **Applies to:** `contracts/GyldBondToken.sol`, `contracts/IssuanceManager.sol`, `contracts/TokenFactory.sol`
 
-> **Update (GYL-956):** Section 3 below was narrowed to permit a display-only UI
+> ~~**Update (GYL-956):** Section 3 below was narrowed to permit a display-only UI
 > scaling multiplier (ERC-8056). The core prohibition — no multiplier or rebasing
 > that affects real `balanceOf`/`totalSupply` — still stands unchanged. See the
-> new subsection at the end of Section 3.
+> new subsection at the end of Section 3.~~
+> **[Superseded — reversed (GYL-1201, 2026-08-03).]** ERC-8056 has been **dropped
+> on EVM** and the display-only extension removed from `GyldBondToken`. Section 3's
+> original prohibition applies again in full, with no carve-out. The GYL-956
+> addendum at the end of Section 3 is retained as ADR history only. Rationale:
+> [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md).
+
+> **Update (GYL-1134, 2026-07-30) — Section 4 oracle claims partly superseded.** Three
+> statements about `KaleidoscopeNAVFeed` in Section 4 were never true of the shipped
+> bytecode, and are now marked inline where they appear:
+> 1. `MAX_STALENESS` is **96 hours, not 36**, and **no read reverts on staleness**. The
+>    constant gates only the `isFresh()` monitoring view. Chainlink read semantics were
+>    re-affirmed deliberately under GYL-1135.
+> 2. There is **no `_requireFresh()`** function, and never was.
+> 3. `MAX_PRICE_DEVIATION_BPS` **does** have an emergency override
+>    (`emergencyUpdateAnswer`), gated on a key separate from the owner.
+>
+> The compliance and upgradeability decisions that are the subject of this ADR are
+> unaffected. Current oracle behaviour: [`docs/contracts.md`](../contracts.md) →
+> KaleidoscopeNAVFeed, and [`docs/blockchain-status.md`](../blockchain-status.md) →
+> "Staleness: what the feed actually does, and who is responsible for it".
 
 ---
 
@@ -186,11 +206,14 @@ The NAV feed says "each unit is worth $X today."
 
 - No `shares` internal accounting
 - No multiplier or NAV accrual that affects REAL balances (`balanceOf`/`totalSupply`)
-  inside the token. (GYL-956 added a narrow, display-only exception that does not
-  touch real balances — see "GYL-956 addendum" below.)
+  inside the token. ~~(GYL-956 added a narrow, display-only exception that does not
+  touch real balances — see "GYL-956 addendum" below.)~~ **[GYL-956 exception
+  removed — GYL-1201, 2026-08-03.]** The prohibition is once again absolute: no
+  multiplier of any kind, display-only or otherwise.
 - No `burnShares()` / `redeemShares()` / `transferShares()` / `sharesOf()`
-- No role that can move REAL balances via a multiplier. (`UI_MULTIPLIER_ROLE`,
-  added in GYL-956, is display-only and cannot affect `balanceOf`/`totalSupply`.)
+- No role that can move REAL balances via a multiplier. ~~(`UI_MULTIPLIER_ROLE`,
+  added in GYL-956, is display-only and cannot affect `balanceOf`/`totalSupply`.)~~
+  **[`UI_MULTIPLIER_ROLE` removed — GYL-1201.]**
 - No rebasing — the number of tokens in a wallet never changes from NAV movement
 
 ### Why
@@ -225,10 +248,52 @@ The NAV feed says "each unit is worth $X today."
 
 ### GYL-956 addendum: a narrow, display-only exception (ERC-8056)
 
+> **SUPERSEDED — ERC-8056 dropped on EVM (GYL-1201, 2026-08-03).** Everything in
+> this addendum, including its conformance notes and circuit breakers, describes
+> an extension that has been **removed** from `GyldBondToken`. It was accurate
+> when written and is retained verbatim as ADR history; do not act on it.
+>
+> The short version of why: ERC-8056 is a stock-splits standard, no EVM wallet
+> implements it (MetaMask displayed the raw balance next to BscScan's scaled one
+> on our own deployment), no bond or treasury issuer uses it — the EIP's own
+> co-author Superstate does not use it on their funds — and it duplicated the NAV
+> channel that `KaleidoscopeNAVFeed` already provides. Full rationale, the
+> orphaned testnet token addresses, and the consequences (the NAV feed is now the
+> sole display channel; see GYL-1134):
+> [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md).
+
 **What was added:** `uiMultiplier` (18-dp fixed point, default `1e18`), gated by a
 dedicated `UI_MULTIPLIER_ROLE`, plus read-only views `balanceOfUI()`,
-`totalSupplyUI()`, `toUIAmount()`, `fromUIAmount()`, and a `UIMultiplierUpdated`
-event. ERC-165 advertises support via a minimal `IERC8056` interface.
+`totalSupplyUI()`, `toUIAmount()`, `fromUIAmount()`, the scheduled-change views
+`newUIMultiplier()` / `effectiveAt()`, and the `UIMultiplierUpdated` and
+`TransferWithUIAmount` events.
+
+**Conformance (GYL-956 follow-up):** the implementation now matches the published
+ERC-8056 Draft rather than an approximation of it.
+
+- The REQUIRED `IScaledUIAmountNewUIMultiplier` extension is implemented.
+  `scheduleUiMultiplier(newMultiplier, effectiveAtTimestamp)` pre-announces a
+  change; `uiMultiplier()` switches to the pending value once
+  `block.timestamp >= effectiveAt()`, inclusive of the boundary block, matching the
+  EIP reference implementation. At most one schedule is pending at a time, and
+  replacing a pending schedule leaves the displayed value untouched — so a
+  mis-scheduled multiplier can be corrected before any holder sees it.
+  `setUiMultiplier(m)` remains the immediate path (schedules at `block.timestamp`).
+- `UIMultiplierUpdated` carries the canonical **three** parameters
+  (`oldMultiplier`, `newMultiplier`, `effectiveAtTimestamp`). The earlier two-parameter
+  form had a different `topic0`, so no EIP-following indexer would ever have matched it.
+- `TransferWithUIAmount` is emitted from `_update`, covering transfer, mint and burn
+  with the same reach as the canonical `Transfer` event. It is OPTIONAL in the EIP;
+  we pay the extra log so indexers can reconstruct displayed amounts from logs alone.
+- ERC-165 advertises **all four** implemented interface ids — `0xa60bf13d` (core),
+  `0x4bd27648` (pending), `0x57854fc3` (conversion), `0xd890fd71` (balances) —
+  rather than only the core id, which left the conversion and balances helpers live
+  but undiscoverable.
+
+ERC-8056 is still a Draft, so its selectors may move. The interfaces are transcribed
+verbatim into `GyldBondToken.sol` and the four ids are pinned against the published
+hex literals in `GyldBondToken.ScaledUIAmount.t.sol`, so an upstream change fails the
+suite instead of silently producing a non-conformant token.
 
 **Why this is not the multiplier/rebasing system prohibited above:** the
 prohibition in this section is about REAL accounting — anything that changes what
@@ -256,26 +321,39 @@ nothing about how trades are priced or settled.
   `HolderBalancesDriver` must keep reading raw `balanceOf()`/`Transfer` events —
   pointing any of them at the UI views would corrupt reconciliation.
 - `setUiMultiplier()` should only ever be called by the same off-chain process
-  that publishes to `KaleidoscopeNAVFeed`, using the identical value and the
-  identical circuit-breaker guardrails (10% max deviation, 1h min interval) so the
-  two numbers can never drift apart. `NavPublishDriver` does exactly this as of
-  GYL-958: it derives the multiplier from the *same* `nav_raw` it just published,
-  never a second independent computation.
-- **`UI_MULTIPLIER_ROLE` is granted to the NAV feed owner, not to a dedicated key**
-  (GYL-958). `TokenFactory._wireRoles` grants it to the `navFeedOwner` argument, so
-  every factory-deployed token has the grant from birth. The rationale is that the
-  two roles are one operational actor — "the process that publishes NAV" — and the
-  Rust adapter signs `setUiMultiplier` with the same `nav_signer` wallet
-  (`EVM_KMS_NAV_KEY_ID`) it signs `updateAnswer` with. Splitting them later is purely
-  additive: grant `UI_MULTIPLIER_ROLE` to a new address and revoke it from the NAV
-  signer via `DEFAULT_ADMIN_ROLE` (the timelock in prod). Without the grant, every
-  NAV tick's multiplier push reverts on `onlyRole` and the driver logs it as
-  `ui_multiplier_errored` while NAV publishing continues — a silent display-only
-  drift, which is why the grant is asserted in `TokenFactory.t.sol` and at deploy
-  time in `scripts/deploy-hoodi-contracts.sh`.
-- Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`
-  to prevent `toUIAmount`/`fromUIAmount` from dividing by zero or displaying a
-  permanently-zeroed balance.
+  that publishes to `KaleidoscopeNAVFeed`, using the identical value, so the two
+  numbers can never drift apart. That driver wiring is a follow-up (GYL-956
+  Rust-side work), not yet implemented as of this addendum.
+- **The circuit breakers are enforced on-chain, not just by convention.** This
+  addendum originally described the 10%-deviation / 1h-interval guardrails as an
+  off-chain discipline for the (unwritten) driver, while the setter itself
+  validated nothing but non-zero. That meant a single `UI_MULTIPLIER_ROLE` key
+  could set `1000e18` and then `1` in the same block, swinging every displayed
+  balance by 1e18x. `GyldBondToken` now enforces
+  `MAX_UI_MULTIPLIER_DEVIATION_BPS` (1000 bps) and
+  `MIN_UI_MULTIPLIER_UPDATE_INTERVAL` (1 hour) itself — the same constants and the
+  same semantics as `KaleidoscopeNAVFeed.updateAnswer`, since the multiplier is a
+  mirror of that feed. The rate limit is measured on ACTIVATION time, so scheduling
+  cannot be used to pack two activations closer than the interval. Reaching a
+  distant multiplier requires ramping across several intervals, exactly as it does
+  on the NAV feed.
+- There is deliberately **no** emergency bypass equivalent to
+  `emergencyUpdateAnswer`. A wrong NAV is a solvency problem for Morpho markets
+  pricing collateral; a wrong multiplier is a display problem only, which does not
+  justify a second unbounded write channel.
+- Do not let `uiMultiplier` reach `0` — the setter reverts with `ZeroMultiplier()`,
+  and reads normalise a `0` to `1e18`, so `toUIAmount`/`fromUIAmount` can never
+  divide by zero or display a permanently-zeroed balance.
+- **Upgrading a live proxy needs no post-upgrade initializer call.** A proxy
+  deployed before these fields existed reads `0` from the never-written slots. The
+  read path treats "no schedule ever written" as 1.0x, which reproduces the exact
+  pre-upgrade display (pre-upgrade balances were never scaled). A bare
+  `upgradeToAndCall(impl, "")` is therefore sufficient and complete. An earlier
+  revision shipped an `initializeUiMultiplierV2()` reinitializer for this purpose;
+  it was `external reinitializer(2)` with **no access control**, so any address
+  could call it and permanently consume the version-2 slot, blocking every future
+  v2 migration. It has been removed rather than gated, because the read-path
+  normalisation makes it unnecessary.
 
 ---
 
@@ -343,6 +421,41 @@ The 1-hour minimum is a security floor, not the operational target.
 
 #### 3. MAX_STALENESS = 36 hours (reads revert if price is too old)
 
+> **SUPERSEDED — this was never implemented (GYL-1134, 2026-07-30).** Both claims below
+> are false against the deployed bytecode and always have been. Retained verbatim as ADR
+> history; do not act on it.
+>
+> **What actually shipped:**
+> - `MAX_STALENESS` is **96 hours**, not 36.
+> - It is **advisory**. Its only consumer is the `isFresh()` monitoring view. No read
+>   function has ever reverted on staleness — `latestRoundData()`, `latestAnswer()` and
+>   `getRoundData()` return the last answer with its true `updatedAt` no matter how old
+>   it is. The single revert on a read is `NoPriceSet`, before the first push.
+> - The `require(...)` snippet below does not exist in the source. A `PriceStale` error
+>   was declared and never thrown; it has since been deleted (GYL-1135) so the source no
+>   longer implies a revert path that is not there.
+> - The staleness constant is therefore **not** a "circuit breaker". Only two of the
+>   three breakers in this section are real: `MAX_PRICE_DEVIATION_BPS` and
+>   `MIN_UPDATE_INTERVAL` (and both are now bypassable via `emergencyUpdateAnswer` from a
+>   separate key — see the emergency-override note later in this section).
+>
+> **This is now a deliberate decision, not just a discrepancy.** Chainlink-compatible
+> read semantics were re-affirmed under GYL-1135 and pinned by
+> `contracts/test/KaleidoscopeNAVFeed.t.sol::test_noStalenessRevertPathExists`: reverting
+> would break consumers that age-check correctly (Euler does), destroy the `updatedAt`
+> signal that makes an outage diagnosable, and — decisively — freeze Morpho
+> *liquidations*, which is unrecoverable during an outage. The staleness defence lives in
+> consumers (`GyldAtomicSwap.StaleNav`, bounded above by `MAX_NAV_AGE_CEILING = 72 h`) and
+> in ops alerting. Current description:
+> [`docs/blockchain-status.md`](../blockchain-status.md) → "Staleness: what the feed
+> actually does, and who is responsible for it", and
+> [`docs/contracts.md`](../contracts.md) → KaleidoscopeNAVFeed.
+>
+> **Consequence, observed:** the Base mainnet feed has been stale since 2026-05-19. Euler
+> froze correctly on its own check; Morpho, which has none, kept quoting the pinned
+> $100.00. Anyone who read this section would have expected the feed itself to have
+> stopped that. It cannot, and by design will not.
+
 ```solidity
 require(block.timestamp - _updatedAt <= MAX_STALENESS, "price stale");
 ```
@@ -366,8 +479,14 @@ triggers staleness and forces an update before DeFi activity resumes.
 | `latestRoundData()` | AggregatorV3Interface (V3) | Morpho Blue, most modern protocols |
 | `latestAnswer()` | AggregatorInterface (V2) | Aave V3 (uses the older call) |
 
-Both check staleness via `_requireFresh()` before returning. Both return the same
-current price — there is no difference in the value returned.
+Both return the same current price — there is no difference in the value returned.
+
+> **Corrected (GYL-1134, 2026-07-30).** This paragraph previously read "Both check
+> staleness via `_requireFresh()` before returning." **There is no `_requireFresh()`** —
+> no such function has ever existed in `KaleidoscopeNAVFeed.sol`. Neither read checks
+> staleness; both return the last answer with its true `updatedAt` regardless of age.
+> Consumers must age-check `updatedAt` themselves. See the superseded-notice on
+> `MAX_STALENESS` above.
 
 Historical rounds are **not stored**. `getRoundData(roundId)` only accepts the
 current round ID and reverts for any other value. DeFi protocols do not need
@@ -397,6 +516,18 @@ a single address calling `updateAnswer()` — MPC threshold happens at the
 signing layer, invisible to the contract.
 
 ### Why `MAX_PRICE_DEVIATION_BPS` has no emergency override
+
+> **SUPERSEDED — reversed (GYL-1134, 2026-07-30).** An override **does** ship:
+> `emergencyUpdateAnswer(int256)` bypasses both `MAX_PRICE_DEVIATION_BPS` and
+> `MIN_UPDATE_INTERVAL`. The analysis below is retained as history because reason 3 is
+> what shaped the shipped design: the override is gated on a separate `emergencyUpdater`
+> key, which `setEmergencyUpdater` / `transferOwnership` / `_transferOwnership` all forbid
+> from equalling `owner()`, so a single compromised KMS key still cannot use it — the
+> owner-callable `forceUpdateAnswer()` rejected here is still rejected. What reasons 1
+> and 2 missed: the binding scenario is not a legitimate >10% move, it is a fat-finger
+> *within* the band (a 9.9% error needs a >10% move to undo), which chained updates
+> cannot fix at all. Current behaviour:
+> [`docs/contracts.md`](../contracts.md) → KaleidoscopeNAVFeed.
 
 During the pre-mainnet security audit (GYL-309, finding M-3), the question was raised:
 what happens if a legitimate NAV move exceeds 10% in a single update? The proposed fix
@@ -483,6 +614,9 @@ an attack surface.
 
 ### What we deliberately do NOT do
 
+> **Two of these bullets are superseded (GYL-1134, 2026-07-30)** — marked inline.
+> Retained rather than deleted so the ADR history stays legible.
+
 - NAV is not stored inside `GyldBondToken`. Do not add a `multiplier` or
   `navPerToken` field to the token contract.
 - `navFeedOwner` must not be a plain hot wallet (EOA with private key in memory)
@@ -490,19 +624,42 @@ an attack surface.
 - Do not remove or increase the circuit breaker constants
   (`MAX_PRICE_DEVIATION_BPS`, `MIN_UPDATE_INTERVAL`, `MAX_STALENESS`). They
   are the on-chain guarantee that DeFi integrators and APs rely on.
-- Do not add a `forceUpdateAnswer()` or any bypass of `MAX_PRICE_DEVIATION_BPS`.
-  The cap is a hard rate limit — its value comes precisely from being unconditional.
-  See "Why there is no emergency override" above.
-- Do not disable `_requireFresh()` or allow reads to succeed on a stale price.
-  Returning a stale price to Morpho Blue would cause it to accept undercollateralised
-  loans — a direct financial loss to lenders.
+  **[Partly superseded]** Holds for `MAX_PRICE_DEVIATION_BPS` and
+  `MIN_UPDATE_INTERVAL`. `MAX_STALENESS` is not a circuit breaker and never was —
+  it gates only the `isFresh()` view, so changing it changes no on-chain guarantee.
+- ~~Do not add a `forceUpdateAnswer()` or any bypass of `MAX_PRICE_DEVIATION_BPS`.~~
+  **[Superseded — reversed.]** `emergencyUpdateAnswer(int256)` ships and bypasses
+  **both** `MAX_PRICE_DEVIATION_BPS` and `MIN_UPDATE_INTERVAL`. The reversal is narrow
+  and the original point-3 objection is preserved structurally: the bypass is callable
+  only by a separate `emergencyUpdater` key that the contract forbids from equalling
+  `owner()`, so a single compromised KMS key still cannot use it. It exists because a
+  fat-finger *inside* the 10% band can strand the correct price out of reach (undoing a
+  9.9% error needs a >10% move). Every use emits `EmergencyAnswerUpdated` and should
+  trigger an ops review. Still true: do **not** add an owner-callable bypass.
+- ~~Do not disable `_requireFresh()` or allow reads to succeed on a stale price.~~
+  **[Superseded — never existed; reads have always succeeded on a stale price.]**
+  There is no `_requireFresh()`. Reads deliberately do not revert on staleness
+  (Chainlink semantics), re-affirmed under GYL-1135 and pinned by
+  `test_noStalenessRevertPathExists`. The concern the bullet raises is real and
+  *unaddressed by the feed*: Morpho Blue does not age-check `updatedAt` and did quote a
+  stale price throughout the outage that began 2026-05-19. The mitigation is
+  consumer-side (`GyldAtomicSwap.StaleNav`, now ceilinged at 72 h) plus NAV-keeper
+  alerting — not a revert in the feed, which would freeze Morpho *liquidations*
+  unrecoverably. Replacement rule: **do not add a staleness revert to the read path;
+  do not ship a consumer that reads this feed without its own `updatedAt` age check.**
 
 ### Consequences for developers
 
 - Every bond series gets its own `KaleidoscopeNAVFeed` deployed atomically by
   `TokenFactory`. Do not share one feed across multiple bond series.
-- The backend must push a NAV update after every market close. If it misses 36
-  hours, the DeFi integration stops working until a fresh update is pushed.
+- The backend must push a NAV update after every market close. **[Corrected
+  GYL-1134]** This bullet used to continue "If it misses 36 hours, the DeFi integration
+  stops working until a fresh update is pushed." It does not stop working — that is the
+  problem. The feed keeps serving the last price indefinitely; only consumers with their
+  own age check (Euler, `GyldAtomicSwap`) stop, while consumers without one (Morpho Blue)
+  keep quoting a dead price. A missed push is therefore an **ops incident that requires
+  alerting**, not a self-limiting condition. Poll `stalenessSeconds()` (feeds deployed
+  after GYL-1135) or `latestRoundData().updatedAt` (all feeds) and page on it.
 - When migrating the updater to Fordefi (Phase 2): use `transferOwnership()` +
   `acceptOwnership()` — never call `renounceOwnership()`.
 - `NAVFeedForwarder` (the stable oracle proxy) points at this feed. DeFi protocols
@@ -696,7 +853,7 @@ institutional AP model.
 | Question | Answer |
 |---|---|
 | **Token model** | |
-| Does the token have shares / multiplier / rebasing? | **No REAL multiplier/rebasing affecting balances.** Plain OZ ERC-20 — `balanceOf`/`totalSupply` change only via mint/burn. A **display-only** `uiMultiplier` (GYL-956) exists purely for `balanceOfUI()`/`totalSupplyUI()`; it cannot affect real accounting. |
+| Does the token have shares / multiplier / rebasing? | **No. None of any kind.** Plain OZ ERC-20 — `balanceOf`/`totalSupply` change only via mint/burn. The display-only `uiMultiplier` briefly permitted by GYL-956 was **removed** when ERC-8056 was dropped on EVM (GYL-1201, 2026-08-03 — see [`erc8056-dropped-on-evm.md`](erc8056-dropped-on-evm.md)). |
 | Where does NAV / value accrual live? | `KaleidoscopeNAVFeed` oracle only — never inside the token. |
 | Are `burnShares`, `transferShares`, `sharesOf` in the contract? | **No.** Deliberately absent — no share system, no dust residual problem. |
 | Is there a `MULTIPLIER_UPDATER_ROLE`? | **No.** Removed with the multiplier system. |

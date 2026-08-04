@@ -42,7 +42,7 @@ contract IssuanceManagerTest is Test {
         vm.prank(admin); mgr.grantRole(whitelistAdminRole, whitelistAdmin);
         vm.prank(admin); mgr.grantRole(registrarRole, registrar);
 
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         GyldBondToken tokenImpl = new GyldBondToken();
         token = GyldBondToken(address(new ERC1967Proxy(
             address(tokenImpl),
@@ -503,7 +503,7 @@ contract IssuanceManagerTest is Test {
 
     function test_registerToken_wrongContract_reverts() public {
         // MockSanctionsList has no MINTER_ROLE() — not a GyldBondToken
-        address wrongContract = address(new MockSanctionsList());
+        address wrongContract = address(new MockSanctionsList(address(this)));
         vm.prank(registrar);
         vm.expectRevert();
         mgr.registerToken(wrongContract);
