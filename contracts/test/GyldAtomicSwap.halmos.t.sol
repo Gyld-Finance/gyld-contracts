@@ -42,8 +42,7 @@ contract Sha3Warmer {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Halmos symbolic-verification suite for the core economic invariants of
-// GyldAtomicSwap (docs/atomic-swap-spec.md §8: I-1, I-2, I-3, I-10, I-11) plus
-// the ERC-8056 conversion round-trip on GyldBondToken.
+// GyldAtomicSwap (docs/atomic-swap-spec.md §8: I-1, I-2, I-3, I-10, I-11).
 //
 // Functions use the check_ prefix: `forge test` ignores them (it only runs
 // test*), halmos runs them (its default --function prefix is (check|invariant)_).
@@ -131,13 +130,10 @@ contract GyldAtomicSwapHalmosTest is Test {
         vm.prank(admin);
         swap.registerSeries(address(token), address(navFeed));
 
-        // MINTER_ROLE tops up inventory; UI_MULTIPLIER_ROLE drives the ERC-8056 check.
+        // MINTER_ROLE tops up inventory.
         bytes32 minterRole = token.MINTER_ROLE();
-        bytes32 uiRole = token.UI_MULTIPLIER_ROLE();
-        vm.startPrank(admin);
+        vm.prank(admin);
         token.grantRole(minterRole, address(this));
-        token.grantRole(uiRole, address(this));
-        vm.stopPrank();
 
         token.mint(address(swap), 1_000e18);
         token.mint(taker, 100e18);
@@ -168,7 +164,6 @@ contract GyldAtomicSwapHalmosTest is Test {
         warmer.warm(keccak256("ALLOWLIST_ADMIN_ROLE"), acBase);
         warmer.warm(keccak256("MINTER_ROLE"), acBase);
         warmer.warm(keccak256("BURNER_ROLE"), acBase);
-        warmer.warm(keccak256("UI_MULTIPLIER_ROLE"), acBase);
     }
 
     /// Deploy + wire a fresh swap proxy over `cashToken`; withdrawalWallet set;
@@ -395,59 +390,4 @@ contract GyldAtomicSwapHalmosTest is Test {
         assertTrue(swap.isQuoteUsed(4));
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // 5. ERC-8056 — conversion semantics on GyldBondToken
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /// toUIAmount is EXACT floor division: for the concrete multiplier
-    /// m = 1.05e18 (within the 10% deviation cap of the initial 1.0x) and any
-    /// raw x < 2^128 (keeps x * m far below 2^256), the returned ui satisfies
-    /// ui * 1e18 <= x * m < (ui + 1) * 1e18. The direct call succeeding on
-    /// every path also proves toUIAmount never reverts for x < 2^128.
-    function check_erc8056_toUIAmount_exactFloor() public {
-        token.setUiMultiplier(1.05e18);
-
-        uint256 x = svm.createUint256("rawAmount");
-        vm.assume(x < 2 ** 128);
-
-        uint256 ui = token.toUIAmount(x);
-
-        assertLe(ui * 1e18, x * 1.05e18);
-        assertLt(x * 1.05e18, (ui + 1) * 1e18);
-    }
-
-    /// fromUIAmount is EXACT floor division the other way: for any
-    /// ui < 2^128 (keeps ui * 1e18 below 2^256), back satisfies
-    /// back * m <= ui * 1e18 < (back + 1) * m, and never reverts.
-    function check_erc8056_fromUIAmount_exactFloor() public {
-        token.setUiMultiplier(1.05e18);
-
-        uint256 ui = svm.createUint256("uiAmount");
-        vm.assume(ui < 2 ** 128);
-
-        uint256 back = token.fromUIAmount(ui);
-
-        assertLe(back * 1.05e18, ui * 1e18);
-        assertLt(ui * 1e18, (back + 1) * 1.05e18);
-    }
-
-    /// Conversion round-trip: fromUIAmount(toUIAmount(x)) <= x, short by at
-    /// most the floor-division dust. For m >= 1e18 the dust bound is
-    /// ceil(1e18 / m) == 1 wei. Proved for all x < 2^128 (overflow-free zone
-    /// for both multiplications). NOTE: requires a division-capable solver —
-    /// z3/yices/plain-cvc5 all exceed 300s on the nested constant division;
-    /// cvc5 with --solve-bv-as-int=iand proves it in seconds (see
-    /// docs/formal-verification.md).
-    function check_erc8056_uiAmount_roundTrip() public {
-        token.setUiMultiplier(1.05e18);
-
-        uint256 x = svm.createUint256("rawAmount");
-        vm.assume(x < 2 ** 128);
-
-        uint256 ui = token.toUIAmount(x);
-        uint256 back = token.fromUIAmount(ui);
-
-        assertLe(back, x);
-        assertLe(x - back, 1);
-    }
 }

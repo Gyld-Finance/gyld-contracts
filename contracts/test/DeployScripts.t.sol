@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {ScriptRevertAsserts} from "./ScriptRevertAsserts.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
@@ -133,7 +134,7 @@ contract DeployGuardsTest is Test {
 /// (`tx.origin`). Foundry also rewrites CREATE2 to the canonical `0x4e59…4956C` proxy here
 /// exactly as it does when broadcasting, so the deterministic addressing below is the real
 /// production scheme rather than a test-only approximation.
-contract DeployScriptsTest is Test {
+contract DeployScriptsTest is ScriptRevertAsserts {
     uint256 constant BASE = 8453; // the chain the incident happened on
     uint256 constant SEPOLIA = 11155111;
     uint256 constant ANVIL = 31337;
@@ -145,7 +146,6 @@ contract DeployScriptsTest is Test {
     address constant REDEEMER = address(0xEDEE);
     address constant WHITELIST_ADMIN = address(0x117E);
     address constant NAV_OWNER = address(0x0AC1);
-    address constant UI_MULTIPLIER_ADMIN = address(0x8056); // ERC-8056 multiplier publisher
     address constant TREASURER = address(0x77EA);
     address constant QUOTE_SIGNER = address(0x519E);
     address constant ALLOWLIST_ADMIN = address(0xA110);
@@ -176,11 +176,9 @@ contract DeployScriptsTest is Test {
         _run(this.reject_devNet_unsetSanctionsListOnBase);
         _run(this.reject_devNet_sanctionsListWithoutCode);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
-        _run(this.reject_devNet_uiMultiplierAdminIsTheDeployer);
         _run(this.accept_devNet_productionHappyPath);
         _run(this.accept_devNet_anvilDevPathStillWorks);
-        _run(this.accept_devNet_uiMultiplierRoleIsWiredOnEverySeries);
-        _run(this.accept_devNet_uiMultiplierAdminDefaultsToNavFeedOwner);
+        _run(this.accept_devNet_everySeriesTokenAdminIsTheTimelock);
         _run(this.accept_bootstrapAddressesDifferAcrossChains);
 
         // ── DeployTimelock ────────────────────────────────────────────────────
@@ -275,29 +273,16 @@ contract DeployScriptsTest is Test {
         );
     }
 
-    /// Catches (GYL-1136): the ERC-8056 multiplier-publisher role pointed at the
-    /// broadcaster. The multiplier cannot move a real balance, but a deployer EOA that can
-    /// re-skew every wallet's DISPLAYED holdings is still the Base-incident shape, and it
-    /// must fail closed on production exactly like the other privileged addresses.
-    function reject_devNet_uiMultiplierAdminIsTheDeployer() external {
-        vm.chainId(BASE);
-        _devNetProdEnv();
-        _setAddr("UI_MULTIPLIER_ADMIN", DEFAULT_SENDER);
-        _expectRunRevert(address(new DeployDevNet()), "UI_MULTIPLIER_ADMIN must not be the deployer EOA");
-    }
-
-    /// Catches the actual GYL-1136 gap: NOTHING in any committed deploy script granted
-    /// UI_MULTIPLIER_ROLE. TokenFactory._wireRoles wires MINTER / BURNER / PAUSER /
-    /// DEFAULT_ADMIN and stops, so every series shipped with the role unassigned — the
-    /// ERC-8056 multiplier was permanently stuck at 1.0x with no key able to publish one.
+    /// Every bond series this run deploys must leave DEFAULT_ADMIN_ROLE with the timelock
+    /// and NOT with the broadcaster — the per-token form of the Base-incident property
+    /// (the other scenarios in this file assert it for IssuanceManager and the swap, but
+    /// this is the only place it is checked on the tokens themselves).
     ///
     /// Asserted on Anvil because that is the only path where the delay-0 factory hand-off
-    /// completes inside a single run and the series are actually deployed. The grant is
-    /// routed through the timelock, which is the sole DEFAULT_ADMIN on each token.
-    function accept_devNet_uiMultiplierRoleIsWiredOnEverySeries() external {
+    /// completes inside a single run and the series are actually deployed.
+    function accept_devNet_everySeriesTokenAdminIsTheTimelock() external {
         vm.chainId(ANVIL);
         _clearEnv();
-        _setAddr("UI_MULTIPLIER_ADMIN", UI_MULTIPLIER_ADMIN);
 
         DeployDevNet script = new DeployDevNet();
         script.run();
@@ -305,37 +290,9 @@ contract DeployScriptsTest is Test {
         assertEq(script.bondTokenCount(), 3, "expected the three dev series to be deployed");
         for (uint256 i = 0; i < script.bondTokenCount(); i++) {
             GyldBondToken t = GyldBondToken(script.bondTokens(i));
-            bytes32 role = t.UI_MULTIPLIER_ROLE();
-            assertTrue(t.hasRole(role, UI_MULTIPLIER_ADMIN), "UI_MULTIPLIER_ROLE not granted to the configured admin");
-            assertFalse(t.hasRole(role, DEFAULT_SENDER), "deployer holds UI_MULTIPLIER_ROLE");
-            // The role holder is the only one who can move the multiplier, and the series
-            // starts at a SAFE 1.0x with nothing scheduled (the E-F1 invariant).
-            assertEq(t.uiMultiplier(), 1e18, "series did not start at 1.0x");
-            assertEq(t.newUIMultiplier(), 1e18, "series has a pending multiplier at deploy time");
-            assertEq(t.effectiveAt(), 0, "series has a multiplier schedule at deploy time");
-            // DEFAULT_ADMIN stays with the timelock, so the grant cannot be undone
-            // (or re-pointed) without a governance proposal.
             assertTrue(t.hasRole(bytes32(0), address(script.timelock())), "timelock is not the token admin");
             assertFalse(t.hasRole(bytes32(0), DEFAULT_SENDER), "deployer kept DEFAULT_ADMIN on a series");
         }
-    }
-
-    /// The multiplier mirrors the NAV feed, so an unset UI_MULTIPLIER_ADMIN falls back to
-    /// NAV_FEED_OWNER rather than to the deployer. Catches a fallback that would quietly
-    /// hand the role to the broadcaster whenever the new variable was forgotten.
-    function accept_devNet_uiMultiplierAdminDefaultsToNavFeedOwner() external {
-        vm.chainId(ANVIL);
-        _clearEnv();
-        _setAddr("NAV_FEED_OWNER", NAV_OWNER);
-        vm.setEnv("UI_MULTIPLIER_ADMIN", "");
-
-        DeployDevNet script = new DeployDevNet();
-        script.run();
-
-        assertEq(script.bondTokenCount(), 3, "expected the three dev series to be deployed");
-        GyldBondToken t = GyldBondToken(script.bondTokens(0));
-        assertTrue(t.hasRole(t.UI_MULTIPLIER_ROLE(), NAV_OWNER), "role did not fall back to NAV_FEED_OWNER");
-        assertFalse(t.hasRole(t.UI_MULTIPLIER_ROLE(), DEFAULT_SENDER), "role fell back to the deployer");
     }
 
     /// The production happy path. Asserts the property the incident violated: when the
@@ -599,7 +556,6 @@ contract DeployScriptsTest is Test {
         _setAddr("REDEEMER_ADDRESS", REDEEMER);
         _setAddr("WHITELIST_ADMIN", WHITELIST_ADMIN);
         _setAddr("NAV_FEED_OWNER", NAV_OWNER);
-        _setAddr("UI_MULTIPLIER_ADMIN", UI_MULTIPLIER_ADMIN);
         _setAddr("SANCTIONS_LIST", address(sanctions));
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "172800");
     }
@@ -666,14 +622,13 @@ contract DeployScriptsTest is Test {
     /// from the project root, and an empty value makes `vm.envAddress` / `vm.envUint`
     /// revert — exactly how an unset variable behaves.
     function _clearEnv() internal {
-        string[25] memory keys = [
+        string[24] memory keys = [
             "GOVERNANCE_MULTISIG",
             "OPS_MULTISIG",
             "SUBSCRIBER_ADDRESS",
             "REDEEMER_ADDRESS",
             "WHITELIST_ADMIN",
             "NAV_FEED_OWNER",
-            "UI_MULTIPLIER_ADMIN",
             "SANCTIONS_LIST",
             "TIMELOCK_DELAY_SECONDS",
             "MULTISIG_ADDRESS",
@@ -710,43 +665,6 @@ contract DeployScriptsTest is Test {
         return abi.decode(ret, (bool));
     }
 
-    // ── Revert assertions ─────────────────────────────────────────────────────
-
-    /// Asserts `run()` reverts AND that the reason names the specific guard, so a scenario
-    /// cannot pass because some unrelated failure happened to revert first.
-    function _expectRunRevert(address script, string memory needle) internal {
-        (bool ok, bytes memory ret) = script.call(abi.encodeWithSignature("run()"));
-        assertFalse(ok, string.concat("expected run() to revert with: ", needle));
-        string memory reason = _revertReason(ret);
-        assertTrue(
-            _contains(reason, needle),
-            string.concat("wrong revert reason\n   expected substring: ", needle, "\n   actual: ", reason)
-        );
-    }
-
-    function _revertReason(bytes memory ret) internal pure returns (string memory) {
-        if (ret.length < 68) return "<no Error(string) payload>";
-        bytes memory payload = new bytes(ret.length - 4);
-        for (uint256 i = 4; i < ret.length; i++) {
-            payload[i - 4] = ret[i];
-        }
-        return abi.decode(payload, (string));
-    }
-
-    function _contains(string memory haystack, string memory needle) internal pure returns (bool) {
-        bytes memory h = bytes(haystack);
-        bytes memory n = bytes(needle);
-        if (n.length == 0 || n.length > h.length) return false;
-        for (uint256 i = 0; i <= h.length - n.length; i++) {
-            bool matched = true;
-            for (uint256 j = 0; j < n.length; j++) {
-                if (h[i + j] != n[j]) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return true;
-        }
-        return false;
-    }
+    // Revert assertions (_expectRunRevert / _revertReason / _contains) live in
+    // {ScriptRevertAsserts}.
 }

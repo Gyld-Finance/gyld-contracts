@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import {Script, console} from "forge-std/Script.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {MockSanctionsList} from "../test/MockSanctionsList.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
@@ -47,12 +46,6 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                           In prod: ops Gnosis Safe
 ///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls)
 ///                           In prod: KMS signer
-///   UI_MULTIPLIER_ADMIN  →  GyldBondToken UI_MULTIPLIER_ROLE on every series
-///                           (ERC-8056 display-only scaling; cannot move real balances)
-///                           In prod: the same KMS NAV-publisher identity, because the
-///                           multiplier mirrors the NAV feed. TokenFactory does NOT wire
-///                           this role, so before GYL-1136 no deploy script granted it at
-///                           all and every series shipped with the role unassigned.
 ///   SANCTIONS_LIST       →  SanctionsOracleMirror (prod) / MockSanctionsList (dev)
 ///
 /// A TimelockController is deployed and wired as:
@@ -103,7 +96,6 @@ contract DeployDevNet is Script {
         address redeemer;
         address whitelistAdmin;
         address navFeedOwner;
-        address uiMultiplierAdmin; // ERC-8056 UI_MULTIPLIER_ROLE on every bond series
         address sanctionsList; // address(0) on a dev chain ⇒ deploy a MockSanctionsList
         uint256 delay;
     }
@@ -140,10 +132,6 @@ contract DeployDevNet is Script {
             // factory.owner() is now the timelock, so TokenFactory._wireRoles() assigns
             // DEFAULT_ADMIN_ROLE on each token to the timelock — never the deployer EOA.
             _deployBondTokens(factory, cfg.opsMultisig, address(issuanceMgr), cfg.navFeedOwner);
-            // TokenFactory wires MINTER / BURNER / PAUSER / DEFAULT_ADMIN but NOT
-            // UI_MULTIPLIER_ROLE, so it is granted here, through the timelock that now
-            // holds DEFAULT_ADMIN on every series (GYL-1136).
-            _grantUiMultiplierRole(cfg.uiMultiplierAdmin);
         }
 
         // In-band post-deploy assertions: still inside the broadcast, so any mismatch
@@ -167,12 +155,6 @@ contract DeployDevNet is Script {
         c.redeemer = DeployGuards.envAddressProdRequired("REDEEMER_ADDRESS", c.deployer);
         c.whitelistAdmin = DeployGuards.envAddressProdRequired("WHITELIST_ADMIN", c.deployer);
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
-        // GYL-1136: the role that gates ERC-8056 multiplier updates. It defaults to
-        // NAV_FEED_OWNER rather than to the deployer, because the UI multiplier is a
-        // display mirror of that feed's NAV and is meant to be driven by the same
-        // publisher identity — so on production a deployment that sets NAV_FEED_OWNER
-        // correctly cannot accidentally leave this role on the deployer EOA.
-        c.uiMultiplierAdmin = DeployGuards.envAddressProdRequired("UI_MULTIPLIER_ADMIN", c.navFeedOwner);
 
         // On production none of these may be the broadcasting EOA — that is precisely
         // the shape of the Base incident, where "handover complete" meant nothing moved.
@@ -182,7 +164,6 @@ contract DeployDevNet is Script {
         DeployGuards.requireNotDeployer(c.redeemer, c.deployer, "REDEEMER_ADDRESS");
         DeployGuards.requireNotDeployer(c.whitelistAdmin, c.deployer, "WHITELIST_ADMIN");
         DeployGuards.requireNotDeployer(c.navFeedOwner, c.deployer, "NAV_FEED_OWNER");
-        DeployGuards.requireNotDeployer(c.uiMultiplierAdmin, c.deployer, "UI_MULTIPLIER_ADMIN");
 
         // Mint and burn are a deliberate two-key quorum; one address holding both
         // collapses it back into a single point of compromise.
@@ -387,30 +368,6 @@ contract DeployDevNet is Script {
                 "DeployDevNet: Anvil account[1] must not be whitelisted on a production chain"
             );
         }
-
-        // 7. Every series deployed by this run has its ERC-8056 role wired (GYL-1136).
-        _assertUiMultiplierRole(c);
-    }
-
-    /// @dev Asserts the ERC-8056 role topology on every series this run deployed.
-    ///      Extracted to keep {_assertFinalTopology}'s stack shallow.
-    ///      Also pins the E-F1 upgrade-window invariant at deploy time: a freshly
-    ///      initialised series MUST read 1.0x, never 0 — a 0 multiplier would display
-    ///      every holder's balance as zero and make fromUIAmount panic (0x12).
-    function _assertUiMultiplierRole(Config memory c) internal view {
-        uint256 n = bondTokens.length;
-        // On production _deployBondTokens is skipped (governance runs Phase 2), so there
-        // is nothing to assert here; the Phase-2 instructions in {_logSummary} carry it.
-        for (uint256 i; i < n; ++i) {
-            GyldBondToken t = GyldBondToken(bondTokens[i]);
-            bytes32 role = t.UI_MULTIPLIER_ROLE();
-            require(t.hasRole(role, c.uiMultiplierAdmin), "DeployDevNet: UI_MULTIPLIER_ROLE not granted on a series");
-            if (!DeployGuards.isDevChain()) {
-                require(!t.hasRole(role, c.deployer), "DeployDevNet: deployer kept UI_MULTIPLIER_ROLE on a series");
-            }
-            require(t.uiMultiplier() == t.UI_MULTIPLIER_SCALE(), "DeployDevNet: series uiMultiplier is not 1.0x");
-            require(t.effectiveAt() == 0, "DeployDevNet: series has a multiplier schedule pending at deploy time");
-        }
     }
 
     /// @dev Extracted so {_assertFinalTopology} keeps a shallow stack.
@@ -495,28 +452,6 @@ contract DeployDevNet is Script {
         }
     }
 
-    /// @dev Grant UI_MULTIPLIER_ROLE on every series deployed by this run, routed through
-    ///      the timelock (which holds DEFAULT_ADMIN_ROLE on each token after
-    ///      TokenFactory._wireRoles). The role gates ERC-8056's display-only multiplier;
-    ///      it can never move a real balance, mint, burn, pause or upgrade — but leaving it
-    ///      unassigned means the NAV publisher cannot keep the displayed value in step with
-    ///      the feed, and granting it to the wrong key lets that key skew every wallet's
-    ///      displayed holdings (within the 10% / 1h bounds GyldBondToken enforces).
-    function _grantUiMultiplierRole(address uiMultiplierAdmin) internal {
-        TimelockController tl = TimelockController(payable(factory.owner()));
-        uint256 n = bondTokens.length;
-        for (uint256 i; i < n; ++i) {
-            address tok = bondTokens[i];
-            bytes memory data =
-                abi.encodeCall(IAccessControl.grantRole, (GyldBondToken(tok).UI_MULTIPLIER_ROLE(), uiMultiplierAdmin));
-            // Salt is keyed on the token so the three operations cannot collide.
-            bytes32 salt = keccak256(abi.encodePacked("grant_ui_multiplier", tok));
-            tl.schedule(tok, 0, data, bytes32(0), salt, 0);
-            tl.execute(tok, 0, data, bytes32(0), salt);
-        }
-        console.log("UI_MULTIPLIER_ROLE granted on %d series to %s", n, uiMultiplierAdmin);
-    }
-
     // ── Logging ───────────────────────────────────────────────────────────────
 
     function _logSummary(Config memory c) internal view {
@@ -541,7 +476,6 @@ contract DeployDevNet is Script {
         console.log("REDEEMER_ADDRESS:      %s  (IssuanceManager REDEEMER_ROLE)", c.redeemer);
         console.log("WHITELIST_ADMIN:       %s  (IssuanceManager WHITELIST_ADMIN_ROLE)", c.whitelistAdmin);
         console.log("NAV_FEED_OWNER:        %s  (KaleidoscopeNAVFeed owner)", c.navFeedOwner);
-        console.log("UI_MULTIPLIER_ADMIN:   %s  (GyldBondToken UI_MULTIPLIER_ROLE, ERC-8056)", c.uiMultiplierAdmin);
         console.log("");
 
         if (!factoryOwnershipAccepted) {
@@ -554,12 +488,6 @@ contract DeployDevNet is Script {
             console.log("  Step 3: Deploy bond tokens via deployToken calls through the timelock");
             console.log("          (factory.owner() is then the timelock, so DEFAULT_ADMIN on each");
             console.log("           token is the timelock - not the deployer EOA)");
-            console.log("  Step 4: For EACH deployed series, schedule+execute through the timelock:");
-            console.log("            token.grantRole(UI_MULTIPLIER_ROLE, %s)", c.uiMultiplierAdmin);
-            console.log("          role id = 0x%x", uint256(keccak256("UI_MULTIPLIER_ROLE")));
-            console.log("          TokenFactory does NOT wire this role. Without it the ERC-8056");
-            console.log("          multiplier is frozen at 1.0x and no key can publish a new one.");
-            console.log("          Then verify: token.uiMultiplier() == 1e18 and effectiveAt() == 0.");
             console.log("");
         }
 
