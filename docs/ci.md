@@ -11,8 +11,9 @@ in a separate workflow so this one stays trustless.
 
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
-| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 496 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
+| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 501 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
 | `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
+| `storage-layout` | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff, which is exactly the review step this job replaces. See "Storage layout" below |
 | `coverage` | `forge coverage --ir-minimum --report summary`, at reduced fuzz intensity, publishing the table to the run summary. **Non-blocking** (`continue-on-error: true`, no threshold) | Nothing, by design — it is a trend instrument, not a gate. See "Coverage" below for what the number is and is not |
 
 ## Why full fuzz intensity on every push
@@ -26,6 +27,90 @@ dialled down and there is no separate nightly: every push gets the same
 scrutiny. If suite runtime ever grows past ~10 minutes, split intensity then —
 reduced per-push via `FOUNDRY_FUZZ_RUNS` / `FOUNDRY_INVARIANT_RUNS` env
 overrides, full on a schedule.
+
+## Storage layout
+
+`GyldAtomicSwap`, `GyldBondToken` and `IssuanceManager` are UUPS proxies whose
+state lives in an ERC-7201 namespaced struct at a computed base slot. On upgrade
+the proxy keeps the old storage and runs the new code, so the new struct has to
+describe the same bytes at the same offsets the old one did. Neither `solc`,
+`forge build` nor `forge test` checks that — and both known violations were
+found by a human reading a diff:
+
+- **`GyldAtomicSwap.maxQuoteTtl`** — appended, then seeded only in
+  `initialize()`. An already-deployed proxy never re-runs `initialize()`, so it
+  read 0 from the fresh slot and `executeSwap` rejected every quote. Fixed by
+  reading through `_effectiveMaxQuoteTtl()`, which treats 0 as "unset".
+- **`GyldBondToken`** — a removed ERC-8056 extension left non-zero values at
+  offsets B+3..B+5 on two orphaned testnet proxies. Removing a field does not
+  clear its slot; it just stops anything from naming it.
+
+`ci/storage-layouts/<Contract>.json` pins, per contract: the ERC-7201 namespace,
+the `_STORAGE_LOCATION` base slot, the struct name, and every field's name,
+slot-relative-to-base, byte offset, width and type. The checker regenerates all
+of it and fails on any difference, naming the field and the old → new
+slot/offset/type. It classifies each drift as **append-only** (new fields
+strictly after every untouched old one) or **BREAKING** (anything else), and the
+failure text differs accordingly.
+
+### How the layout is obtained
+
+`forge inspect GyldAtomicSwap storageLayout` returns `{"storage": [], "types":
+{}}`, and that is correct rather than the usual `via_ir` breakage: ERC-7201
+state is not a declared state variable, so the contract genuinely has no layout
+to report. The struct only acquires one when something declares it as a
+variable, so the checker writes a throwaway probe —
+
+```solidity
+contract Probe_GyldAtomicSwap { GyldAtomicSwap.GyldAtomicSwapStorage internal s; }
+```
+
+— into a temp directory and inspects *that*. The probe run is hermetic (its own
+`src`, `out` and `cache`), which keeps your `out/` untouched, avoids the real
+`via_ir` failure mode here (`forge inspect` against a warm `out/` built without
+the `storageLayout` output selector dies with "storage layout missing from
+artifact"), and means only the three contracts plus imports compile: **~2 s
+cold**, so the job needs no build cache.
+
+Snapshots drop solc's `astId` and `contract` keys and resolve type ids to their
+human labels (`uint64`, `mapping(address => bool)`, `contract ISanctionsList`).
+Both the ids and the astIds shift whenever unrelated code above them changes; a
+raw snapshot would churn on every edit and train people to run `--write`
+reflexively, which is the one failure mode that would make this job worthless.
+
+### Updating a baseline
+
+```bash
+python3 ci/check_storage_layout.py --write   # then read `git diff` and commit
+```
+
+Legitimate appends will happen, so this has to be easy. It should not be
+thoughtless: **for a contract that is already deployed, updating a baseline is a
+migration decision, not a formality.** The baseline only records what the code
+says; the proxies keep their old bytes regardless. Know which proxies exist
+(`DEPLOYMENTS.md`), what sits in the affected slots, and how they reach the new
+shape — and say so in the commit message. Note that an append is *also* not free:
+the new field reads zero on every pre-existing proxy, which is precisely the
+`maxQuoteTtl` bug, so either fall back on zero in the getter or add a
+reinitializer and actually run it.
+
+### What it does not catch
+
+- **Inherited (non-namespaced) storage.** Only the ERC-7201 struct is pinned.
+  If an OpenZeppelin base contract's own layout changed under a submodule bump,
+  this job is silent. The three contracts declare no slot-0 state of their own,
+  so there is nothing else local to pin.
+- **Changes inside a struct reached only through a mapping or array.** The
+  recursion follows nested struct *members*, but a struct used as a mapping
+  value or array element is pinned by its label and width only, so reordering
+  *its* fields would pass. No such struct exists today.
+- **Whether the deployed implementation matches this source.** The baseline is a
+  property of the tree, not of any chain. It cannot tell you that a live proxy's
+  storage actually has the shape recorded here — only that the shape has not
+  changed since the last deliberate `--write`.
+- **Semantic reuse of a slot.** Renaming `foo` to `bar` at the same slot, width
+  and type reads as REMOVED + INSERTED and fails loudly, which is right. But
+  repurposing a field's *meaning* while keeping name and type is invisible.
 
 ## Coverage
 
@@ -149,6 +234,7 @@ the code changed, not the environment. Bump the pins deliberately.
 ```bash
 forge test -vvv                      # same command, same foundry.toml intensity
 python3 ci/check_chain_guards.py     # the chain-guard scan; exit 1 on violation
+python3 ci/check_storage_layout.py   # ERC-7201 layout diff; exit 1 on drift, 2 on tooling failure
 
 # Coverage. --ir-minimum is mandatory (via_ir breaks instrumentation); without
 # it forge emits no table at all. The env overrides match the CI job and are
@@ -172,6 +258,21 @@ CI log if you need the exact case.
   `contracts/test/GyldAtomicSwap.spec.t.sol:599`) plus ~40 `forge lint` notes
   (`erc20-unchecked-transfer`, `unsafe-typecast`). Same rule: fix first, then
   enforce, otherwise the job starts red.
+- **`openzeppelin-foundry-upgrades` (`Upgrades.validateUpgrade`)** — considered
+  instead of `storage-layout`, rejected. It is a new submodule plus an npm
+  dependency (`@openzeppelin/upgrades-core`) reached through `ffi = true`, and
+  this workflow's whole claim is that it cannot touch the outside world; turning
+  on `ffi` to get a layout diff trades that away for something one Python script
+  and a checked-in JSON already do. It also wants a "before" *contract* to
+  compare against, which means keeping old implementations in the tree, whereas
+  a baseline file compares against the last deliberate decision. Revisit if we
+  ever need its other checks (constructor/`selfdestruct`/`delegatecall`
+  validation), and if so put it behind its own workflow.
+- **A checked-in probe contract under `contracts/`** — the probe has to exist for
+  solc to emit an ERC-7201 struct's layout at all, but a permanent one would be
+  compiled by every `forge build` and every `forge test`, and would show up in
+  coverage tables, for the benefit of one CI script. It is generated into a temp
+  directory instead and deleted in a `finally`.
 - **Gas snapshots** — no `.gas-snapshot` baseline exists, most hot paths are
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.

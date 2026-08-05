@@ -1,0 +1,30 @@
+{
+  "baseSlot": "0x0fe35ba304a016e79d78a184eb899c1e21310138e0bfe9a54648a2dfe0da0d00",
+  "contract": "GyldBondToken",
+  "fields": [
+    {
+      "bytes": 20,
+      "name": "sanctionsList",
+      "offset": 0,
+      "slot": 0,
+      "type": "contract ISanctionsList"
+    },
+    {
+      "bytes": 32,
+      "name": "isin",
+      "offset": 0,
+      "slot": 1,
+      "type": "string"
+    },
+    {
+      "bytes": 32,
+      "name": "maturityTimestamp",
+      "offset": 0,
+      "slot": 2,
+      "type": "uint256"
+    }
+  ],
+  "namespace": "gyld.GyldBondToken",
+  "source": "contracts/GyldBondToken.sol",
+  "struct": "GyldBondTokenStorage"
+}

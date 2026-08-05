@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Full-intensity suite on every push: 487 tests, fuzz runs = 10000,
+  # Full-intensity suite on every push: 501 tests, fuzz runs = 10000,
   # invariant runs = 1000 x depth 50 (the foundry.toml defaults — nothing is
   # dialled down; the whole suite runs in seconds, see docs/ci.md).
   test:
@@ -77,6 +77,33 @@ jobs:
 
       - name: Scan contracts/script for block.chainid != guards
         run: python3 ci/check_chain_guards.py
+
+  # Guards against the GYL-1208 bug class: an ERC-7201 storage field that moves,
+  # resizes, reorders or disappears between implementations, which silently
+  # re-points storage on an already-deployed proxy. See
+  # ci/check_storage_layout.py for the full story.
+  #
+  # Needs Foundry and submodules (unlike chain-guard, it compiles), but not the
+  # build cache: the script points `src` at a throwaway probe contract, so only
+  # the three upgradeable contracts and their imports compile — ~2 s cold.
+  storage-layout:
+    name: ERC-7201 storage layout unchanged
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (lib/ dependencies are git submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Foundry (pinned to the version the team runs locally)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.5.1
+          cache: false
+
+      - name: Compare ERC-7201 layouts against ci/storage-layouts/
+        run: python3 ci/check_storage_layout.py
 
   # Informational only. Reports line/statement/branch/function coverage and
   # never fails the build: `continue-on-error: true` and no threshold gate.

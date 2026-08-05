@@ -1,0 +1,86 @@
+{
+  "baseSlot": "0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300",
+  "contract": "GyldAtomicSwap",
+  "fields": [
+    {
+      "bytes": 8,
+      "name": "quoteEpoch",
+      "offset": 0,
+      "slot": 0,
+      "type": "uint64"
+    },
+    {
+      "bytes": 2,
+      "name": "maxQuoteDeviationBps",
+      "offset": 8,
+      "slot": 0,
+      "type": "uint16"
+    },
+    {
+      "bytes": 4,
+      "name": "maxNavAgeSecs",
+      "offset": 10,
+      "slot": 0,
+      "type": "uint32"
+    },
+    {
+      "bytes": 20,
+      "name": "withdrawalWallet",
+      "offset": 0,
+      "slot": 1,
+      "type": "address"
+    },
+    {
+      "bytes": 20,
+      "name": "usdc",
+      "offset": 0,
+      "slot": 2,
+      "type": "address"
+    },
+    {
+      "bytes": 32,
+      "name": "usedQuoteWords",
+      "offset": 0,
+      "slot": 3,
+      "type": "mapping(uint256 => uint256)"
+    },
+    {
+      "bytes": 32,
+      "name": "seriesList",
+      "offset": 0,
+      "slot": 4,
+      "type": "address[]"
+    },
+    {
+      "bytes": 32,
+      "name": "registeredSeries",
+      "offset": 0,
+      "slot": 5,
+      "type": "mapping(address => bool)"
+    },
+    {
+      "bytes": 32,
+      "name": "navForwarderOf",
+      "offset": 0,
+      "slot": 6,
+      "type": "mapping(address => address)"
+    },
+    {
+      "bytes": 32,
+      "name": "allowed",
+      "offset": 0,
+      "slot": 7,
+      "type": "mapping(address => bool)"
+    },
+    {
+      "bytes": 8,
+      "name": "maxQuoteTtl",
+      "offset": 0,
+      "slot": 8,
+      "type": "uint64"
+    }
+  ],
+  "namespace": "gyld.GyldAtomicSwap",
+  "source": "contracts/GyldAtomicSwap.sol",
+  "struct": "GyldAtomicSwapStorage"
+}

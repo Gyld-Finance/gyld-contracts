@@ -1,0 +1,23 @@
+{
+  "baseSlot": "0xc8552dd465c7174389604c2ad1f48bf21d46f65ee8d42bbd0456923afc111000",
+  "contract": "IssuanceManager",
+  "fields": [
+    {
+      "bytes": 32,
+      "name": "whitelisted",
+      "offset": 0,
+      "slot": 0,
+      "type": "mapping(address => bool)"
+    },
+    {
+      "bytes": 32,
+      "name": "registeredTokens",
+      "offset": 0,
+      "slot": 1,
+      "type": "mapping(address => bool)"
+    }
+  ],
+  "namespace": "gyld.IssuanceManager",
+  "source": "contracts/IssuanceManager.sol",
+  "struct": "IssuanceManagerStorage"
+}
