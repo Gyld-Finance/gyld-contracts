@@ -1,0 +1,156 @@
+# Gyld contracts CI — see docs/ci.md for what runs, why, and how to reproduce
+# failures locally.
+#
+# This workflow is structurally incapable of touching a real network:
+#   - it references no secrets, so no RPC URL and no key material ever exist
+#     on the runner (a broadcast needs a funded key; there is none);
+#   - the test suite contains no fork cheatcodes (no vm.createFork / ffi);
+#   - GITHUB_TOKEN is restricted to contents: read.
+# Keep it that way. If a future job genuinely needs a secret, put it in a
+# separate workflow so this one stays trustless.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Full-intensity suite on every push: 487 tests, fuzz runs = 10000,
+  # invariant runs = 1000 x depth 50 (the foundry.toml defaults — nothing is
+  # dialled down; the whole suite runs in seconds, see docs/ci.md).
+  test:
+    name: forge test (full fuzz + invariants)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (lib/ dependencies are git submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Foundry (pinned to the version the team runs locally)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.5.1
+          # The toolchain's built-in cache stores RPC responses; this workflow
+          # never makes an RPC call, so it would only add noise.
+          cache: false
+
+      - name: Cache build artifacts (via_ir compiles are the slow part)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            cache
+            out
+            ~/.svm
+          key: foundry-build-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            foundry-build-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-
+
+      - name: Build
+        run: forge build
+
+      - name: Test
+        # -vvv prints traces for failing tests only; passing tests stay one line.
+        run: forge test -vvv
+
+  # Guards against the GYL-1135 bug class: denylist chain guards
+  # (`block.chainid != 1`) in deploy scripts, which every L2 walks straight
+  # past. See ci/check_chain_guards.py for the full story.
+  chain-guard:
+    name: no denylist chain guards in deploy scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (no submodules needed — plain text scan)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan contracts/script for block.chainid != guards
+        run: python3 ci/check_chain_guards.py
+
+  # Informational only. Reports line/statement/branch/function coverage and
+  # never fails the build: `continue-on-error: true` and no threshold gate.
+  #
+  # Two things to know before trusting the number, both expanded in docs/ci.md:
+  #   1. `via_ir = true` breaks solc's coverage instrumentation, so this job
+  #      compiles with `--ir-minimum`. The percentages therefore describe
+  #      *differently compiled* bytecode than the one that ships.
+  #   2. There is deliberately no minimum. A gate picked on the first-ever
+  #      measurement would be an arbitrary number defended as if it were a
+  #      standard. Watch the trend, and gate later if the trend justifies one.
+  coverage:
+    name: forge coverage (informational, non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Checkout (lib/ dependencies are git submodules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Foundry (pinned to the version the team runs locally)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.5.1
+          cache: false
+
+      # Separate cache namespace from the `test` job on purpose: --ir-minimum
+      # compiles the same sources with different settings, so a shared `out/`
+      # would have the two jobs evicting each other's artifacts every run.
+      - name: Cache build artifacts (--ir-minimum artifacts, distinct from test)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            cache
+            out
+            ~/.svm
+          key: foundry-coverage-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            foundry-coverage-${{ runner.os }}-${{ hashFiles('foundry.toml', 'foundry.lock', '.gitmodules') }}-
+
+      - name: forge coverage --ir-minimum
+        # Fuzz/invariant intensity is dialled down HERE ONLY. Coverage asks
+        # "was this line ever reached", which 256 fuzz runs answer as well as
+        # 10000. Measured: these overrides produce a byte-identical coverage
+        # table (1053/1618 lines) in 1.4 s of test time versus 44 s at full
+        # intensity. The `test` job still runs the full foundry.toml intensity,
+        # so nothing about the actual regression signal is reduced.
+        env:
+          FOUNDRY_FUZZ_RUNS: 256
+          FOUNDRY_INVARIANT_RUNS: 64
+          FOUNDRY_INVARIANT_DEPTH: 25
+        run: forge coverage --ir-minimum --report summary 2>&1 | tee coverage.txt
+
+      - name: Publish the summary table to the run summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage (informational — never fails the build)'
+            echo
+            echo 'Measured on `--ir-minimum` bytecode, **not** the `via_ir` bytecode that ships,'
+            echo 'and at reduced fuzz intensity. See `docs/ci.md` for what this does and does not tell you.'
+            echo
+            echo '```'
+            # The coverage table is the only one with a "% Lines" header, so print
+            # from there to EOF. Do NOT reach for "the last table printed": on a
+            # failed run that is an invariant handler table, which would get
+            # published as if it were coverage.
+            if grep -q '% Lines' coverage.txt; then
+              sed -n '/% Lines/,$p' coverage.txt
+            else
+              echo 'No coverage table was produced — the run failed. Tail of the log:'
+              tail -40 coverage.txt
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -36,7 +36,7 @@ contract GyldBondTokenTest is Test {
 
     function setUp() public {
         holderAddr    = vm.addr(HOLDER_PK);
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
 
         // ── GyldBondToken proxy ───────────────────────────────────────────────
         GyldBondToken tokenImpl = new GyldBondToken();
@@ -191,6 +191,46 @@ contract GyldBondTokenTest is Test {
     // ═════════════════════════════════════════════════════════════════════════
     // Gap 3 — storage layout compatibility after a UUPS upgrade
     // ═════════════════════════════════════════════════════════════════════════
+
+    /// Pin every field of the ERC-7201 namespaced struct against its raw storage slot.
+    ///
+    /// This is the test that fails if someone INSERTS or REORDERS a field rather than
+    /// appending one. `sanctionsList` / `isin` / `maturityTimestamp` must keep offsets
+    /// 0/1/2 forever — every live proxy already has data there, so a reordering silently
+    /// reinterprets that storage on the next upgrade.
+    ///
+    /// The namespace root is DERIVED here from the same expression the contract uses
+    /// rather than copy-pasted as a literal, so the test cannot drift from the contract's
+    /// declared storage-location namespace while still appearing to pass.
+    ///
+    /// The final assertion pins the END of the struct: `GyldBondTokenStorage` has exactly
+    /// three fields, so offset 3 must be untouched. A future field MUST be APPENDED at
+    /// offset 3 (never inserted) — doing so is expected to fail this assertion, which is
+    /// the intended prompt to extend the pins below rather than a reason to delete them.
+    function test_storageLayout_erc7201OffsetsArePinned() public view {
+        bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1))
+            & ~bytes32(uint256(0xff));
+
+        assertEq(
+            address(uint160(uint256(vm.load(address(token), bytes32(uint256(root) + 0))))),
+            address(mockSanctions),
+            "offset 0 is not sanctionsList"
+        );
+        // Short strings are stored inline as (data | 2*length) in the same slot.
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(root) + 1))) & 0xff,
+            2 * bytes(token.isin()).length,
+            "offset 1 is not isin"
+        );
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(root) + 2))),
+            token.maturityTimestamp(),
+            "offset 2 is not maturityTimestamp"
+        );
+
+        // Nothing is written past the struct's three fields.
+        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 3))), 0, "wrote past offset 2");
+    }
 
     /// Upgrading to V2 preserves all existing state: balances, ISIN, maturity,
     /// sanctions list pointer. This is the regression net for future upgrades.
@@ -360,7 +400,7 @@ contract GyldBondTokenTest is Test {
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
     function test_setSanctionsList_validOracle_succeeds() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(admin);
         token.setSanctionsList(address(newOracle));
         assertEq(address(token.sanctionsList()), address(newOracle));
@@ -388,7 +428,7 @@ contract GyldBondTokenTest is Test {
     }
 
     function test_setSanctionsList_onlyAdmin_reverts() public {
-        MockSanctionsList newOracle = new MockSanctionsList();
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
         vm.prank(address(0xDEAD));
         vm.expectRevert();
         token.setSanctionsList(address(newOracle));
@@ -413,6 +453,41 @@ contract GyldBondTokenTest is Test {
         vm.prank(pauser2);
         token.renounceRole(pauserRole, pauser2);
         assertFalse(token.hasRole(pauserRole, pauser2));
+    }
+
+    // ── decimals() is a cross-contract invariant ──────────────────────────────
+
+    /// GyldAtomicSwap prices every quote with a hard-coded divisor:
+    ///     navValue = tokenAmount * nav / 1e20,   20 = 18 (bond) + 8 (NAV) - 6 (cash)
+    /// so 18 decimals here is not cosmetic — it is an input to someone else's arithmetic.
+    /// A series reporting 7..17 decimals silently UNDER-prices (a 12dp token makes navValue
+    /// 10^6 too small, letting a taker pay ~$0.001 for ~$1,000 of bonds); <=6 truncates
+    /// navValue to zero and bricks the series.
+    ///
+    /// registerSeries staticcall-probes for exactly 18, but only ONCE at registration — an
+    /// implementation upgrade adding a `decimals()` override would bypass that probe for
+    /// every series already registered, and nothing on-chain would notice. This test is
+    /// that missing tripwire: it fails in CI before such an override could ship.
+    /// If a series ever genuinely needs different precision, change the swap's scaling to a
+    /// per-series factor FIRST, then this test.
+    function test_decimals_is18_swapBandDependsOnIt() public view {
+        assertEq(token.decimals(), 18, "GyldAtomicSwap's /1e20 band divisor assumes 18 decimals");
+    }
+
+    /// The same invariant, stated the way it can actually break: `decimals()` is inherited
+    /// from ERC20Upgradeable as a hard-coded `return 18` with no storage behind it, so it
+    /// cannot drift at runtime — only a new implementation can change it. Prove an upgrade
+    /// that does NOT touch decimals leaves it intact, so this test isolates the override
+    /// case rather than incidentally passing because nothing was upgraded.
+    function test_decimals_survivesUpgrade() public {
+        assertEq(token.decimals(), 18);
+
+        GyldBondTokenV2 v2 = new GyldBondTokenV2();
+        vm.prank(admin);
+        token.upgradeToAndCall(address(v2), "");
+
+        assertEq(GyldBondTokenV2(address(token)).version(), 2, "precondition: the upgrade landed");
+        assertEq(token.decimals(), 18, "decimals must not move across an upgrade");
     }
 }
 

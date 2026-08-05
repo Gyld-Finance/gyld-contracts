@@ -262,6 +262,101 @@ contract NAVFeedForwarderTest is Test {
         vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, stub));
         forwarder.setUpstreamOracle(stub);
     }
+
+    // ── future-dated upstream rejection (GYL-1135) ───────────────────────────
+
+    /// The defect: every consumer of this forwarder defends itself against a dead feed
+    /// with `block.timestamp - updatedAt <= maxAge`. An upstream that reports an
+    /// `updatedAt` in the FUTURE satisfies that check unconditionally — so one
+    /// setUpstreamOracle call would silently disarm the staleness defence of every
+    /// integrator at once (Morpho, Euler, GyldAtomicSwap), with nothing in the
+    /// UpstreamOracleUpdated event that reads as anomalous. That fails OPEN, which is
+    /// strictly worse than the stale-feed case that fails closed and loudly.
+    /// decimals()/version() cannot catch it: a synthetic-fresh oracle answers both
+    /// perfectly.
+    function test_setUpstreamOracle_rejectsFutureDatedUpstream() public {
+        vm.warp(1_000_000);
+        MockFutureDatedOracle bad = new MockFutureDatedOracle(block.timestamp + 1);
+
+        vm.prank(forwarderOwner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                NAVFeedForwarder.UpstreamFutureDated.selector, block.timestamp + 1, block.timestamp
+            )
+        );
+        forwarder.setUpstreamOracle(address(bad));
+
+        // Rejected before any state change — the old upstream is still installed.
+        assertEq(forwarder.upstreamOracle(), address(feedV1), "a rejected probe must not swap the pointer");
+    }
+
+    function test_constructor_rejectsFutureDatedUpstream() public {
+        vm.warp(1_000_000);
+        MockFutureDatedOracle bad = new MockFutureDatedOracle(block.timestamp + 365 days);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                NAVFeedForwarder.UpstreamFutureDated.selector, block.timestamp + 365 days, block.timestamp
+            )
+        );
+        new NAVFeedForwarder(address(bad), forwarderOwner);
+    }
+
+    /// updatedAt == block.timestamp is the honest case for an oracle updated in this
+    /// very block — it must NOT be rejected. Only strictly-future is a lie.
+    function test_setUpstreamOracle_acceptsUpdatedAtEqualToNow() public {
+        vm.warp(1_000_000);
+        MockFutureDatedOracle atNow = new MockFutureDatedOracle(block.timestamp);
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(atNow));
+        assertEq(forwarder.upstreamOracle(), address(atNow));
+    }
+
+    /// A stale-but-honest upstream is still a legitimate swap target. The probe rejects
+    /// lying about time, not being old — freezing oracle migrations during an outage is
+    /// precisely the wrong time to be unable to migrate.
+    function test_setUpstreamOracle_acceptsStaleButHonestUpstream() public {
+        vm.warp(1_750_000_000);
+        MockFutureDatedOracle old = new MockFutureDatedOracle(block.timestamp - 500 days);
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(old));
+        assertEq(forwarder.upstreamOracle(), address(old));
+    }
+
+    /// The probe must stay tolerant of an upstream whose latestRoundData REVERTS: a
+    /// freshly deployed KaleidoscopeNAVFeed reverts NoPriceSet until its first push,
+    /// and installing it before that push is a legitimate deploy order. (Duplicated
+    /// intent with test_setUpstreamOracle_freshFeedWithNoPrice_succeeds above, kept
+    /// separate because this one guards the new probe specifically.)
+    function test_setUpstreamOracle_revertingLatestRoundData_stillAccepted() public {
+        assertEq(feedV2.stalenessSeconds(), type(uint256).max, "feedV2 must have no price for this test");
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(feedV2));
+        assertEq(forwarder.upstreamOracle(), address(feedV2));
+    }
+}
+
+/// @dev Oracle stub with a settable `updatedAt`, used to test the future-dated probe.
+///      Answers decimals()/version() correctly so it clears the existing probes —
+///      the point is that a synthetic-fresh oracle is indistinguishable by those.
+contract MockFutureDatedOracle {
+    uint256 private immutable _updatedAt;
+
+    constructor(uint256 updatedAt_) {
+        _updatedAt = updatedAt_;
+    }
+
+    function decimals() external pure returns (uint8) { return 8; }
+    function version() external pure returns (uint256) { return 3; }
+    function description() external pure returns (string memory) { return "synthetic"; }
+    function latestAnswer() external pure returns (int256) { return 100e8; }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, 100e8, _updatedAt, _updatedAt, 1);
+    }
+
+    function getRoundData(uint80) external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, 100e8, _updatedAt, _updatedAt, 1);
+    }
 }
 
 /// @dev Minimal contract with no oracle interface — used to test invalid oracle rejection.

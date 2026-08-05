@@ -42,7 +42,7 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 /// ── Run (start anvil --chain-id 31337 first) ────────────────────────────────
 ///   forge script contracts/script/DeployAtomicSettlementE2E.s.sol \
 ///     --rpc-url http://127.0.0.1:8545 --broadcast \
-///     --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+///     --private-key $ANVIL_ACCT0_KEY   # from the Anvil startup banner; 31337-guarded
 ///
 /// ── Outputs (grep the `KEY=VALUE` lines; feed to the Rust test env) ─────────
 ///   E2E_SWAP  E2E_TOKEN  E2E_USDC  E2E_NAVFEED  E2E_FORWARDER
@@ -64,7 +64,7 @@ contract DeployAtomicSettlementE2E is Script {
         vm.startBroadcast();
 
         // ── 1. Minimal base stack ────────────────────────────────────────────
-        MockSanctionsList sanctions = new MockSanctionsList();
+        MockSanctionsList sanctions = new MockSanctionsList(deployer);
         MockUSDC usdc = new MockUSDC();
 
         IssuanceManager issuanceMgr = IssuanceManager(
@@ -77,7 +77,7 @@ contract DeployAtomicSettlementE2E is Script {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), deployer);
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions));
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // CAT-style series — deployer is factory owner so deployToken is direct.

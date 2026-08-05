@@ -66,7 +66,7 @@ contract AtomicSettlementDeployTest is Test {
 
         // ── Minimal DevNet stack (mirrors DeployDevNet; no timelock — the test
         //    contract stays factory owner so deployToken is called directly) ─────
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
 
         issuanceMgr = IssuanceManager(
@@ -79,7 +79,7 @@ contract AtomicSettlementDeployTest is Test {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), address(this));
 
-        factory = new TokenFactory(address(new GyldBondToken()), address(mockSanctions));
+        factory = new TokenFactory(address(new GyldBondToken()), address(mockSanctions), address(this));
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // Real bond series deployed through the factory (CAT, same params as DeployDevNet).
@@ -217,8 +217,16 @@ contract AtomicSettlementDeployTest is Test {
         assertEq(swap.withdrawalWallet(), withdrawal, "withdrawalWallet mismatch");
         assertTrue(swap.isAllowed(taker), "taker not allowlisted");
 
-        // Roles: deployer keeps DEFAULT_ADMIN (dev path); treasurer holds TREASURER_ROLE.
-        assertTrue(swap.hasRole(swap.DEFAULT_ADMIN_ROLE(), address(this)), "deployer lost swap admin");
+        // Roles. setUp deliberately replays the DEV path (TIMELOCK_ADDRESS unset), so the
+        // deployer still holds DEFAULT_ADMIN here. That is legitimate ONLY on a development
+        // chain, and this suite runs on Anvil's 31337 — asserted, so the expectation can
+        // never silently become "the deployer keeps admin everywhere", which is exactly the
+        // fail-open shape this used to encode. Since GYL-1135 DeployAtomicSettlement
+        // requires TIMELOCK_ADDRESS on every production chain and refuses to skip the
+        // handover there, so this state is unreachable in production; the production
+        // topology is pinned by the handover test below and by DeployScripts.t.sol.
+        assertEq(block.chainid, 31337, "dev-path assertion assumes a development chain");
+        assertTrue(swap.hasRole(swap.DEFAULT_ADMIN_ROLE(), address(this)), "deployer lost swap admin on the dev path");
         assertTrue(swap.hasRole(swap.TREASURER_ROLE(), treasurer), "treasurer lacks TREASURER_ROLE");
         assertTrue(swap.hasRole(swap.QUOTE_SIGNER_ROLE(), signer), "signer lacks QUOTE_SIGNER_ROLE");
 
@@ -266,6 +274,15 @@ contract AtomicSettlementDeployTest is Test {
         // (c) The timelock now owns governance; the deployer owns nothing.
         assertTrue(swap.hasRole(adminRole, address(timelock)), "timelock lacks DEFAULT_ADMIN after handover");
         assertFalse(swap.hasRole(adminRole, address(this)), "deployer kept DEFAULT_ADMIN after handover");
+
+        // (c2) GYL-1135: the hand-over must not be cosmetic. On Base the timelock had a
+        // zero delay and the deployer as its sole proposer, so "admin is the timelock"
+        // was true and meant nothing. These are the properties
+        // DeployGuards.assertTimelockSane now enforces in-band during the deploy.
+        assertGe(timelock.getMinDelay(), 48 hours, "timelock delay below the production minimum");
+        assertFalse(timelock.hasRole(timelock.PROPOSER_ROLE(), address(this)), "deployer can propose through the timelock");
+        assertFalse(timelock.hasRole(timelock.CANCELLER_ROLE(), address(this)), "deployer can cancel through the timelock");
+        assertFalse(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), address(this)), "deployer administers the timelock");
 
         // (a) The KMS allowlist key can STILL allowlist a taker synchronously — the
         //     property the whole ticket exists to guarantee.

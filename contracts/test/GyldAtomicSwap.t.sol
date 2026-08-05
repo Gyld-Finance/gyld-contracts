@@ -27,6 +27,7 @@ contract GyldAtomicSwapTest is Test {
     event QuoteEpochBumped(uint64 indexed newEpoch);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
+    event MaxQuoteTtlUpdated(uint64 newTtl);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     GyldAtomicSwap swap;
@@ -63,7 +64,7 @@ contract GyldAtomicSwapTest is Test {
         signer = vm.addr(SIGNER_PK);
         taker = vm.addr(TAKER_PK);
 
-        mockSanctions = new MockSanctionsList();
+        mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
         navFeed = new MockNavForwarder(NAV);
 
@@ -299,6 +300,34 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpired.selector, m.expiry));
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// F-4: a quote expiring beyond block.timestamp + maxQuoteTtl is rejected even
+    /// though it has not expired — immortal quotes are unsignable.
+    function test_executeSwap_expiryBeyondMaxQuoteTtl_reverts() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(70);
+        m.expiry = uint64(block.timestamp + swap.maxQuoteTtl() + 1);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        // Cache before vm.prank — a getter call would consume the prank.
+        uint64 maxAllowed = uint64(block.timestamp + swap.maxQuoteTtl());
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, maxAllowed));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertFalse(swap.isQuoteUsed(70), "a too-far-out quote must not burn the quoteId");
+    }
+
+    /// The TTL bound is INCLUSIVE: expiry == block.timestamp + maxQuoteTtl executes.
+    function test_executeSwap_expiryExactlyMaxQuoteTtl_succeeds() public {
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(71);
+        m.expiry = uint64(block.timestamp + swap.maxQuoteTtl());
+        bytes memory sig = _sign(m, SIGNER_PK);
+
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(71), "expiry exactly at the TTL bound must execute");
     }
 
     function test_executeSwap_staleEpoch_reverts() public {
@@ -657,6 +686,24 @@ contract GyldAtomicSwapTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
+    /// F-6: a future-dated updatedAt would satisfy the age check forever
+    /// (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — it must revert
+    /// StaleNav just like an old feed. The inclusive fresh edge updatedAt ==
+    /// block.timestamp is the mock's default, exercised by every happy-path test.
+    function test_executeSwap_futureDatedNav_reverts() public {
+        uint256 future = block.timestamp + 1;
+        navFeed.setUpdatedAt(future);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(73);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), future));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
     /// A quote where NEITHER leg is a registered series against USDC → NotOneBondLeg.
     function test_executeSwap_unregisteredSeries_reverts() public {
         // Deregister the series (after draining inventory so the guard passes).
@@ -724,6 +771,22 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NotValidForwarder.selector, eoa));
         swap.registerSeries(address(0xD00D), eoa);
+    }
+
+    /// F-1: the bond token's decimals are probed on-chain — a 6-decimal "series"
+    /// (MockUSDC standing in) would silently vacuum the /1e20 NAV band.
+    function test_registerSeries_wrongDecimalsToken_reverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(usdc), uint8(6)));
+        swap.registerSeries(address(usdc), address(navFeed));
+    }
+
+    /// F-1: a token with no decimals() at all (EOA) is rejected too — reported as 0.
+    function test_registerSeries_tokenWithoutDecimals_reverts() public {
+        address eoa = address(0xD00D);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, eoa, uint8(0)));
+        swap.registerSeries(eoa, address(navFeed));
     }
 
     function test_registerSeries_zeroAddress_reverts() public {
@@ -926,16 +989,103 @@ contract GyldAtomicSwapTest is Test {
         swap.setMaxQuoteDeviationBps(300);
     }
 
-    function test_setMaxQuoteDeviationBps_aboveDenominator_reverts() public {
+    /// GYL-1135: the bound is MAX_QUOTE_DEVIATION_BPS_CEILING (1000 bps), NOT
+    /// BPS_DENOMINATOR. 10_001 was always rejected; 10_000 (±100%, i.e. no band at all)
+    /// and everything else above the ceiling now is too.
+    function test_setMaxQuoteDeviationBps_aboveCeiling_reverts() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(10_001)));
         swap.setMaxQuoteDeviationBps(10_001);
+
+        // The old permitted maximum — a ±100% band — is no longer settable.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(10_000)));
+        swap.setMaxQuoteDeviationBps(10_000);
+
+        // One basis point past the ceiling.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidDeviationBps.selector, uint16(1001)));
+        swap.setMaxQuoteDeviationBps(1001);
+
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS, "rejected setters must not move the band");
+    }
+
+    /// GYL-1135: setMaxQuoteTtl previously had no validation at all.
+    function test_setMaxQuoteTtl_aboveCeiling_reverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(1 hours + 1)));
+        swap.setMaxQuoteTtl(1 hours + 1);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, type(uint64).max));
+        swap.setMaxQuoteTtl(type(uint64).max);
+
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "rejected setters must not move the TTL");
     }
 
     function test_setMaxNavAgeSecs_zero_reverts() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, uint32(0)));
         swap.setMaxNavAgeSecs(0);
+    }
+
+    /// initialize deliberately does NOT seed maxQuoteTtl (F-4): the storage slot stays
+    /// zero and the effective cap comes from the DEFAULT_MAX_QUOTE_TTL fallback. That is
+    /// what keeps a proxy upgraded across the field's addition working — see
+    /// GyldAtomicSwap.upgrade.t.sol. The getter reports the effective value.
+    function test_initialize_leavesTtlSlotUnsetAndFallsBackToDefault() public view {
+        assertEq(swap.maxQuoteTtl(), 15 minutes);
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
+    }
+
+    function test_setMaxQuoteTtl_onlyAdmin_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxQuoteTtl(2 hours);
+    }
+
+    function test_setMaxQuoteTtl_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true, address(swap));
+        emit MaxQuoteTtlUpdated(5 minutes);
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(5 minutes);
+        assertEq(swap.maxQuoteTtl(), 5 minutes);
+
+        // A 10-minute quote was legal under the 15-minute default but is now too far out.
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(72);
+        m.expiry = uint64(block.timestamp + 10 minutes);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 5 minutes)
+            )
+        );
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// Zero is the UNSET sentinel, not "zero seconds" — passing it resets the cap to the
+    /// compiled-in default rather than pinning expiry to the current block. This is the
+    /// property that makes an un-migrated upgrade safe; if it ever regresses to literal
+    /// zero-seconds, every real quote reverts QuoteExpiryTooFar.
+    function test_setMaxQuoteTtl_zeroResetsToDefaultRatherThanBricking() public {
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(5 minutes);
+        assertEq(swap.maxQuoteTtl(), 5 minutes);
+
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(0);
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "zero must fall back, not disable");
+
+        // And a normal quote still settles at the restored default.
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(73);
+        m.expiry = uint64(block.timestamp + 10 minutes);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(73));
     }
 
     function test_initialize_zeroUsdc_reverts() public {
@@ -947,6 +1097,53 @@ contract GyldAtomicSwapTest is Test {
                 GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(0), MAX_BPS, MAX_NAV_AGE)
             )
         );
+    }
+
+    /// F-1: initialize probes the cash token's decimals on-chain — an 18-decimal
+    /// "USDC" (the bond token standing in) must be rejected before any state is set.
+    function test_initialize_wrongDecimalsUsdc_reverts() public {
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(token), uint8(18)));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(token), MAX_BPS, MAX_NAV_AGE)
+            )
+        );
+    }
+
+    /// F-1, the other half of the initialize probe: a cash token with NO usable
+    /// `decimals()` at all. `registerSeries` covers this for the bond leg
+    /// (test_registerSeries_tokenWithoutDecimals_reverts); this pins the initialize leg,
+    /// which matters more because `usdc` has NO SETTER — a bad cash token bricks the proxy
+    /// permanently, recoverable only by upgrading in a setter that does not exist. The
+    /// probe reports decimals 0 to mean "no answer", distinct from a token that genuinely
+    /// answers 0.
+    function test_initialize_cashTokenWithoutDecimals_reverts() public {
+        // An EOA: the staticcall succeeds with empty returndata, so length != 32.
+        address eoa = address(0xDECAF);
+        GyldAtomicSwap impl = new GyldAtomicSwap();
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, eoa, uint8(0)));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, eoa, MAX_BPS, MAX_NAV_AGE))
+        );
+    }
+
+    /// The swap half of the cross-contract decimals invariant (F-1). The probes in
+    /// registerSeries/initialize enforce this at admission time, but that only helps if the
+    /// three values the /1e20 divisor is built from are the ones actually deployed. Assert
+    /// the live wiring, not just the rejection paths: 18 (bond) + 8 (NAV) - 6 (cash) = 20.
+    /// GyldBondToken.t.sol carries the matching assertion on the token side — if either
+    /// contract's precision moves, one of the two fails and names the divisor.
+    function test_decimalsLadder_matchesHardcodedDivisor() public view {
+        assertEq(token.decimals(), 18, "bond leg");
+        assertEq(navFeed.decimals(), 8, "NAV leg");
+        assertEq(usdc.decimals(), 6, "cash leg");
+
+        // The exponent the divisor encodes, derived rather than restated.
+        uint256 exponent = uint256(token.decimals()) + uint256(navFeed.decimals()) - uint256(usdc.decimals());
+        assertEq(10 ** exponent, 1e20, "_checkQuoteBand's /1e20 no longer matches the deployed decimals");
     }
 
     // ── Reentrancy ──────────────────────────────────────────────────────────────
@@ -1006,6 +1203,44 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         vm.expectRevert(GyldAtomicSwap.CannotRenounceAdminRole.selector);
         swap.renounceRole(adminRole, admin);
+    }
+
+    /// DEFAULT_ADMIN_ROLE is the ONLY non-renounceable role. The incident-response pair
+    /// stays renounceable on purpose (F-7 was considered and rejected): a holder who knows
+    /// their key is compromised must be able to shed the role immediately rather than wait
+    /// on a timelocked revokeRole. Renouncing is not a loss of capability — the admin
+    /// re-grants in one transaction, asserted below.
+    function test_renounceRole_pauser_succeedsAndIsRegrantable() public {
+        bytes32 pauserRole = swap.PAUSER_ROLE();
+        vm.prank(pauser);
+        swap.renounceRole(pauserRole, pauser);
+        assertFalse(swap.hasRole(pauserRole, pauser), "a holder must be able to shed a hot role");
+
+        // Nothing is stranded: DEFAULT_ADMIN_ROLE administers every role.
+        vm.prank(admin);
+        swap.grantRole(pauserRole, pauser);
+        assertTrue(swap.hasRole(pauserRole, pauser), "admin must be able to re-grant");
+    }
+
+    function test_renounceRole_treasurer_succeedsAndIsRegrantable() public {
+        bytes32 treasurerRole = swap.TREASURER_ROLE();
+        vm.prank(treasurer);
+        swap.renounceRole(treasurerRole, treasurer);
+        assertFalse(swap.hasRole(treasurerRole, treasurer));
+
+        vm.prank(admin);
+        swap.grantRole(treasurerRole, treasurer);
+        assertTrue(swap.hasRole(treasurerRole, treasurer));
+    }
+
+    /// The property that made F-7 unnecessary, pinned directly: renounceRole can only ever
+    /// affect the caller, so there is no accidental or third-party path into it.
+    function test_renounceRole_cannotRenounceSomeoneElsesRole() public {
+        bytes32 pauserRole = swap.PAUSER_ROLE();
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.renounceRole(pauserRole, pauser);
+        assertTrue(swap.hasRole(pauserRole, pauser), "a third party must not be able to strip a role");
     }
 
     function test_renounceRole_quoteSigner_succeeds() public {
@@ -1121,5 +1356,100 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(taker);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteSigner.selector, vm.addr(strangerPk)));
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    // ── Upgrade safety for the appended maxQuoteTtl slot (F-4) ────────────────
+    //
+    // maxQuoteTtl is an APPEND-ONLY ERC-7201 field added after the first deployments
+    // (there is a live pre-F-4 proxy on Sepolia). A proxy upgraded onto this
+    // implementation never re-runs `initialize`, so that slot has never been written and
+    // reads ZERO. An earlier revision of this change seeded the field in `initialize`
+    // and read it raw in executeSwap, which meant the upgraded proxy enforced
+    // `expiry <= block.timestamp + 0` — directly contradicting the `block.timestamp >
+    // m.expiry` check one line above it. Every quote a real service can issue reverted
+    // QuoteExpiryTooFar; the only satisfiable expiry was exactly the inclusion block's
+    // timestamp, which no service can target. That is a total executeSwap outage whose
+    // only remedy, setMaxQuoteTtl, sits behind the 48h production timelock.
+    //
+    // The fix is that the field is read through `_effectiveMaxQuoteTtl`, which treats an
+    // unset slot as "use DEFAULT_MAX_QUOTE_TTL". These tests pin that, because the
+    // scenario had NO coverage before — every other test deploys fresh.
+
+    /// Zeroing the slot IS the un-migrated-upgrade state, so write it directly and prove
+    /// a normal quote still settles. This assertion is what the seed-based design failed.
+    function test_upgrade_unsetTtlSlot_stillSettlesNormalQuotes() public {
+        // erc7201:gyld.GyldAtomicSwap base; maxQuoteTtl is the appended field at B+8.
+        bytes32 base = 0x21c91deba1ebb3b1dd4f7372693119a28dc8ce05601a0afdcf4ef40d5ef89300;
+        bytes32 slot = bytes32(uint256(base) + 8);
+        vm.store(address(swap), slot, bytes32(0));
+        assertEq(uint256(vm.load(address(swap), slot)), 0, "precondition: slot unset");
+
+        // The getter reports the fallback, not zero.
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(901);
+        m.expiry = uint64(block.timestamp + 10 minutes);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 2_000e6);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(901), "an unset TTL slot must not brick executeSwap");
+
+        // The cap is still enforced at the fallback value, not disabled.
+        GyldAtomicSwap.SwapMessage memory tooFar = _buyQuote(902);
+        tooFar.expiry = uint64(block.timestamp + 15 minutes + 1);
+        bytes memory farSig = _sign(tooFar, SIGNER_PK);
+        vm.prank(taker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, tooFar.expiry, uint64(block.timestamp + 15 minutes)
+            )
+        );
+        swap.executeSwap(tooFar, farSig, _noPermit(), tooFar.maxAmountIn);
+    }
+
+    /// A real UUPS round-trip with NO initializer call in the upgrade, which is how an
+    /// existing proxy is actually migrated. Storage survives; the TTL guard still works.
+    function test_upgrade_withoutReinitializer_preservesStateAndTtlGuard() public {
+        // Settle one swap pre-upgrade so there is real state to preserve.
+        GyldAtomicSwap.SwapMessage memory before_ = _buyQuote(903);
+        bytes memory beforeSig = _sign(before_, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 2_000e6);
+        vm.prank(taker);
+        swap.executeSwap(before_, beforeSig, _noPermit(), before_.maxAmountIn);
+
+        GyldAtomicSwap newImpl = new GyldAtomicSwap();
+        vm.prank(admin);
+        swap.upgradeToAndCall(address(newImpl), ""); // empty calldata: no initializer
+
+        // Pre-upgrade state intact.
+        assertTrue(swap.isQuoteUsed(903), "quoteId bitmap must survive the upgrade");
+        assertEq(swap.maxQuoteDeviationBps(), MAX_BPS);
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE);
+        assertTrue(swap.registeredSeries(address(token)));
+        assertTrue(swap.isAllowed(taker));
+
+        // And the TTL guard is live at the fallback rather than bricked at zero.
+        assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
+        GyldAtomicSwap.SwapMessage memory after_ = _buyQuote(904);
+        after_.expiry = uint64(block.timestamp + 10 minutes);
+        bytes memory afterSig = _sign(after_, SIGNER_PK);
+        vm.prank(taker);
+        swap.executeSwap(after_, afterSig, _noPermit(), after_.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(904), "executeSwap must work after an un-migrated upgrade");
+    }
+
+    /// An admin-set TTL survives an upgrade — the fallback must not clobber a real value.
+    function test_upgrade_preservesAdminSetTtl() public {
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(5 minutes);
+
+        GyldAtomicSwap newImpl = new GyldAtomicSwap();
+        vm.prank(admin);
+        swap.upgradeToAndCall(address(newImpl), "");
+
+        assertEq(swap.maxQuoteTtl(), 5 minutes, "a configured TTL must survive the upgrade");
     }
 }

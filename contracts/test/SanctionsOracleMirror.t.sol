@@ -284,21 +284,21 @@ contract SanctionsOracleMirrorTest is Test {
     // ── forwarding oracle ─────────────────────────────────────────────────────
 
     function test_setForwardingOracle_adminCanSet() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin);
         oracle.setForwardingOracle(address(mock));
         assertEq(address(oracle.forwardingOracle()), address(mock));
     }
 
     function test_setForwardingOracle_strangerReverts() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(stranger);
         vm.expectRevert();
         oracle.setForwardingOracle(address(mock));
     }
 
     function test_setForwardingOracle_emitsEvent() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.expectEmit(true, true, false, false, address(oracle));
         emit ForwardingOracleUpdated(address(0), address(mock));
         vm.prank(admin);
@@ -306,7 +306,7 @@ contract SanctionsOracleMirrorTest is Test {
     }
 
     function test_setForwardingOracle_canBeZeroed() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
         vm.prank(admin); oracle.setForwardingOracle(address(0));
         assertEq(address(oracle.forwardingOracle()), address(0));
@@ -329,7 +329,7 @@ contract SanctionsOracleMirrorTest is Test {
 
     // Forwarding: address only on forwarding oracle → isSanctioned returns true
     function test_isSanctioned_trueFromForwardingOracle() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         mock.setSanctioned(sanctioned1, true);
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
@@ -338,7 +338,7 @@ contract SanctionsOracleMirrorTest is Test {
 
     // Forwarding: address only on local list → isSanctioned returns true (no external call)
     function test_isSanctioned_trueFromLocalList() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
         address[] memory addrs = new address[](1);
@@ -350,7 +350,7 @@ contract SanctionsOracleMirrorTest is Test {
 
     // Forwarding: address on both lists → still returns true
     function test_isSanctioned_trueFromBothLists() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         mock.setSanctioned(sanctioned1, true);
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
@@ -363,14 +363,14 @@ contract SanctionsOracleMirrorTest is Test {
 
     // Forwarding: clean address on neither list → false
     function test_isSanctioned_falseOnBothLists() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
         assertFalse(oracle.isSanctioned(clean));
     }
 
     // Remove from local list does NOT clear forwarding oracle flag
     function test_removeFromLocal_doesNotClearForwardingFlag() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         mock.setSanctioned(sanctioned1, true);
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
@@ -385,7 +385,7 @@ contract SanctionsOracleMirrorTest is Test {
 
     // After zeroing forwarding oracle, removed-local address is clean
     function test_zeroForwarding_thenRemovedLocal_isFalse() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         mock.setSanctioned(sanctioned1, true);
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
@@ -395,7 +395,7 @@ contract SanctionsOracleMirrorTest is Test {
     }
 
     function test_constructor_withForwardingOracle() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         mock.setSanctioned(sanctioned1, true);
         SanctionsOracleMirror o2 = new SanctionsOracleMirror(admin, updater, address(mock));
         assertTrue(o2.isSanctioned(sanctioned1));
@@ -454,7 +454,7 @@ contract SanctionsOracleMirrorTest is Test {
 
     // Self-destructed oracle (code wiped) → probe rejects it
     function test_setForwardingOracle_selfDestructedOracle_reverts() public {
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
         // Wipe the contract's code with vm.etch — simulates self-destruct
@@ -483,13 +483,22 @@ contract SanctionsOracleMirrorTest is Test {
 
         // Should use well under 100k despite the oracle attempting to burn 1M+
         assertLt(gasUsed, 100_000);
+
+        // Lower bound: the griefer must actually have reached its burn loop.
+        // Without this, the assertion above would also pass if GasGriefingOracle
+        // silently stopped griefing (which is exactly how the --ir-minimum
+        // breakage hid itself). The griefer burns FORWARDING_GAS minus its
+        // return reserve, so ~35_000 lands here regardless of optimiser
+        // settings — the loop is bounded by gasleft(), not by an iteration
+        // count, so its consumption does not move with codegen.
+        assertGt(gasUsed, 25_000, "griefing oracle never burned its budget - test is vacuous");
     }
 
     // ── fuzz: forwarding-path invariant ──────────────────────────────────────
 
     function testFuzz_forwardingOrLocalTrue_meansTrue(address addr) public {
         vm.assume(addr != address(0));
-        MockSanctionsList mock = new MockSanctionsList();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
         vm.prank(admin); oracle.setForwardingOracle(address(mock));
 
         // local only
@@ -527,10 +536,28 @@ contract MalformedReturnOracle {
 }
 
 contract GasGriefingOracle {
+    /// Gas this oracle keeps back so it can still ABI-encode and return its
+    /// bool after burning everything else.
+    ///
+    /// This reserve must exceed the cost of the callee's own return epilogue,
+    /// which is COMPILER-DEPENDENT. The original value was 100, which is just
+    /// barely enough under `via_ir` + optimizer but not under
+    /// `forge coverage --ir-minimum`, whose unoptimised IR needs ~450. Under
+    /// --ir-minimum the griefer therefore ran out of gas mid-return, the
+    /// `setForwardingOracle` probe saw `ok == false`, and installing this
+    /// oracle reverted `InvalidForwardingOracle` before the test could measure
+    /// anything. 5_000 is ~10x the measured worst case, so the double behaves
+    /// identically under every optimiser setting.
+    ///
+    /// This does not soften the test. The oracle is handed FORWARDING_GAS =
+    /// 40_000 by the staticcall, so it still burns ~35_000 — the entire
+    /// forwarded budget bar the reserve — and the assertion below is unchanged.
+    uint256 constant RETURN_RESERVE = 5_000;
+
     function isSanctioned(address) external view returns (bool) {
         // Attempt to burn all gas via an infinite-ish loop
         uint256 i;
-        while (gasleft() > 100) { unchecked { i++; } }
+        while (gasleft() > RETURN_RESERVE) { unchecked { i++; } }
         return false;
     }
 }

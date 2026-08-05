@@ -14,11 +14,6 @@ interface ISanctionsList {
     function isSanctioned(address addr) external view returns (bool);
 }
 
-/// @dev Minimal ERC-8056 (Scaled UI Amount) interface marker for ERC-165 discovery.
-interface IERC8056 {
-    function uiMultiplier() external view returns (uint256);
-}
-
 /// @title GyldBondToken
 /// @notice Standard ERC-20 per bond series. One token = one unit of bond ownership.
 ///
@@ -26,11 +21,21 @@ interface IERC8056 {
 ///         burn (redemption). Value accrual (coupons, NAV appreciation) is reflected
 ///         exclusively in the paired KaleidoscopeNAVFeed oracle, not in balances.
 ///
-///         A display-only ERC-8056 (Scaled UI Amount) extension lets integrators show a
-///         NAV-scaled balance (`balanceOfUI`) without affecting real balances.
-///
 /// UUPS-upgradeable — the proxy pattern keeps bond token addresses stable post-issuance.
 /// Upgrades require DEFAULT_ADMIN_ROLE (a TimelockController in production).
+///
+/// ⚠ DECIMALS ARE LOAD-BEARING OFF-CONTRACT — DO NOT OVERRIDE `decimals()`.
+/// This contract deliberately does not override `decimals()`, so it inherits
+/// {ERC20Upgradeable}'s hard-coded `return 18` (no storage slot, nothing to drift).
+/// `GyldAtomicSwap._checkQuoteBand` prices every quote with a single hard-coded divisor —
+/// `navValue = tokenAmount * nav / 1e20` — where the 20 is `18 (bond) + 8 (NAV) - 6 (cash)`.
+/// A series reporting anything in 7..17 decimals silently UNDER-prices: a 12-decimal token
+/// makes the band value 10^6 too small, so a taker can pay ~$0.001 for ~$1,000 of bonds.
+/// `GyldAtomicSwap.registerSeries` staticcall-probes for exactly 18 and rejects otherwise,
+/// but that probe runs once at registration — an implementation upgrade that added an
+/// override would bypass it for series already registered. If a future series genuinely
+/// needs different precision, change the swap's scaling FIRST (per-series factor), not
+/// this function. Pinned by `test_decimals_is18_swapBandDependsOnIt`.
 ///
 /// Compliance:
 ///   - All secondary transfers check sender, receiver, AND spender (msg.sender in transferFrom)
@@ -57,12 +62,6 @@ contract GyldBondToken is
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-    bytes32 public constant UI_MULTIPLIER_ROLE = keccak256("UI_MULTIPLIER_ROLE");
-
-    // ── Constants ─────────────────────────────────────────────────────────────
-
-    /// @notice Fixed-point scale for the display-only UI multiplier. 1e18 == 1.0x (no scaling).
-    uint256 public constant UI_MULTIPLIER_SCALE = 1e18;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -71,9 +70,6 @@ contract GyldBondToken is
         ISanctionsList sanctionsList;
         string isin;
         uint256 maturityTimestamp;
-        // Display-only ERC-8056 scaling multiplier (18-dp fixed point; 1e18 == 1.0x).
-        // Appended at the end so existing field offsets are undisturbed.
-        uint256 uiMultiplier;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1)) & ~bytes32(uint256(0xff))
@@ -93,12 +89,10 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error NotValidSanctionsList(address addr);
-    error ZeroMultiplier();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
     event SanctionsListUpdated(address indexed newSanctionsList);
-    event UIMultiplierUpdated(uint256 previousMultiplier, uint256 newMultiplier);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -142,18 +136,6 @@ contract GyldBondToken is
         _grantRole(PAUSER_ROLE, pauser);
         $.sanctionsList = ISanctionsList(sanctionsList_);
         emit SanctionsListUpdated(sanctionsList_);
-        $.uiMultiplier = UI_MULTIPLIER_SCALE;
-        emit UIMultiplierUpdated(0, UI_MULTIPLIER_SCALE);
-    }
-
-    /// @notice One-time post-upgrade initializer for proxies deployed before the ERC-8056
-    ///         extension existed. Sets uiMultiplier to 1.0x (no value change vs pre-upgrade
-    ///         state, since balanceOf/totalSupply were never scaled to begin with).
-    ///         Brand-new deployments get this from initialize() directly and never call this.
-    function initializeUiMultiplierV2() external reinitializer(2) {
-        GyldBondTokenStorage storage $ = _getStorage();
-        $.uiMultiplier = UI_MULTIPLIER_SCALE;
-        emit UIMultiplierUpdated(0, UI_MULTIPLIER_SCALE);
     }
 
     // ── Getters ───────────────────────────────────────────────────────────────
@@ -161,35 +143,6 @@ contract GyldBondToken is
     function isin() external view returns (string memory) { return _getStorage().isin; }
     function maturityTimestamp() external view returns (uint256) { return _getStorage().maturityTimestamp; }
     function sanctionsList() external view returns (ISanctionsList) { return _getStorage().sanctionsList; }
-
-    // ── ERC-8056 Scaled UI Amount (display-only) ──────────────────────────────
-    // Purely cosmetic view layer. Does NOT touch balanceOf/totalSupply/transfer or any
-    // real accounting — the raw ERC-20 balances remain the single source of truth.
-
-    /// @notice Current display-only UI scaling multiplier (18-dp fixed point; 1e18 == 1.0x).
-    function uiMultiplier() external view returns (uint256) {
-        return _getStorage().uiMultiplier;
-    }
-
-    /// @notice `account`'s balance scaled by the UI multiplier — for display only.
-    function balanceOfUI(address account) external view returns (uint256) {
-        return toUIAmount(balanceOf(account));
-    }
-
-    /// @notice Total supply scaled by the UI multiplier — for display only.
-    function totalSupplyUI() external view returns (uint256) {
-        return toUIAmount(totalSupply());
-    }
-
-    /// @notice Scale a raw token amount into its UI (NAV-scaled) representation.
-    function toUIAmount(uint256 amount) public view returns (uint256) {
-        return (amount * _getStorage().uiMultiplier) / UI_MULTIPLIER_SCALE;
-    }
-
-    /// @notice Convert a UI (NAV-scaled) amount back into a raw token amount.
-    function fromUIAmount(uint256 uiAmount) public view returns (uint256) {
-        return (uiAmount * UI_MULTIPLIER_SCALE) / _getStorage().uiMultiplier;
-    }
 
     // ── ERC20 transfer overrides ──────────────────────────────────────────────
 
@@ -283,21 +236,6 @@ contract GyldBondToken is
         emit SanctionsListUpdated(newSanctionsList);
     }
 
-    // ── UI multiplier management (display-only) ───────────────────────────────
-
-    /// @notice Update the display-only UI scaling multiplier. Purely cosmetic — does NOT
-    ///         affect balanceOf/totalSupply/transfer or any real accounting or settlement
-    ///         logic. Intended to be driven by an off-chain process mirroring the paired
-    ///         KaleidoscopeNAVFeed's published NAV so wallets can show "current value"
-    ///         without a second contract read.
-    function setUiMultiplier(uint256 newMultiplier) external onlyRole(UI_MULTIPLIER_ROLE) {
-        if (newMultiplier == 0) revert ZeroMultiplier();
-        GyldBondTokenStorage storage $ = _getStorage();
-        uint256 previous = $.uiMultiplier;
-        $.uiMultiplier = newMultiplier;
-        emit UIMultiplierUpdated(previous, newMultiplier);
-    }
-
     // ── Pause ─────────────────────────────────────────────────────────────────
 
     function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
@@ -316,13 +254,6 @@ contract GyldBondToken is
     // ── UUPS upgrade authorization ────────────────────────────────────────────
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
-
-    // ── ERC-165 ───────────────────────────────────────────────────────────────
-
-    /// @dev Advertises ERC-8056 (Scaled UI Amount) support alongside AccessControl's own.
-    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
-        return interfaceId == type(IERC8056).interfaceId || super.supportsInterface(interfaceId);
-    }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 

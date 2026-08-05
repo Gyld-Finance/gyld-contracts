@@ -55,6 +55,8 @@ contract NAVFeedForwarder is Ownable2Step {
 
     error UpstreamCannotBeZero();
     error InvalidOracle(address oracle);
+    /// Upstream's latestRoundData() reported an `updatedAt` in the future.
+    error UpstreamFutureDated(uint256 updatedAt, uint256 blockTimestamp);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -74,6 +76,7 @@ contract NAVFeedForwarder is Ownable2Step {
         // never reverts for business-logic reasons, catches partial stubs that only have decimals().
         (bool okV, bytes memory dataV) = initialUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(initialUpstream);
+        _probeNotFutureDated(initialUpstream);
         _upstreamOracle = IUpstreamOracle(initialUpstream);
         emit UpstreamOracleUpdated(address(0), initialUpstream);
     }
@@ -97,6 +100,7 @@ contract NAVFeedForwarder is Ownable2Step {
         // Also probe version() to catch partial interface implementations (M-05).
         (bool okV, bytes memory dataV) = newUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(newUpstream);
+        _probeNotFutureDated(newUpstream);
         address previous = address(_upstreamOracle);
         _upstreamOracle = IUpstreamOracle(newUpstream);
         emit UpstreamOracleUpdated(previous, newUpstream);
@@ -105,6 +109,38 @@ contract NAVFeedForwarder is Ownable2Step {
     /// @notice Returns the address of the current upstream oracle.
     function upstreamOracle() external view returns (address) {
         return address(_upstreamOracle);
+    }
+
+    // ── Upstream sanity probe ─────────────────────────────────────────────────
+
+    /// @dev Reject an upstream whose latestRoundData() reports a FUTURE `updatedAt`
+    ///      (GYL-1135). Every honest consumer of this forwarder defends itself against
+    ///      a dead feed with an age check of the shape
+    ///      `block.timestamp - updatedAt <= maxAge`. A future-dated `updatedAt`
+    ///      satisfies that check unconditionally, and for as long as it stays ahead of
+    ///      the clock — so a single swapped-in upstream would silently disarm the
+    ///      staleness defence of every integrator at once, with no event that reads as
+    ///      anomalous. That is a strictly worse failure than a stale feed: stale is
+    ///      loud and fails closed, synthetic-fresh is silent and fails open.
+    ///      GyldAtomicSwap._checkQuoteBand already rejects future `updatedAt` at read
+    ///      time (F-6); this is the same invariant enforced one layer earlier, at
+    ///      configuration time, where it is cheap and where an operator sees it.
+    ///
+    ///      Deliberately tolerant of a REVERTING latestRoundData: a freshly deployed
+    ///      KaleidoscopeNAVFeed reverts NoPriceSet until its first push, and pointing
+    ///      the forwarder at one before that push is a legitimate deploy sequence.
+    ///      Garbage/short returndata is likewise tolerated here — the decimals() and
+    ///      version() probes above are what establish "this is an oracle at all". This
+    ///      probe answers only "is it lying about time?".
+    ///
+    ///      Note this is a point-in-time probe, not a guarantee: an upstream can start
+    ///      returning future timestamps after it is installed. Consumer-side age checks
+    ///      remain mandatory.
+    function _probeNotFutureDated(address oracle) private view {
+        (bool ok, bytes memory data) = oracle.staticcall(abi.encodeWithSignature("latestRoundData()"));
+        if (!ok || data.length < 160) return; // no price yet / not decodable — not our check
+        (,,, uint256 updatedAt,) = abi.decode(data, (uint80, int256, uint256, uint256, uint80));
+        if (updatedAt > block.timestamp) revert UpstreamFutureDated(updatedAt, block.timestamp);
     }
 
     // ── AggregatorV3Interface — pure delegation ───────────────────────────────

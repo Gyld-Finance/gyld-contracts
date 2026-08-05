@@ -15,7 +15,7 @@ import {MockNavForwarder} from "./MockNavForwarder.sol";
 // ─────────────────────────────────────────────────────────────────────────────
 // Fuzz + invariant coverage for GyldAtomicSwap.
 //
-// The audit-prep checklist (lib/gyld-contracts/docs/atomic-settlement.md) flags
+// The audit-prep checklist (lib/gyld-contracts/docs/ARCHITECTURE.md) flags
 // the absence of a stateful invariant suite over executeSwap as outstanding.
 // These tests prove the two load-bearing conservation properties that make the
 // self-custodial swap safe:
@@ -53,7 +53,7 @@ contract SwapFuzzTest is Test {
         vm.warp(1_750_000_000);
         taker = vm.addr(TAKER_PK);
 
-        MockSanctionsList mockSanctions = new MockSanctionsList();
+        MockSanctionsList mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
         navFeed = new MockNavForwarder(NAV);
 
@@ -376,7 +376,7 @@ contract GyldAtomicSwapInvariantsTest is StdInvariant, Test {
         vm.warp(1_750_000_000);
         taker = vm.addr(TAKER_PK);
 
-        MockSanctionsList mockSanctions = new MockSanctionsList();
+        MockSanctionsList mockSanctions = new MockSanctionsList(address(this));
         usdc = new MockUSDCPermit();
         MockNavForwarder navFeed = new MockNavForwarder(100e8);
 
