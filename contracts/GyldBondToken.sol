@@ -66,17 +66,6 @@ contract GyldBondToken is
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
     /// @custom:storage-location erc7201:gyld.GyldBondToken
-    ///
-    /// Historical note, applying to two orphaned proxies only. The removed ERC-8056
-    /// extension (GYL-1201) occupied B+3..B+5, and deleting the fields did not clear those
-    /// slots on the two demo proxies deployed from the `46050ea` lineage — Sepolia GTB8056
-    /// `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` and BSC testnet GBSCD
-    /// `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a`. Both are marked do-not-reuse in
-    /// DEPLOYMENTS.md and will not be upgraded.
-    ///
-    /// FRESH DEPLOYS ARE UNAFFECTED — every slot starts at zero, so append normally. The
-    /// Base mainnet and Sepolia gen-1 tokens predate the extension entirely (deployed from
-    /// `6349ec5`, which has no ERC-8056 code) and are clean.
     struct GyldBondTokenStorage {
         ISanctionsList sanctionsList;
         string isin;
