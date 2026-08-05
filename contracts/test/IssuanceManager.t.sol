@@ -547,6 +547,58 @@ contract IssuanceManagerTest is Test {
         vm.expectRevert();
         mgr.subscribe(address(rtoken), ap, 1e18);
     }
+    // ── ERC-7201 storage layout (GYL-1208) ────────────────────────────────────
+
+    /// Pin the namespaced layout. This proxy is LIVE on Base mainnet
+    /// (0x5BA267367f06378816c58d47C5850fC9863Ce67F, commit 6349ec5) with
+    /// DEFAULT_ADMIN_ROLE on a deployer EOA, so an upgrade needs no governance
+    /// proposal — and nothing in this file asserted a single storage slot before now.
+    ///
+    /// The two negative assertions at the end are the actual point. `whitelisted` and
+    /// `registeredTokens` are BOTH `mapping(address => bool)` and adjacent. Swapping
+    /// them compiles clean, leaves every other test in this suite passing, and reads
+    /// as tidying in a diff — while on the live proxy it would make every whitelisted
+    /// AP a registered token and vice versa. Nothing else in the repo catches that.
+    function test_storageLayout_erc7201OffsetsArePinned() public {
+        bytes32 root =
+            keccak256(abi.encode(uint256(keccak256("gyld.IssuanceManager")) - 1)) & ~bytes32(uint256(0xff));
+        assertEq(
+            root,
+            0xc8552dd465c7174389604c2ad1f48bf21d46f65ee8d42bbd0456923afc111000,
+            "ERC-7201 derivation drifted from the _STORAGE_LOCATION literal"
+        );
+
+        vm.prank(whitelistAdmin);
+        mgr.addToWhitelist(ap);
+        vm.prank(registrar);
+        mgr.registerToken(address(token));
+
+        // whitelisted occupies B+0; registeredTokens occupies B+1.
+        assertEq(
+            uint256(vm.load(address(mgr), keccak256(abi.encode(ap, uint256(root) + 0)))),
+            1,
+            "whitelisted must occupy B+0"
+        );
+        assertEq(
+            uint256(vm.load(address(mgr), keccak256(abi.encode(address(token), uint256(root) + 1)))),
+            1,
+            "registeredTokens must occupy B+1"
+        );
+
+        // NEGATIVE: the two mappings must not be interchangeable. If a refactor ever
+        // swaps them these are the assertions that fail — the positives above would
+        // still pass, because each key would simply be found in the other's slot.
+        assertEq(
+            uint256(vm.load(address(mgr), keccak256(abi.encode(ap, uint256(root) + 1)))),
+            0,
+            "a whitelisted AP must NOT appear in registeredTokens' slot (fields swapped?)"
+        );
+        assertEq(
+            uint256(vm.load(address(mgr), keccak256(abi.encode(address(token), uint256(root) + 0)))),
+            0,
+            "a registered token must NOT appear in whitelisted's slot (fields swapped?)"
+        );
+    }
 }
 
 /// @dev Malicious token that attempts to re-enter IssuanceManager on burn() or mint().
