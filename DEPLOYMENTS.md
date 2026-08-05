@@ -142,16 +142,17 @@ Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
 
 ---
 
-## Source-commit preservation — action required
+## Source-commit preservation — resolved 2026-08-05
 
 - **`6349ec5`** (Base + Sepolia gen-1): on `main` and `origin/main`. Safe.
-- **`46050ea`** (Sepolia gen-2 + BSC testnet ERC-8056 bytecode): **NOT on
-  `main`.** As of 2026-08-04 it is reachable only from unmerged feature
-  branches `feat/GYL-1135-contract-hardening` (local + `origin`) and
-  `feat/testnet-erc8056-atomic-swap` (local only). If those branches are
-  squash-merged or deleted, the only source matching the live testnet ERC-8056
-  bytecode is garbage-collected. **Tag it now** (e.g.
-  `git tag deploy/erc8056-testnet 46050ea && git push origin deploy/erc8056-testnet`).
+- **`46050ea`** (Sepolia gen-2 + BSC testnet ERC-8056 bytecode): **not on
+  `main`** — the extension was removed under GYL-1201, so this source will never
+  be reachable from `main`. It is preserved by the annotated tag
+  **`deployed/sepolia-bsc-gen2-46050ea`**, pushed to `origin`, and therefore
+  survives deletion or squash-merge of the feature branches it came from. That
+  mattered: `feat/GYL-1135-hardening` was deleted when PR #2 merged, so branch
+  deletion is routine here. The tag message carries the address list and the
+  do-not-upgrade caveats.
 - Bytecode check confirming the gap: the current working tree builds a
   GyldBondToken runtime of 11,283 bytes; the live Sepolia/BSC implementations
   are 13,184 bytes (and Base's is 11,585). Current source does **not**
@@ -160,9 +161,37 @@ Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
 ## Known hazards, in one place
 
 1. `0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad` on **Sepolia** = ungated
-   MockSanctionsList (anyone can write). The same address on **Base** = the
-   GyldBondToken implementation. Copying addresses between chains here is not
-   a theoretical risk; it is two different contracts.
+   MockSanctionsList. **Re-verified on-chain 2026-08-05:** `owner()` reverts (the
+   selector is absent — pre-GYL-1135 bytecode), and `addToSanctionsList([0xdEaD])`
+   `eth_call`s cleanly from an arbitrary EOA, so it is permissionlessly writable.
+   **FOUR live Sepolia tokens point at it**, not three — each verified by reading
+   `sanctionsList()`:
+
+   | Token | Symbol | totalSupply |
+   | -- | -- | -- |
+   | `0xC545645b889027F5C2e7c1460566B08673273B07` | 14913UBF6 | 1e24 |
+   | `0xF62dd0722ed16593B0e8A00dD80D0Ea43A0e0c1E` | 172967LD1 | 0 |
+   | `0xb7Fc5791910CeddB54BbD53136D2cfc67719A2B4` | 191216DP2 | 0 |
+   | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | GTB8056 | 1e20 |
+
+   Because screening is fail-closed (`GyldBondToken._update` → `_checkNotSanctioned`
+   → revert `AccountSanctioned`), any caller can freeze transfers for every holder of
+   all four. Two carry supply.
+
+   **Accepted as testnet-only (GYL-1203).** The gated version is on `main` and applies
+   to all future deploys; the deployed instance is a plain contract, not a proxy, so it
+   cannot be retro-gated. Redeploying against the real oracle is **not available** —
+   `0x40C57923924B5c5c5455c48D93317139ADDaC8fb` has **no code on Sepolia**; Chainalysis
+   does not publish an oracle there.
+
+   **If Sepolia demos resume, rewire rather than redeploy:** `setSanctionsList()` is
+   `DEFAULT_ADMIN_ROLE`-gated and live on all four proxies, and the timelock
+   `0xf803…ef72` holds that role — so all four can be pointed at a freshly deployed
+   gated mock in a handful of transactions, no upgrade needed. Note that timelock has
+   `minDelay = 0` and an open executor, which is its own problem (see GYL-1206).
+
+   The same address on **Base** = the GyldBondToken implementation. Copying addresses
+   between chains here is not a theoretical risk; it is two different contracts.
 2. `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` (Sepolia GTB8056) and
    `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` (BSC GBSCD): **do-not-reuse**
    ERC-8056 proxies.

@@ -66,10 +66,36 @@ contract GyldBondToken is
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
     /// @custom:storage-location erc7201:gyld.GyldBondToken
+    ///
+    /// ⚠ OFFSETS B+3, B+4 and B+5 ARE BURNED — DO NOT APPEND THERE.
+    /// The ERC-8056 extension (removed under GYL-1201, commit `96c7df2`) occupied those
+    /// three slots as `uiMultiplier` / `newUIMultiplier` / `uiMultiplierEffectiveAt`.
+    /// Deleting them from this struct did NOT clear them on proxies already deployed from
+    /// the `46050ea` lineage, and those slots are **non-zero** there. Read live from the
+    /// Sepolia GTB8056 proxy `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` on 2026-08-05:
+    ///
+    ///     B+3 = 0x…0e92596fd6290000  = 1.05e18       (orphaned uiMultiplier)
+    ///     B+4 = 0x…0e6ed27d66680000  = 1.04e18       (orphaned newUIMultiplier)
+    ///     B+5 = 0x…6a6c6134          = 1785487668    (orphaned effectiveAt)
+    ///
+    /// BSC testnet GBSCD `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` shares that bytecode
+    /// lineage and is presumed identical (not read on-chain).
+    ///
+    /// Appending a field here therefore does NOT give it a zero initial value on those
+    /// proxies — a new `uint256` at B+3 would be born holding 1.05e18. **A zero-sentinel
+    /// fallback is no defence against this**, which is what makes it different from the
+    /// `GyldAtomicSwap.maxQuoteTtl` case (there the appended slot really was zero, and the
+    /// fallback fixed it — see that contract's `_effectiveMaxQuoteTtl`).
+    ///
+    /// Both affected proxies are marked do-not-reuse in DEPLOYMENTS.md, so nothing is
+    /// broken today. If you need new state, append at **B+6 or later** and leave the gap,
+    /// or add a `reinitializer` that explicitly zeroes B+3..B+5 first. See GYL-1208.
     struct GyldBondTokenStorage {
-        ISanctionsList sanctionsList;
-        string isin;
-        uint256 maturityTimestamp;
+        ISanctionsList sanctionsList; // B+0
+        string isin; // B+1
+        uint256 maturityTimestamp; // B+2
+        // B+3, B+4, B+5 — BURNED by the removed ERC-8056 extension. See the note above.
+        // APPEND-ONLY: new fields go at B+6 or later, never at B+3..B+5.
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1)) & ~bytes32(uint256(0xff))

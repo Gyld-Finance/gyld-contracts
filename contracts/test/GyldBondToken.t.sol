@@ -232,6 +232,48 @@ contract GyldBondTokenTest is Test {
         assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 3))), 0, "wrote past offset 2");
     }
 
+    /// B+3..B+5 ARE BURNED — this test exists to make that concrete rather than a comment.
+    ///
+    /// The removed ERC-8056 extension (GYL-1201, `96c7df2`) occupied B+3/B+4/B+5. Deleting
+    /// the fields from the struct did NOT clear them on proxies already deployed from the
+    /// `46050ea` lineage. Read live from Sepolia GTB8056
+    /// `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` on 2026-08-05, those slots hold
+    /// 1.05e18 / 1.04e18 / 1785487668 — NOT zero.
+    ///
+    /// The consequence, which the fresh-deploy assertion above cannot show: a field
+    /// appended at B+3 would be born holding 1.05e18 on those proxies. **A zero-sentinel
+    /// fallback does not save you here** — that is what makes this different from
+    /// `GyldAtomicSwap.maxQuoteTtl`, where the appended slot genuinely was zero and a
+    /// fallback was sufficient.
+    ///
+    /// This test simulates the dirty lineage and asserts the trap is real, so anyone who
+    /// appends at B+3 sees a failure that explains itself. Append at B+6 or later, or add
+    /// a reinitializer that zeroes B+3..B+5 first. See GYL-1208.
+    function test_storageLayout_offsets3to5AreBurnedNotZero() public {
+        bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1)) & ~bytes32(uint256(0xff));
+
+        // Reproduce the on-chain values observed on the 46050ea-lineage proxies.
+        vm.store(address(token), bytes32(uint256(root) + 3), bytes32(uint256(1.05e18)));
+        vm.store(address(token), bytes32(uint256(root) + 4), bytes32(uint256(1.04e18)));
+        vm.store(address(token), bytes32(uint256(root) + 5), bytes32(uint256(1_785_487_668)));
+
+        // Live state is untouched by those slots — main's implementation never reads them,
+        // which is why upgrading such a proxy is safe TODAY.
+        assertEq(token.isin(), "US912797KR72", "burned slots must not affect live fields");
+        assertEq(token.maturityTimestamp(), 1_780_000_000);
+        assertEq(address(token.sanctionsList()), address(mockSanctions));
+
+        // But the slots are emphatically not zero, so an appended field inherits garbage.
+        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 3))), 1.05e18, "B+3 is dirty by design");
+        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 4))), 1.04e18, "B+4 is dirty by design");
+        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 5))), 1_785_487_668, "B+5 is dirty by design");
+
+        // And the token still works end to end over the dirty slots.
+        vm.prank(issuer);
+        mgr.subscribe(address(token), ap, 1e18);
+        assertEq(token.balanceOf(ap), 1e18, "transfers must be unaffected by burned slots");
+    }
+
     /// Upgrading to V2 preserves all existing state: balances, ISIN, maturity,
     /// sanctions list pointer. This is the regression net for future upgrades.
     function test_upgrade_preservesAllState() public {
