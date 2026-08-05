@@ -75,9 +75,9 @@ def discover_contracts():
 
     Deliberately not a hardcoded list. A hardcoded list means a newly added
     upgradeable contract is simply invisible and the job still prints OK, and
-    silent under-coverage is the worst property a guard can have. GyldDvpEscrow
-    (GYL-724) is off `main` today and will land; it should be picked up without
-    anyone remembering to edit this file.
+    silent under-coverage is the worst property a guard can have. The next
+    upgradeable contract should be picked up without anyone remembering to edit
+    this file.
     """
     found = []
     for path in sorted(CONTRACT_DIR.glob("*.sol")):
