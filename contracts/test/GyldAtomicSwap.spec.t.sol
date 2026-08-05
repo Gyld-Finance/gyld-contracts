@@ -1361,6 +1361,75 @@ contract GyldAtomicSwapSpecTest is Test {
     /// withdrawalWallet and usdc occupy B+1 and B+2, and the F-4 addition maxQuoteTtl
     /// sits at the append-only tail (B+8). An upgrade that reorders or resizes any of
     /// these silently corrupts live state.
+    /// B+3..B+7 were UNPINNED before GYL-1208. Five reference-type fields sat
+    /// unasserted between the packed head (B+0..B+2) and the appended tail (B+8).
+    ///
+    /// The two negative assertions at the end are why this matters most:
+    /// `registeredSeries` (B+5) and `allowed` (B+7) are BOTH `mapping(address => bool)`.
+    /// Swapping them compiles clean and leaves every other test in the suite passing,
+    /// while on a live proxy it makes every allowlisted taker a registered bond series —
+    /// and the swap's whole leg classification (`buy`/`redeem` in _checkQuoteBand) is
+    /// built on exactly those two mappings.
+    ///
+    /// Kept separate from test_storageLayout_erc7201SlotAndPacking because that test
+    /// bumps the epoch and holds a prank, which a real executeSwap here would fight.
+    function test_storageLayout_referenceTypeFieldsPinned() public {
+        bytes32 B = keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff));
+        _approveTaker();
+
+        // usedQuoteWords (B+3): one 256-bit word per (quoteId >> 8), bit (quoteId & 0xff).
+        uint256 usedId = 24;
+        GyldAtomicSwap.SwapMessage memory used = _buyQuote(usedId, 1_000e6);
+        // Sign BEFORE pranking: _sign calls swap.hashSwapMessage, and an external call
+        // consumes the prank (the same trap the role-getter comments warn about), which
+        // would make the test contract the caller and revert NotTaker.
+        bytes memory sig = _sign(used);
+        vm.prank(taker);
+        swap.executeSwap(used, sig, _noPermit(), used.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(usedId), "precondition: the quote was consumed");
+        uint256 word = uint256(vm.load(address(swap), keccak256(abi.encode(usedId >> 8, uint256(B) + 3))));
+        assertEq((word >> (usedId & 0xff)) & 1, 1, "usedQuoteWords must occupy B+3");
+
+        // seriesList (B+4): dynamic array — length at the slot, elements at keccak(slot).
+        assertEq(uint256(vm.load(address(swap), bytes32(uint256(B) + 4))), 1, "seriesList length at B+4");
+        assertEq(
+            address(uint160(uint256(vm.load(address(swap), keccak256(abi.encode(bytes32(uint256(B) + 4))))))),
+            address(token),
+            "seriesList[0] must be the registered series"
+        );
+
+        // registeredSeries (B+5), navForwarderOf (B+6), allowed (B+7).
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 5)))),
+            1,
+            "registeredSeries must occupy B+5"
+        );
+        assertEq(
+            address(
+                uint160(uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 6)))))
+            ),
+            address(navFeed),
+            "navForwarderOf must occupy B+6"
+        );
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(taker, uint256(B) + 7)))),
+            1,
+            "allowed must occupy B+7"
+        );
+
+        // NEGATIVE: the two address=>bool mappings must not be interchangeable.
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 7)))),
+            0,
+            "a registered series must NOT appear in allowed's slot (B+5/B+7 swapped?)"
+        );
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(taker, uint256(B) + 5)))),
+            0,
+            "an allowlisted taker must NOT appear in registeredSeries' slot (B+5/B+7 swapped?)"
+        );
+    }
+
     function test_storageLayout_erc7201SlotAndPacking() public {
         bytes32 derived =
             keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff));

@@ -13,7 +13,7 @@ in a separate workflow so this one stays trustless.
 |-----|--------------|---------------------------|
 | `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 501 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
 | `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
-| `storage-layout` | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff, which is exactly the review step this job replaces. See "Storage layout" below |
+| `test` (step) | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff — and NEITHER reached `main`. This check does not replace that review; it **forces** it, by turning a subtle Solidity diff into an explicit `ci/storage-layouts/` diff a reviewer cannot skim past, and giving an auditor a concrete artifact to read before an upgrade. The audit remains the thing that decides whether a layout change is safe. See "Storage layout" below |
 | `coverage` | `forge coverage --ir-minimum --report summary`, at reduced fuzz intensity, publishing the table to the run summary. **Non-blocking** (`continue-on-error: true`, no threshold) | Nothing, by design — it is a trend instrument, not a gate. See "Coverage" below for what the number is and is not |
 
 ## Why full fuzz intensity on every push
@@ -29,6 +29,26 @@ reduced per-push via `FOUNDRY_FUZZ_RUNS` / `FOUNDRY_INVARIANT_RUNS` env
 overrides, full on a schedule.
 
 ## Storage layout
+
+**Scope, stated up front.** This check is a review aid, not a safety proof. The
+audit before an upgrade is what decides whether a layout change is safe; all this
+does is make the change impossible to miss. In this repo's history four layout
+changes have landed and human review caught all four, with none reaching `main` —
+so the check is not compensating for a broken review process. It exists because
+that review depended on someone choosing to look closely, and the two bugs below
+were both found by an unusually deep read rather than by routine review.
+
+Most comparable projects do not gate on this (Aave, Morpho, Euler, Lido, Ondo,
+Centrifuge all have no such check). Those that do split into three shapes: in the
+test suite (Safe, Superstate), a dedicated CI job (Optimism, EtherFi), or
+developer-run and committed as a review artifact rather than gating — which is what
+BGD Labs, who author Aave's actual upgrade payloads, chose. We sit closest to the
+first: the check runs as a step inside `test`, and the Solidity pins in
+`GyldAtomicSwap.spec.t.sol` and `GyldBondToken.t.sol` are the primary net. The
+script's distinct contribution is that it is **exhaustive by construction** — solc
+enumerates every field, whereas a hand-written pin only covers what someone
+remembered to write.
+
 
 `GyldAtomicSwap`, `GyldBondToken` and `IssuanceManager` are UUPS proxies whose
 state lives in an ERC-7201 namespaced struct at a computed base slot. On upgrade
