@@ -4,7 +4,7 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on branch `feat/GYL-1135-hardening` (483 tests,
+Verified against the Solidity on `main` @ `2e84151` (501 tests,
 19 suites, all passing). Every claim here was checked against the source at the
 time of writing; claims carried forward from older docs and found **false** are
 recorded in [§19 Corrections](#19-corrections--claims-that-were-false).
@@ -2562,7 +2562,7 @@ consequence, and the two upstream properties a vault builder must document are i
 
 ### 16.1 Test suites
 
-`forge test` — **483 tests, 19 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **501 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
@@ -2850,7 +2850,7 @@ bytecode, so the corrections are recorded rather than silently dropped.
 | "All **six** contracts use `pragma solidity =0.8.28`" | `blockchain-status.md` | There are **seven** core contracts (the atomic swap was added after that sentence was written). The pin itself is correct on all seven. |
 | Contract table listing all seven core contracts as "Platform (**MIT**)" | `blockchain-status.md` | **False** — they are **BUSL-1.1**. `contracts.md` had this right. |
 | "Test and deployment-script files under `contracts/test/` and `contracts/script/` remain **MIT**" | `README.md`, `contracts.md` | **False.** 22 are `UNLICENSED`, 7 are MIT, 6 are `GPL-2.0-or-later`. Full breakdown in [§4.2](#42-licensing). |
-| "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual: **483 tests across 19 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
+| "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `2e84151`): **501 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
 | "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml:29` | Stale. Now 483. The workflow comment is outside this document's remit and still says 471. |
 | "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | **8 of 14.** Six reference `DeployGuards`; the eight that do not are the six Euler steps plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
 | Fireblocks ERC20F / DenyList contracts "remain in the repo for reference only" at `contracts/erc20f/` | `blockchain-status.md` | **The directory does not exist** in this tree. |
