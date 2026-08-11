@@ -110,6 +110,7 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     // believe reads revert on staleness. They do not — see latestRoundData below.
     error NotEmergencyUpdater();
     error EmergencyUpdaterCannotBeOwner();
+    error CannotRenounceOwnership();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -163,10 +164,25 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         super.transferOwnership(newOwner);
     }
 
-    /// @dev Single funnel that actually changes owner() (acceptOwnership /
-    ///      renounceOwnership). Enforce the key-separation invariant here so it
-    ///      holds regardless of the path. address(0) is allowed so
-    ///      renounceOwnership() keeps working.
+    /// @notice Disabled (GLD-165) — this feed can never be left without an owner.
+    /// @dev    An ownerless feed is unrecoverable: `updateAnswer` dies, there is no
+    ///         proxy to upgrade, and reads never revert on staleness (see
+    ///         `latestRoundData`) so it serves its last answer forever instead of
+    ///         failing loudly. Renouncing with an `_emergencyUpdater` set is worse
+    ///         still — that address keeps unbounded price authority with nobody left
+    ///         to clear it. Rotate with transferOwnership + acceptOwnership instead.
+    ///         No `onlyOwner`: nobody can ever succeed, so one unambiguous error
+    ///         beats telling a non-owner the owner could have done it.
+    ///         Not retrofittable — feeds deployed before this guard lack it.
+    function renounceOwnership() public virtual override {
+        revert CannotRenounceOwnership();
+    }
+
+    /// @dev Single funnel that actually changes owner() (acceptOwnership). Enforce
+    ///      the key-separation invariant here so it holds regardless of the path.
+    ///      The address(0) carve-out is retained defensively — with
+    ///      renounceOwnership() disabled above and OZ's constructor rejecting a zero
+    ///      initialOwner, nothing currently reaches this with address(0).
     function _transferOwnership(address newOwner) internal virtual override {
         if (newOwner != address(0) && newOwner == _emergencyUpdater)
             revert EmergencyUpdaterCannotBeOwner();

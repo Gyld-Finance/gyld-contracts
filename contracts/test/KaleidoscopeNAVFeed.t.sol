@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test, Vm} from "forge-std/Test.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract KaleidoscopeNAVFeedTest is Test {
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
@@ -634,12 +635,76 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.acceptOwnership();
     }
 
-    function test_renounceOwnership_stillWorks() public {
+    // ── renounceOwnership is disabled (GLD-165) ──────────────────────────────
+
+    /// The feed is not upgradeable and its reads never revert on staleness, so a
+    /// renounce would freeze the published NAV forever with no recovery path.
+    function test_renounceOwnership_ownerReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
+        feed.renounceOwnership();
+        assertEq(feed.owner(), owner, "owner must be unchanged");
+    }
+
+    /// Same error for a non-owner: the call can never succeed for anyone, so it
+    /// must not report "not owner" and imply the owner could have done it.
+    function test_renounceOwnership_nonOwnerReverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
+        feed.renounceOwnership();
+        assertEq(feed.owner(), owner, "owner must be unchanged");
+    }
+
+    /// The dangerous state the guard exists to prevent: a renounce with an
+    /// emergency updater set would strand that address with permanent, uncapped
+    /// price authority and nobody able to clear it.
+    function test_renounceOwnership_revertsWithEmergencyUpdaterSet() public {
         vm.prank(owner);
         feed.setEmergencyUpdater(emergencyUpdater);
         vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
         feed.renounceOwnership();
-        assertEq(feed.owner(), address(0));
+        assertEq(feed.owner(), owner, "owner must be unchanged");
+        assertEq(feed.emergencyUpdater(), emergencyUpdater, "updater must be unchanged");
+    }
+
+    /// Premise the `_transferOwnership` comment now rests on: OZ's constructor
+    /// rejects a zero initialOwner, so that is not a back door to an ownerless
+    /// feed. Pinned so the zero path cannot reopen silently if `Ownable(...)` is
+    /// ever swapped for a custom initialiser.
+    function test_constructor_zeroOwnerReverts() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
+        new KaleidoscopeNAVFeed(address(0), "TLT / USD NAV");
+    }
+
+    /// The other premise: transferOwnership(address(0)) cancels a pending transfer
+    /// and never changes owner(), so it is not a renounce by another name.
+    function test_transferOwnership_zeroCancelsPendingWithoutChangingOwner() public {
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        assertEq(feed.pendingOwner(), newOwner);
+
+        vm.prank(owner);
+        feed.transferOwnership(address(0));
+        assertEq(feed.pendingOwner(), address(0), "pending must be cleared");
+        assertEq(feed.owner(), owner, "owner must be unchanged");
+
+        // The cancelled heir can no longer claim it.
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        feed.acceptOwnership();
+    }
+
+    /// The feed must remain fully operable after a rejected renounce — the guard
+    /// blocks the renounce, it does not brick the contract it protects.
+    function test_renounceOwnership_feedStillUsableAfterRejectedRenounce() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
+        feed.renounceOwnership();
+
+        vm.prank(owner);
+        feed.updateAnswer(9_542_000_000);
+        assertEq(feed.latestAnswer(), 9_542_000_000);
     }
 
     function test_transferOwnership_toDifferentAddressStillWorks() public {

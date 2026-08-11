@@ -595,13 +595,26 @@ structural property that makes the bypass safe:
 setEmergencyUpdater(newUpdater)  → reverts EmergencyUpdaterCannotBeOwner if newUpdater == owner()
 transferOwnership(newOwner)      → reverts if newOwner == _emergencyUpdater  (fail fast)
 _transferOwnership(newOwner)     → reverts if newOwner == _emergencyUpdater  (the single funnel
-                                    that actually changes owner(): acceptOwnership,
-                                    renounceOwnership)
+                                    that actually changes owner(): acceptOwnership)
+renounceOwnership()              → always reverts CannotRenounceOwnership
 ```
 
-`address(0)` is permitted in all three so the emergency path can be disabled and
-`renounceOwnership()` keeps working. The rate limit therefore still holds against
-a **single** compromised key; it does not hold against compromise of both.
+`address(0)` is permitted in `setEmergencyUpdater` and `transferOwnership` so the
+emergency path can be disabled and a pending transfer can be cancelled. The
+carve-out in `_transferOwnership` is now defensive only: with `renounceOwnership`
+disabled and OZ's constructor rejecting a zero `initialOwner`, nothing reaches it
+with `address(0)`. The rate limit therefore still holds against a **single**
+compromised key; it does not hold against compromise of both.
+
+`renounceOwnership()` is disabled outright (GLD-165). Note this is **not
+retrofittable** — the feed is not upgradeable, so feeds deployed before this
+guard (including the live Base mainnet feed, `DEPLOYMENTS.md`) do not have it and
+still depend on the runbook rule. The feed is not
+upgradeable and its reads never revert on staleness, so an owner-less feed would
+serve its last answer forever with no recovery path — and if an
+`_emergencyUpdater` were set at the time, that address would keep unbounded price
+authority with nobody able to clear it. §17.2 previously carried "Never call
+`renounceOwnership()`" as a written rule; the contract now enforces it.
 `EmergencyAnswerUpdated` is a deliberately different event from `AnswerUpdated`
 so monitoring can page on any use — every use should trigger an immediate ops
 review.
@@ -1132,7 +1145,7 @@ production. This is the table to read first if you are auditing the system.
 | `IssuanceManager` | `WHITELIST_ADMIN_ROLE` | `addToWhitelist`, `removeFromWhitelist`, `addToWhitelistBatch` | Compliance ops Gnosis Safe | Yes |
 | `IssuanceManager` | `REGISTRAR_ROLE` | `registerToken`, `deregisterToken` | `TokenFactory` — **held permanently, never revoked** | Yes |
 | `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | n/a (2-step transfer) |
-| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer`, `setEmergencyUpdater` | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | n/a |
+| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer`, `setEmergencyUpdater` | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
 | `KaleidoscopeNAVFeed` | `emergencyUpdater` | `emergencyUpdateAnswer` — bypasses **both** interval and deviation caps | Ops Gnosis Safe, **contract-enforced ≠ `owner()`** | n/a |
 | `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | n/a |
 | `SanctionsOracleMirror` | `DEFAULT_ADMIN_ROLE` | Grant/revoke roles; `setForwardingOracle` | Compliance ops Gnosis Safe | **No** |
@@ -1166,7 +1179,9 @@ production. This is the table to read first if you are auditing the system.
 - **The emergency NAV override is key-separated by the contract itself**, in all
   three directions (`setEmergencyUpdater`, `transferOwnership`,
   `_transferOwnership`), not by convention.
-- **Only `DEFAULT_ADMIN_ROLE` is non-renounceable.** `PAUSER_ROLE` and
+- **Among *roles*, only `DEFAULT_ADMIN_ROLE` is non-renounceable.** (Separately,
+  `KaleidoscopeNAVFeed.renounceOwnership()` reverts — GLD-165 — but that is
+  ownership, not a role.) `PAUSER_ROLE` and
   `TREASURER_ROLE` stay renounceable deliberately — the admin re-grants either in one
   transaction, so a renounce strands nothing, and a holder who knows their key is
   compromised must be able to shed the role without waiting on the timelock. See
@@ -2702,7 +2717,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | **ERC-2771 / gasless meta-transactions** | Not implemented. Phase-1 users are institutional APs who hold ETH and submit their own transactions. Adding it means operating relay infrastructure — who submits, who pays gas, how failures are handled, how the relay audit log is produced — for a problem that does not exist yet. | **Retail access.** Then: deploy a `MinimalForwarder`, upgrade the token via UUPS to inherit `ERC2771ContextUpgradeable` and override `_msgSender()`/`_msgData()` (~15 lines; ERC-7201 makes the upgrade safe), and deploy or integrate a relay service. The operational commitment is the real work. Additive and invisible to DeFi: the `_msgSender()` override only activates when `msg.sender` is the trusted forwarder. **Never** build a bespoke `delegatedTransfer()`; use the standard. The forwarder address must be set at deploy time and locked — a compromised or wrong forwarder can spoof any `_msgSender()`, admin addresses included. |
 | **On-chain rate limiter in `executeSwap`** | V1.1 candidate, following Ondo's `InstantMintTimeBasedRateLimiter`. If a minimum size is added alongside a cap, keep `min < cap remainder` — that was Ondo's Medium finding. | Before meaningful notional flows through the swap. |
 | **Multi-draw quotes (remaining-balance tracking)** | Explicitly out of scope for the capped-allowance design. Needs `filled[quoteId] += requestedAmountIn` instead of one bitmap bit, which swaps 256-quotes-per-slot for a per-quote counter, reopens "which fill's NAV and expiry apply to fill #2", and needs its own reentrancy analysis. | Only if the AP/LP flow genuinely needs draw-over-time rather than single-shot-capped sizing. Confirm which before estimating. |
-| **Multi-source NAV aggregator** (Phase 3) | Independent data sources each submit; median forwarded when M-of-N agree. | At scale. Phases 1→2 (KMS → Fordefi MPC) need **no contract change at all** — `transferOwnership` + `acceptOwnership`; from the feed's perspective it is still one address calling `updateAnswer`, with the MPC threshold happening invisibly at the signing layer. Never call `renounceOwnership()`. |
+| **Multi-source NAV aggregator** (Phase 3) | Independent data sources each submit; median forwarded when M-of-N agree. | At scale. Phases 1→2 (KMS → Fordefi MPC) need **no contract change at all** — `transferOwnership` + `acceptOwnership`; from the feed's perspective it is still one address calling `updateAnswer`, with the MPC threshold happening invisibly at the signing layer. `renounceOwnership()` reverts (GLD-165) — retire a feed by transferring it to a custodian you still control, never by renouncing. |
 | **Solana** | No Solana contracts in this repo. Token standard, custodian and compliance tooling are all EVM-native for v1. | After the EVM flow is battle-tested and a Solana custodian or issuer relationship exists. |
 | **Aave V3 listing** | Researched, not started. Path A fork test not yet written. | See [§15.4](#154-aave-v3--researched-not-deployed). |
 | **ERC-7540 queued-exit vault** | Was the V2 shape for LP exits under the removed vault design. Moot while the swap is self-custodial with no LPs. | Only if LP-funded liquidity returns. |
