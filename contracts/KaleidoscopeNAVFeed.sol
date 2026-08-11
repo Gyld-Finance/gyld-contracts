@@ -110,6 +110,14 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     // believe reads revert on staleness. They do not — see latestRoundData below.
     error NotEmergencyUpdater();
     error EmergencyUpdaterCannotBeOwner();
+    // GLD-165 / security review H-3: ownership on this contract is NOT renounceable.
+    // There is no proxy (Ownable2Step only), so a successful renounce — which sets
+    // owner() to address(0) permanently — would strand updateAnswer and
+    // setEmergencyUpdater with nobody left to call them, and (worse) leave a set
+    // _emergencyUpdater holding permanent, uncapped price authority. Every other
+    // contract in the repo already blocks the equivalent (renounceRole of
+    // DEFAULT_ADMIN_ROLE); this pins the house rule as code instead of a runbook.
+    error OwnershipCannotBeRenounced();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -163,14 +171,30 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         super.transferOwnership(newOwner);
     }
 
-    /// @dev Single funnel that actually changes owner() (acceptOwnership /
-    ///      renounceOwnership). Enforce the key-separation invariant here so it
-    ///      holds regardless of the path. address(0) is allowed so
-    ///      renounceOwnership() keeps working.
+    /// @dev Single funnel that actually changes owner() (acceptOwnership). Enforce
+    ///      the key-separation invariant here so it holds regardless of the path.
+    ///      address(0) is allowed so a transfer can be cancelled and so rotation
+    ///      through the pending-owner funnel stays well-defined.
+    ///      Ownership cannot be renounced at all — see OwnershipCannotBeRenounced
+    ///      and renounceOwnership() below (GLD-165 / H-3).
     function _transferOwnership(address newOwner) internal virtual override {
         if (newOwner != address(0) && newOwner == _emergencyUpdater)
             revert EmergencyUpdaterCannotBeOwner();
         super._transferOwnership(newOwner);
+    }
+
+    /// @dev Ownership on this contract can never be abandoned. The inherited OZ
+    ///      renounceOwnership() permanently zeroes owner() — unrecoverable here
+    ///      (no proxy) and the one action that can never be undone: updateAnswer and
+    ///      setEmergencyUpdater would be permanently dead, and a set
+    ///      _emergencyUpdater would keep uncapped price authority with nobody able
+    ///      to change or clear it. Retire a feed by transferring it to a custodian
+    ///      you still control, never by renouncing.
+    ///      No onlyOwner: the call can never succeed for anyone, so a single
+    ///      unambiguous error beats reporting "not owner" to a non-owner and
+    ///      implying the owner could have done it.
+    function renounceOwnership() public virtual override {
+        revert OwnershipCannotBeRenounced();
     }
 
     // ── Price update ──────────────────────────────────────────────────────────

@@ -634,12 +634,62 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.acceptOwnership();
     }
 
-    function test_renounceOwnership_stillWorks() public {
+    // ── renounceOwnership — permanently blocked (GLD-165 / review H-3) ───────
+
+    /// The owner cannot renounce. Unlike transferOwnership, renounceOwnership is
+    /// NOT gated by onlyOwner — the action can never succeed for anyone, so the
+    /// contract answers with the single unambiguous OwnershipCannotBeRenounced
+    /// error rather than telling a non-owner they are "not owner" (which would
+    /// imply the owner could have done it).
+    function test_renounceOwnership_revertsForOwner() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnershipCannotBeRenounced.selector);
+        feed.renounceOwnership();
+        // The owner is untouched — no silent, unrecoverable zeroing.
+        assertEq(feed.owner(), owner);
+    }
+
+    /// A stranger gets the SAME error as the owner — the call can never succeed
+    /// for anyone, so there is no "not owner" nuance to report.
+    function test_renounceOwnership_revertsForStranger() public {
+        vm.prank(stranger);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnershipCannotBeRenounced.selector);
+        feed.renounceOwnership();
+        assertEq(feed.owner(), owner);
+    }
+
+    /// The mirror case H-3 flagged: renouncing while an _emergencyUpdater is set
+    /// would strand that address with permanent, uncapped price authority and
+    /// nobody left to change or clear it. Both roles must survive an attempt.
+    function test_renounceOwnership_withEmergencyUpdater_cannotStrandIt() public {
         vm.prank(owner);
         feed.setEmergencyUpdater(emergencyUpdater);
+
         vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnershipCannotBeRenounced.selector);
         feed.renounceOwnership();
-        assertEq(feed.owner(), address(0));
+
+        // Owner still controls the contract; the emergency updater is unchanged
+        // and remains clearable by the (still intact) owner.
+        assertEq(feed.owner(), owner);
+        assertEq(feed.emergencyUpdater(), emergencyUpdater);
+        vm.prank(owner);
+        feed.setEmergencyUpdater(address(0));
+        assertEq(feed.emergencyUpdater(), address(0));
+    }
+
+    /// Rotation is unaffected: a failed renounce attempt changes nothing and the
+    /// two-step transfer still hands the feed to a controlled custodian.
+    function test_renounceOwnership_transferStillWorksAfterAttempt() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnershipCannotBeRenounced.selector);
+        feed.renounceOwnership();
+
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        feed.acceptOwnership();
+        assertEq(feed.owner(), newOwner);
     }
 
     function test_transferOwnership_toDifferentAddressStillWorks() public {

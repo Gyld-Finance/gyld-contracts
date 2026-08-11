@@ -193,6 +193,11 @@ The doc set is deliberately three files.
 - UUPS upgrades require a `TimelockController` in production (48 h minimum)
 - `DEFAULT_ADMIN_ROLE` is non-renounceable on every contract that has it; on
   `GyldAtomicSwap`, `PAUSER_ROLE` and `TREASURER_ROLE` are non-renounceable too
+- `KaleidoscopeNAVFeed.owner` is non-renounceable (GLD-165 / review H-3):
+  `renounceOwnership()` reverts `OwnershipCannotBeRenounced` — there is no proxy,
+  so zeroing `owner()` would permanently freeze `updateAnswer` / `setEmergencyUpdater`
+  and strand a set `emergencyUpdater` with uncapped price authority. Retire a feed
+  via `transferOwnership` + `acceptOwnership`, never by renouncing.
 - CI is structurally unable to broadcast: no secrets, no RPC URL, no key material,
   no fork cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`
 
