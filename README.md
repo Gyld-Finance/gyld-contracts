@@ -192,7 +192,9 @@ The doc set is deliberately three files.
   three upgradeable contracts (slots recomputed and pinned by test)
 - UUPS upgrades require a `TimelockController` in production (48 h minimum)
 - `DEFAULT_ADMIN_ROLE` is non-renounceable on every contract that has it; on
-  `GyldAtomicSwap`, `PAUSER_ROLE` and `TREASURER_ROLE` are non-renounceable too
+  `GyldAtomicSwap`, `PAUSER_ROLE` and `TREASURER_ROLE` stay renounceable
+  deliberately (see `docs/ARCHITECTURE.md` §6.1). `KaleidoscopeNAVFeed` has no
+  roles — its `renounceOwnership()` reverts instead, on newly deployed feeds
 - CI is structurally unable to broadcast: no secrets, no RPC URL, no key material,
   no fork cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`
 
