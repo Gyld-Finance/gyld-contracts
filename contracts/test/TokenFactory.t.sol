@@ -604,6 +604,35 @@ contract TokenFactoryTest is Test {
         assertFalse(t.hasRole(t.DEFAULT_ADMIN_ROLE(), address(factory)), "factory must NOT have DEFAULT_ADMIN_ROLE");
     }
 
+    // ── renounceOwnership is disabled (GLD-166) ──────────────────────────────
+
+    /// The factory owns DEFAULT_ADMIN_ROLE on every deployed GyldBondToken, so
+    /// renouncing would hand that governance authority to address(0) and permanently
+    /// lose deployToken — with no upgrade path back.
+    function test_renounceOwnership_ownerReverts() public {
+        vm.prank(address(this));
+        vm.expectRevert(TokenFactory.CannotRenounceOwnership.selector);
+        factory.renounceOwnership();
+        assertEq(factory.owner(), address(this), "owner must be unchanged");
+    }
+
+    /// Same error for a non-owner: the call can never succeed for anyone, so it
+    /// must not report "not owner" and imply the owner could have done it.
+    function test_renounceOwnership_nonOwnerReverts() public {
+        vm.prank(alice);
+        vm.expectRevert(TokenFactory.CannotRenounceOwnership.selector);
+        factory.renounceOwnership();
+        assertEq(factory.owner(), address(this), "owner must be unchanged");
+    }
+
+    /// Rotation must be unaffected by the guard: transfer + accept still works.
+    function test_renounceOwnershipGuard_rotationStillWorks() public {
+        factory.transferOwnership(bob);
+        vm.prank(bob);
+        factory.acceptOwnership();
+        assertEq(factory.owner(), bob, "rotation must still work");
+    }
+
     // ── re-entrancy guard ─────────────────────────────────────────────────────
 
     function test_deployToken_nonReentrant() public {

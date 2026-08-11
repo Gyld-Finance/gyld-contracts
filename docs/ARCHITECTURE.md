@@ -1144,10 +1144,10 @@ production. This is the table to read first if you are auditing the system.
 | `IssuanceManager` | `REDEEMER_ROLE` | `redeem()` — the burn path | MPC / Fordefi wallet B, **distinct from A** | Yes |
 | `IssuanceManager` | `WHITELIST_ADMIN_ROLE` | `addToWhitelist`, `removeFromWhitelist`, `addToWhitelistBatch` | Compliance ops Gnosis Safe | Yes |
 | `IssuanceManager` | `REGISTRAR_ROLE` | `registerToken`, `deregisterToken` | `TokenFactory` — **held permanently, never revoked** | Yes |
-| `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | n/a (2-step transfer) |
+| `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to factories deployed before it. |
 | `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer`, `setEmergencyUpdater` | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
 | `KaleidoscopeNAVFeed` | `emergencyUpdater` | `emergencyUpdateAnswer` — bypasses **both** interval and deviation caps | Ops Gnosis Safe, **contract-enforced ≠ `owner()`** | n/a |
-| `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | n/a |
+| `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to forwarders already deployed (incl. Base mainnet `0x09907C78D4eB531495962120464BFd9044390337`).
 | `SanctionsOracleMirror` | `DEFAULT_ADMIN_ROLE` | Grant/revoke roles; `setForwardingOracle` | Compliance ops Gnosis Safe | **No** |
 | `SanctionsOracleMirror` | `SANCTIONS_UPDATER_ROLE` | `addToSanctionsList`, `removeFromSanctionsList` | Keeper-bot hot wallet | Yes |
 | `GyldAtomicSwap` | `DEFAULT_ADMIN_ROLE` | **UUPS upgrade**; `unpause`; `registerSeries` / `deregisterSeries`; `setMaxQuoteDeviationBps`; `setMaxNavAgeSecs`; `setMaxQuoteTtl`; `setWithdrawalWallet`; `bumpQuoteEpoch`; role grants | **TimelockController** (48 h) | **No** |
