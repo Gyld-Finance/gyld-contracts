@@ -203,6 +203,36 @@ contract NAVFeedForwarderTest is Test {
         forwarder.setUpstreamOracle(address(feedV2));
     }
 
+    // ── renounceOwnership is disabled (GLD-166) ──────────────────────────────
+
+    /// The forwarder is a permanent address baked into immutable Morpho market params —
+    /// renouncing would weld the upstream pointer forever, making the Phase 2/3
+    /// oracle migration this contract exists to enable impossible.
+    function test_renounceOwnership_ownerReverts() public {
+        vm.prank(forwarderOwner);
+        vm.expectRevert(NAVFeedForwarder.CannotRenounceOwnership.selector);
+        forwarder.renounceOwnership();
+        assertEq(forwarder.owner(), forwarderOwner, "owner must be unchanged");
+    }
+
+    /// Same error for a non-owner: the call can never succeed for anyone, so it
+    /// must not report "not owner" and imply the owner could have done it.
+    function test_renounceOwnership_nonOwnerReverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(NAVFeedForwarder.CannotRenounceOwnership.selector);
+        forwarder.renounceOwnership();
+        assertEq(forwarder.owner(), forwarderOwner, "owner must be unchanged");
+    }
+
+    /// Rotation must be unaffected by the guard: transfer + accept still works.
+    function test_renounceOwnershipGuard_rotationStillWorks() public {
+        vm.prank(forwarderOwner);
+        forwarder.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        forwarder.acceptOwnership();
+        assertEq(forwarder.owner(), newOwner, "rotation must still work");
+    }
+
     // ── setUpstreamOracle interface validation (GYL-299) ─────────────────────
 
     function test_setUpstreamOracle_nonContractAddress_reverts() public {

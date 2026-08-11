@@ -61,6 +61,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     error MissingRegistrarRole(address factory, address issuanceManager);
     error ProxyDeployFailed();
     error NotValidSanctionsList(address addr);
+    /// renounceOwnership() is disabled — the factory must never be left ownerless.
+    error CannotRenounceOwnership();
 
     event TokenDeployed(
         address indexed token,
@@ -192,6 +194,20 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         forwarderOf[token]      = forwarder;
         emit TokenDeployed(token, navFeed, forwarder, issuanceManager);
         IssuanceManager(issuanceManager).registerToken(token);
+    }
+
+    /// @notice Disabled (GLD-166) — the factory can never be left ownerless.
+    /// @dev    `deployToken` is `onlyOwner`, so renouncing permanently ends the ability
+    ///         to issue new bond series, and the factory is not upgradeable so there is
+    ///         no path back. Already-deployed tokens are unaffected — `_wireRoles`
+    ///         grants DEFAULT_ADMIN_ROLE to `owner()` as a snapshot at deploy time, not
+    ///         a live lookup — but every FUTURE series is lost. Rotate with
+    ///         transferOwnership + acceptOwnership instead. No `onlyOwner`: nobody can
+    ///         ever succeed, so one unambiguous error beats telling a non-owner the
+    ///         owner could have done it. Not retrofittable — factories deployed before
+    ///         this guard lack it.
+    function renounceOwnership() public virtual override {
+        revert CannotRenounceOwnership();
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

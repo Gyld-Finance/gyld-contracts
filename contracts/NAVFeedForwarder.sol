@@ -57,6 +57,8 @@ contract NAVFeedForwarder is Ownable2Step {
     error InvalidOracle(address oracle);
     /// Upstream's latestRoundData() reported an `updatedAt` in the future.
     error UpstreamFutureDated(uint256 updatedAt, uint256 blockTimestamp);
+    /// renounceOwnership() is disabled — this forwarder must never be left ownerless.
+    error CannotRenounceOwnership();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -109,6 +111,20 @@ contract NAVFeedForwarder is Ownable2Step {
     /// @notice Returns the address of the current upstream oracle.
     function upstreamOracle() external view returns (address) {
         return address(_upstreamOracle);
+    }
+
+    /// @notice Disabled (GLD-166) — this forwarder can never be left ownerless.
+    /// @dev    `setUpstreamOracle` is the only owner-gated function, so renouncing
+    ///         welds the upstream pointer permanently: the Phase 2/3 oracle migration
+    ///         this contract exists to enable becomes impossible, and if the installed
+    ///         feed dies the forwarder keeps serving it with no way to repoint — its
+    ///         address is baked into immutable Morpho market params. Not upgradeable,
+    ///         so there is no path back. Rotate with transferOwnership +
+    ///         acceptOwnership instead. No `onlyOwner`: nobody can ever succeed, so one
+    ///         unambiguous error beats telling a non-owner the owner could have done it.
+    ///         Not retrofittable — forwarders deployed before this guard lack it.
+    function renounceOwnership() public virtual override {
+        revert CannotRenounceOwnership();
     }
 
     // ── Upstream sanity probe ─────────────────────────────────────────────────
