@@ -164,49 +164,16 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         super.transferOwnership(newOwner);
     }
 
-    /// @notice Disabled — this feed can never be left without an owner.
-    /// @dev    `Ownable.renounceOwnership()` is inherited and would set owner() to
-    ///         address(0) permanently. On THIS contract that is unrecoverable and,
-    ///         worse, silent:
-    ///
-    ///           - `updateAnswer` and `setEmergencyUpdater` both become unreachable,
-    ///             so no price can ever be published again;
-    ///           - there is no proxy (Ownable2Step only — see the note on
-    ///             `stalenessSeconds`), so there is no upgrade path back;
-    ///           - reads deliberately do NOT revert on staleness (see
-    ///             `latestRoundData`), so the feed keeps serving the last answer
-    ///             forever instead of failing loudly. A consumer that does not
-    ///             age-check `updatedAt` — Morpho Blue does not — would price
-    ///             collateral off a frozen NAV indefinitely, and the forwarder
-    ///             address is baked into immutable Morpho market params, so it
-    ///             cannot be repointed away;
-    ///           - and if an `_emergencyUpdater` is set when the renounce lands, that
-    ///             address retains UNBOUNDED price authority (no interval guard, no
-    ///             deviation guard) with nobody left who can change or clear it.
-    ///
-    ///         The four AccessControl contracts already block the equivalent action
-    ///         (`renounceRole` on GyldBondToken, IssuanceManager, GyldAtomicSwap and
-    ///         SanctionsOracleMirror, each for DEFAULT_ADMIN_ROLE only). The two
-    ///         other Ownable2Step contracts — NAVFeedForwarder and TokenFactory —
-    ///         do NOT yet block it; the forwarder in particular is the address baked
-    ///         into immutable Morpho market params, so renouncing it would weld the
-    ///         upstream pointer permanently. Tracked separately, deliberately out of
-    ///         scope here. ARCHITECTURE.md §17.2 already carried "Never call
-    ///         renounceOwnership()" as a written rule; this makes the contract
-    ///         enforce it rather than trusting the runbook.
-    ///
-    ///         NOT retrofittable: this contract is not upgradeable, so feeds already
-    ///         deployed — including the Base mainnet feed at
-    ///         0xC69e88136D52D0ADb911F03A2E71d374cA668DeC — do not have this guard.
-    ///         For those, the runbook rule remains the only protection.
-    ///
-    ///         Rotation is unaffected: transferOwnership + acceptOwnership still
-    ///         work. Retiring a feed means handing it to a custodian you still
-    ///         control, never renouncing it.
-    ///
-    ///         No `onlyOwner`: the call can never succeed for anyone, so a single
-    ///         unambiguous error beats reporting "not owner" to a non-owner and
-    ///         implying the owner could have done it.
+    /// @notice Disabled (GLD-165) — this feed can never be left without an owner.
+    /// @dev    An ownerless feed is unrecoverable: `updateAnswer` dies, there is no
+    ///         proxy to upgrade, and reads never revert on staleness (see
+    ///         `latestRoundData`) so it serves its last answer forever instead of
+    ///         failing loudly. Renouncing with an `_emergencyUpdater` set is worse
+    ///         still — that address keeps unbounded price authority with nobody left
+    ///         to clear it. Rotate with transferOwnership + acceptOwnership instead.
+    ///         No `onlyOwner`: nobody can ever succeed, so one unambiguous error
+    ///         beats telling a non-owner the owner could have done it.
+    ///         Not retrofittable — feeds deployed before this guard lack it.
     function renounceOwnership() public virtual override {
         revert CannotRenounceOwnership();
     }
