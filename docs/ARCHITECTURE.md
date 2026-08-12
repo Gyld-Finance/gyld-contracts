@@ -1990,30 +1990,24 @@ refactor to them is tracked in [§18](#18-known-gaps-and-open-decisions).
 
 Deployer for all Base and Sepolia work below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
 
-### 14.1 Base mainnet (8453) — the live production-test stack
+### 14.1 Base mainnet (8453) — retired demo, records removed
 
-Deployed 2026-05-18. Token metadata is deliberately test/dummy: name **Test Bond
-Alpha**, symbol **TBA**, ISIN `US000000TBA0` (fake), maturity 2030-01-01, 18
-decimals. All 13 transactions of step 1 landed in block **46,154,075**.
+The Base mainnet demo stack (a dummy "Test Bond Alpha" token behind a Morpho Blue
+market, deployed 2026-05-18 to produce a shareable `app.morpho.org` link) is
+**retired and no longer tracked here.** Its addresses were removed from this
+document and from `DEPLOYMENTS.md` on 2026-08-12 by owner decision (GLD-148): it is
+a learning/demo artefact, nothing in the platform depends on it, and it is not a
+deployment target.
 
-| Contract | Address |
-|---|---|
-| `GyldBondToken` proxy (TBA) | `0xD9e587D18A6aA190eba22dFce06fb84a8cdfEFA3` |
-| `KaleidoscopeNAVFeed` (TBA) | `0xC69e88136D52D0ADb911F03A2E71d374cA668DeC` |
-| `NAVFeedForwarder` (TBA) | `0x09907C78D4eB531495962120464BFd9044390337` |
-| `IssuanceManager` proxy | `0x5BA267367f06378816c58d47C5850fC9863Ce67F` |
-| `TokenFactory` | `0x18Ce55785bD24Dd096dAC11111168B1E94A76317` |
-| `TimelockController` — **delay = 0** | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` |
-| Chainalysis sanctions oracle (Base official) | `0x3A91A31cB3dC49b4db9Ce721F50a9D076c8D739B` |
+**The lesson it produced is kept, and is the important part** — this stack is why
+[§13](#13-deployment-model)'s deploy guards exist. It was deployed with `delay = 0`,
+an open executor and deployer-held roles, and `DeployBaseTest.s.sol` (deleted in
+`ea6683c`, GYL-1135) is why `isDevChain()` is now a **allowlist** rather than the
+`require(block.chainid != 1)` denylist that let an L2 through. See
+[§13.1](#13-deployment-model) and D-15 in the decision log.
 
-> **This stack carries the GYL-1135 incident configuration.** `delay = 0` and
-> deployer-held roles. It predates every guard in [§13](#13-deployment-model). The
-> `TokenFactory` here holds `REGISTRAR_ROLE` on the `IssuanceManager` and always
-> will — `hasRole(REGISTRAR_ROLE, factory) == true` on live Base. Treat it as a
-> production *test* deployment, not a governed one.
->
-> Its NAV feed has also been **stale since 2026-05-19** and, being immutable,
-> does not have `stalenessSeconds()`.
+The addresses remain recoverable from git history (this file and `DEPLOYMENTS.md`
+prior to 2026-08-12) if they are ever needed.
 
 ### 14.2 Ethereum Sepolia (11155111)
 
@@ -2744,21 +2738,26 @@ Carried forward honestly. Ordered by severity.
 
 ### High
 
-1. **The Base mainnet NAV feed has been stale since 2026-05-19, and Morpho does no
-   age check.** Morpho keeps quoting the pinned $100.00 indefinitely. This is a real,
-   open exposure to bad debt if the price gaps at reopen. No contract change fixes it —
-   the mitigation is a NAV keeper that pushes reliably plus alerting that pages when it
-   does not. Being immutable, that feed also lacks `stalenessSeconds()`, so alerting
-   must derive age from `latestRoundData().updatedAt` or the `AnswerUpdated` /
-   `EmergencyAnswerUpdated` events.
-2. **The live Base mainnet stack carries the GYL-1135 incident configuration** —
-   `delay = 0` on the timelock, deployer-held roles. It predates every guard in
-   [§13](#13-deployment-model). It must be re-deployed under the hardened scripts, or
-   explicitly re-classified as a throwaway production test, before anything real depends
-   on it.
+1. **The two Base mainnet findings are CLOSED — retired demo, records removed
+   (2026-08-12, GLD-148).** Former High #1 (NAV feed stale since 2026-05-19, Morpho
+   doing no age check) and former High #2 (the GYL-1135 incident configuration:
+   `delay = 0`, deployer-held roles, open executor) were re-verified on-chain and were
+   accurate. They are closed as **accepted, not remediated**: the stack was a
+   learning/demo deployment with a dummy asset and a ~1 USDC dust seed on which Gyld
+   held both sides, nothing in the platform reads it, and the bug class is closed at
+   source by [§13](#13-deployment-model)'s guards. Its addresses were removed from
+   [§14.1](#141-base-mainnet-8453--retired-demo-records-removed) and `DEPLOYMENTS.md`;
+   see git history prior to 2026-08-12 if they are ever needed.
+
+   *For auditors:* do not re-file these, and note that "wire up NAV keeper alerting for
+   the Base series" is **not implementable** — `ChainId` has only `Ethereum` and
+   `Solana` (`kaleidoscope crates/core-types/src/domain/chain.rs`), so Base is
+   unrepresentable in the backend domain model and the feed never had a writer.
+
+2. *(retired — see #1)*
 3. **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently.**
-   Neither the contract nor `DeployDevNet.s.sol` ever revokes it. On live Base,
-   `hasRole(REGISTRAR_ROLE, factory) == true`. The exploitable surface is narrow (the
+   Neither the contract nor `DeployDevNet.s.sol` ever revokes it — on any stack
+   deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The exploitable surface is narrow (the
    factory is immutable and has no `registerToken` passthrough) but the README asserted
    the opposite as a security property, and any threat model built on that assertion is
    wrong.
