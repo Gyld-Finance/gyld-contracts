@@ -44,58 +44,13 @@ Rules:
 
 ---
 
-## Base mainnet (chainId 8453)
+## Base mainnet (chainId 8453) — removed 2026-08-12
 
-Deployed 2026-05-18/19 (`DeployBaseTest`, `DeployEulerStep1–6`, plus Morpho via
-`cast send`). Implementations reproduce from commit **`6349ec5`** (on `main`).
-
-### Core
-
-| Contract | Address | Source commit | Privileged roles | Explorer verified | Status |
-|---|---|---|---|---|---|
-| TimelockController | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` | 6349ec5 (OZ v5) | **minDelay = 0**; PROPOSER = deployer EOA; EXECUTOR = open (`address(0)` role member — anyone may execute); admin = timelock itself | No (Blockscout) | live — **no delay protection; deployer EOA has instant control of everything the timelock owns** |
-| IssuanceManager (ERC1967 proxy) | `0x5BA267367f06378816c58d47C5850fC9863Ce67F` | 6349ec5 | DEFAULT_ADMIN_ROLE = **deployer EOA directly** (not the timelock) | No (Blockscout) | live |
-| IssuanceManager (implementation) | `0xEA637cdB348d4d14d1329E304F025cC8FD428E5a` | 6349ec5 | — (logic only) | No (Blockscout) | live |
-| GyldBondToken (implementation) | `0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad` | 6349ec5 | — (logic only). **Caution:** the *same address* on Sepolia is the ungated MockSanctionsList — same deployer nonce on two chains. Never copy this address across chains. | Yes (Blockscout) | live |
-| TokenFactory | `0x18Ce55785bD24Dd096dAC11111168B1E94A76317` | 6349ec5 | owner = timelock. **Caution:** same address on Sepolia is the (older) GyldBondToken implementation. | Yes (Blockscout) | live |
-| TBA token "Test Bond Alpha" (ERC1967 proxy, CREATE2) | `0xD9e587D18A6aA190eba22dFce06fb84a8cdfEFA3` | 6349ec5 | DEFAULT_ADMIN_ROLE = timelock (which the deployer controls with zero delay) | No (Blockscout) | live — test bond, not a production asset |
-| KaleidoscopeNAVFeed (TBA) | `0xC69e88136D52D0ADb911F03A2E71d374cA668DeC` | 6349ec5 | managed via timelock/factory | No (Blockscout) | live |
-| NAVFeedForwarder (TBA, AggregatorV3, 8-dec USD) | `0x09907C78D4eB531495962120464BFd9044390337` | 6349ec5 | owner = timelock | No (Blockscout) | live — the oracle address DeFi integrations point at |
-
-### Morpho Blue integration
-
-| Item | Address / ID | Source commit | Privileged roles | Explorer verified | Status |
-|---|---|---|---|---|---|
-| MorphoChainlinkOracleV2 (TBA/USDC) | `0xeD5f6Efb1A4d486642Dac48Ac129Af5834D7cA6a` | deployed via `cast send createMorphoChainlinkOracleV2` (no forge artifact); factory-produced, immutable | none (immutable) | Not checked on Blockscout | live — `price()` returns ~1.0002e26 |
-| Morpho Blue market (loan USDC `0x8335…2913`, collateral TBA, LLTV 86%) | id `0x9840633fea7b077c2efac0f819ccef9fa69e2641844fcc749e756cafb0bfd453` | market params, not a contract; lives on Morpho singleton `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` | Morpho markets are permissionless/immutable | n/a | live — dust-scale seed (~1 USDC supplied, ~0.70 borrowed, last update 2026-05-19) |
-
-### Euler V2 integration
-
-| Contract | Address | Source commit | Privileged roles | Explorer verified | Status |
-|---|---|---|---|---|---|
-| ChainlinkOracle adapter (TBA/USDC, wraps NAVFeedForwarder) | `0x557c63b77BCC74D511E05A8C6EF58DC809c13e8D` | 6349ec5 (`DeployEulerStep1`) | none (immutable) | No (Blockscout) | live |
-| EulerRouter #1 | `0xe2Cf003AA0855D035c01c32B1cdEb081f7666428` | 6349ec5 (`DeployEulerStep2`) | governor = `address(0)` (renounced) | No (Blockscout) | **do-not-reuse** — governance renounced before `govSetResolvedVault()` was called; cannot price escrow-vault shares; permanently misconfigured. Superseded by router #2. |
-| IRMLinearKink | `0xE0EF36466d5d6Fce7764339d278Fe786a4cA573d` | 6349ec5 (`DeployEulerStep3`) | none (immutable by design) | No (Blockscout) | live |
-| TBA escrow EVault | `0x155872FAA8c6C47BAE55cbE14deFb324663ec3F4` | 6349ec5 (`DeployEulerStep4`) | governorAdmin = `address(0)` (renounced) | No (Blockscout) | live, immutable |
-| — escrow vault DToken | `0x2eA7A9556ce9eFAcd1e842cdb5316D68a56710eB` | (created by EVault factory) | — | No | live |
-| EulerRouter #2 (active) | `0xBD8535B344293e96C0eFE7E9224aB54CE880471E` | 6349ec5 (`DeployEulerStep5`) | governor = `address(0)` (renounced, correctly configured first) | No (Blockscout) | live, immutable |
-| USDC lending EVault | `0xCF8930030FbA9c8599A534304B94972762d79F71` | 6349ec5 (`DeployEulerStep5`) | governorAdmin = `address(0)` (renounced) | No (Blockscout) | live, immutable |
-| — lending vault DToken | `0x059A4Ebf50CB8084F0a0fC795C42f9209063D611` | (created by EVault factory) | — | No | live |
-
-External dependencies referenced (not ours, listed to prevent confusion):
-Base USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, Morpho Blue
-`0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`, Morpho Adaptive Curve IRM
-`0x46415998764C29aB2a25CbeA6254146D50D22687`, Euler EVC
-`0x5301c7dD20bD945D2013b48ed0DEE3A284ca8989`, EVault factory
-`0x7F321498A801A191a93C840750ed637149dDf8D0`, deterministic deployer
-`0x4e59b44847b379578588920cA78FbF26c0B4956C`.
-
-Explorer note: "No (Blockscout)" means `base.blockscout.com` has no verified
-source for the address as of 2026-08-04. BaseScan (Etherscan) status could not
-be checked from this environment — the Etherscan v2 API requires an API key
-(`ETHERSCAN_API_KEY`); re-check and verify sources there.
-
----
+The Base demo stack's addresses were **removed from this address book** by owner
+decision (GLD-148). It was a learning/demo deployment (dummy "Test Bond Alpha"
+token, ~1 USDC dust seed, Gyld on both sides of the Morpho market), nothing in the
+platform reads it, and it is not a deployment target. Recoverable from git history
+if ever needed.
 
 ## Ethereum Sepolia (chainId 11155111)
 
