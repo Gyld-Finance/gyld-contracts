@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
+import {IERC1643} from "../interfaces/IERC1643.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 
@@ -203,10 +204,11 @@ contract GyldBondTokenTest is Test {
     /// rather than copy-pasted as a literal, so the test cannot drift from the contract's
     /// declared storage-location namespace while still appearing to pass.
     ///
-    /// The final assertion pins the END of the struct: `GyldBondTokenStorage` has exactly
-    /// three fields, so offset 3 must be untouched. A future field MUST be APPENDED at
-    /// offset 3 (never inserted) — doing so is expected to fail this assertion, which is
-    /// the intended prompt to extend the pins below rather than a reason to delete them.
+    /// The final pair of assertions pins the appended IERC-1643 fields: the `documents`
+    /// mapping MUST sit at offset 3 and the `docNames` array MUST sit at offset 4 — appended
+    /// after the original three fields, never inserted among them. (Offsets 3/4 are
+    /// exercised with real data in `test_storageLayout_documentFieldsAppendedAtOffsets3and4`;
+    /// here we only confirm the original layout is still untouched.)
     function test_storageLayout_erc7201OffsetsArePinned() public view {
         bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1))
             & ~bytes32(uint256(0xff));
@@ -227,9 +229,45 @@ contract GyldBondTokenTest is Test {
             token.maturityTimestamp(),
             "offset 2 is not maturityTimestamp"
         );
+    }
 
-        // Nothing is written past the struct's three fields.
-        assertEq(uint256(vm.load(address(token), bytes32(uint256(root) + 3))), 0, "wrote past offset 2");
+    /// Pins that the IERC-1643 fields were APPENDED at offsets 3 (documents mapping) and 4
+    /// (docNames array), verified against raw storage after a real setDocument. The mapping's
+    /// first member (uri length) must live at keccak256(name, slot3), the array length at
+    /// slot4, and the array's first element at keccak256(slot4). A field INSERTED anywhere
+    /// among offsets 0..2 would shift these and break this test.
+    function test_storageLayout_documentFieldsAppendedAtOffsets3and4() public {
+        bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1))
+            & ~bytes32(uint256(0xff));
+        bytes32 slot3 = bytes32(uint256(root) + 3); // documents mapping
+        bytes32 slot4 = bytes32(uint256(root) + 4); // docNames array
+
+        bytes32 name = keccak256("prospectus");
+        string memory uri = "ipfs://Qm1234567890abcdef/prospectus.pdf";
+        bytes32 hash = keccak256("prospectus-pdf");
+
+        // admin in setUp only holds DEFAULT_ADMIN_ROLE — grant DOCUMENT_ROLE, then set a doc.
+        bytes32 docRole = token.DOCUMENT_ROLE();
+        vm.prank(admin); token.grantRole(docRole, admin);
+        vm.prank(admin); token.setDocument(name, uri, hash);
+
+        // documents mapping offset: uri is a LONG string (> 31 bytes), so its length slot
+        // at keccak256(name, slot3) holds 2*len+1 (the long-string marker). Proving that
+        // slot carries the uri's length confirms the mapping itself sat at offset 3.
+        bytes32 uriLenSlot = keccak256(abi.encode(name, slot3));
+        assertEq(
+            uint256(vm.load(address(token), uriLenSlot)),
+            2 * bytes(uri).length + 1,
+            "documents mapping not at offset 3"
+        );
+
+        // docNames array offset: length at slot4, first element at keccak256(slot4).
+        assertEq(uint256(vm.load(address(token), slot4)), 1, "docNames length not at offset 4");
+        assertEq(
+            bytes32(vm.load(address(token), keccak256(abi.encode(slot4)))),
+            name,
+            "docNames[0] not at keccak256(slot4)"
+        );
     }
 
     /// Upgrading to V2 preserves all existing state: balances, ISIN, maturity,
@@ -488,6 +526,185 @@ contract GyldBondTokenTest is Test {
 
         assertEq(GyldBondTokenV2(address(token)).version(), 2, "precondition: the upgrade landed");
         assertEq(token.decimals(), 18, "decimals must not move across an upgrade");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Gap 5 — IERC-1643 document management
+    // ═════════════════════════════════════════════════════════════════════════
+
+    bytes32 constant DOC_NAME   = keccak256("prospectus");
+    string  constant DOC_URI    = "ipfs://Qm1234567890abcdef/prospectus.pdf";
+    bytes32 constant DOC_HASH   = keccak256("prospectus-pdf");
+    bytes32 constant DOC_NAME2  = keccak256("supplement-1");
+
+    /// Helper: grant `caller` DOCUMENT_ROLE. In setUp only admin holds DEFAULT_ADMIN_ROLE,
+    /// so grants are always made as admin. Returns the DOCUMENT_ROLE id to reuse.
+    function _grantDocumentRole(address caller) internal returns (bytes32) {
+        bytes32 docRole = token.DOCUMENT_ROLE();
+        vm.prank(admin); token.grantRole(docRole, caller);
+        return docRole;
+    }
+
+    /// setDocument stores uri + hash, fires DocumentUpdated, and getDocument reads it back.
+    function test_setDocument_addsDocument() public {
+        _grantDocumentRole(operator);
+
+        bytes32 name = DOC_NAME;
+        vm.prank(operator);
+        vm.expectEmit(true, false, false, true, address(token));
+        emit IERC1643.DocumentUpdated(name, DOC_URI, DOC_HASH);
+        token.setDocument(name, DOC_URI, DOC_HASH);
+
+        (string memory uri, bytes32 hash, uint256 lastModified) = token.getDocument(name);
+        assertEq(uri, DOC_URI, "uri mismatch");
+        assertEq(hash, DOC_HASH, "documentHash mismatch");
+        assertEq(lastModified, block.timestamp, "lastModified should be block.timestamp");
+
+        bytes32[] memory names = token.getAllDocuments();
+        assertEq(names.length, 1, "getAllDocuments length");
+        assertEq(names[0], name, "getAllDocuments[0]");
+    }
+
+    /// Replacing an existing document updates in place and does NOT duplicate the array entry.
+    function test_setDocument_replacesWithoutDuplicating() public {
+        _grantDocumentRole(operator);
+
+        bytes32 name = DOC_NAME;
+        vm.prank(operator); token.setDocument(name, DOC_URI, DOC_HASH);
+
+        string memory newUri = "ipfs://Qm9999999999999999/prospectus-v2.pdf";
+        bytes32 newHash = keccak256("prospectus-pdf-v2");
+        vm.prank(operator); token.setDocument(name, newUri, newHash);
+
+        (string memory uri, bytes32 hash, ) = token.getDocument(name);
+        assertEq(uri, newUri, "uri not replaced");
+        assertEq(hash, newHash, "hash not replaced");
+
+        bytes32[] memory names = token.getAllDocuments();
+        assertEq(names.length, 1, "replacing a doc must not grow the array");
+        assertEq(names[0], name);
+    }
+
+    /// Multiple documents are all enumerated by getAllDocuments.
+    function test_setDocument_multipleDocsEnumerated() public {
+        _grantDocumentRole(operator);
+
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+        vm.prank(operator); token.setDocument(DOC_NAME2, "ipfs://Qm.../supplement-1.pdf", keccak256("supp-1"));
+
+        bytes32[] memory names = token.getAllDocuments();
+        assertEq(names.length, 2, "two docs expected");
+        assertTrue(names[0] == DOC_NAME || names[1] == DOC_NAME, "DOC_NAME present");
+        assertTrue(names[0] == DOC_NAME2 || names[1] == DOC_NAME2, "DOC_NAME2 present");
+    }
+
+    /// setDocument is gated by DOCUMENT_ROLE — a caller without it reverts.
+    function test_setDocument_nonDocumentRole_reverts() public {
+        vm.prank(operator); // PAUSER_ROLE only
+        vm.expectRevert();
+        token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+    }
+
+    function test_setDocument_emptyUri_reverts() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentUri.selector);
+        token.setDocument(DOC_NAME, "", DOC_HASH);
+    }
+
+    function test_setDocument_zeroHash_reverts() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentHash.selector);
+        token.setDocument(DOC_NAME, DOC_URI, bytes32(0));
+    }
+
+    /// removeDocument clears the doc, fires DocumentRemoved, and drops it from getAllDocuments.
+    function test_removeDocument_removesDocument() public {
+        _grantDocumentRole(operator);
+
+        bytes32 name = DOC_NAME;
+        vm.prank(operator); token.setDocument(name, DOC_URI, DOC_HASH);
+
+        vm.prank(operator);
+        vm.expectEmit(true, false, false, true, address(token));
+        emit IERC1643.DocumentRemoved(name);
+        token.removeDocument(name);
+
+        // getDocument now reverts.
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, name));
+        token.getDocument(name);
+
+        assertEq(token.getAllDocuments().length, 0, "docNames not emptied");
+    }
+
+    function test_removeDocument_nonexistent_reverts() public {
+        _grantDocumentRole(operator);
+        bytes32 name = DOC_NAME;
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, name));
+        token.removeDocument(name);
+    }
+
+    function test_removeDocument_nonDocumentRole_reverts() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+
+        vm.prank(issuer); // no role
+        vm.expectRevert();
+        token.removeDocument(DOC_NAME);
+    }
+
+    function test_removeDocument_keepsOtherDocs() public {
+        _grantDocumentRole(operator);
+
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+        vm.prank(operator); token.setDocument(DOC_NAME2, "ipfs://Qm.../supplement-1.pdf", keccak256("supp-1"));
+
+        vm.prank(operator); token.removeDocument(DOC_NAME);
+
+        bytes32[] memory names = token.getAllDocuments();
+        assertEq(names.length, 1, "the other doc should remain");
+        assertEq(names[0], DOC_NAME2);
+    }
+
+    /// getDocument reverts for a name that was never set.
+    function test_getDocument_nonexistent_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, DOC_NAME));
+        token.getDocument(DOC_NAME);
+    }
+
+    /// An empty token enumerates no documents.
+    function test_getAllDocuments_empty() public view {
+        assertEq(token.getAllDocuments().length, 0, "no docs initially");
+    }
+
+    /// Documents survive a UUPS upgrade — the appended layout preserves them across
+    /// implementation swaps exactly like the pre-existing state (see test_upgrade_preservesAllState).
+    function test_upgrade_preservesDocuments() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+
+        bytes32[] memory before = token.getAllDocuments();
+        assertEq(before.length, 1);
+
+        GyldBondTokenV2 v2Impl = new GyldBondTokenV2();
+        vm.prank(admin);
+        token.upgradeToAndCall(address(v2Impl), "");
+        GyldBondTokenV2 tokenV2 = GyldBondTokenV2(address(token));
+        assertEq(tokenV2.version(), 2, "precondition: upgrade landed");
+
+        (string memory uri, bytes32 hash, ) = token.getDocument(DOC_NAME);
+        assertEq(uri, DOC_URI, "document uri corrupted across upgrade");
+        assertEq(hash, DOC_HASH, "document hash corrupted across upgrade");
+
+        bytes32[] memory afterUpgrade = token.getAllDocuments();
+        assertEq(afterUpgrade.length, 1, "doc list corrupted across upgrade");
+        assertEq(afterUpgrade[0], DOC_NAME);
+
+        // Document management remains functional post-upgrade (operator holds DOCUMENT_ROLE).
+        vm.prank(operator); token.setDocument(DOC_NAME2, "ipfs://Qm.../supplement-1.pdf", keccak256("supp-1"));
+        assertEq(token.getAllDocuments().length, 2, "can still add docs post-upgrade");
     }
 }
 

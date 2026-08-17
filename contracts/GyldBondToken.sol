@@ -7,6 +7,7 @@ import {ERC20PermitUpgradeable} from "@openzeppelin/contracts-upgradeable/token/
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IERC1643} from "./interfaces/IERC1643.sol";
 
 /// @dev Read-only interface for the Chainalysis on-chain sanctions oracle.
 /// Mainnet: 0x40C57923924B5c5c5455c48D93317139ADDaC8fb
@@ -49,19 +50,23 @@ interface ISanctionsList {
 ///   MINTER_ROLE        — IssuanceManager only
 ///   BURNER_ROLE        — IssuanceManager only
 ///   PAUSER_ROLE        — ops multisig (separate signer set from governance)
+///   DOCUMENT_ROLE      — ops multisig, for ERC-1643 document set/remove (operational, not a
+///                        governance event — decisions recorded on GLD-264)
 contract GyldBondToken is
     Initializable,
     ERC20Upgradeable,
     ERC20PermitUpgradeable,
     AccessControlUpgradeable,
     PausableUpgradeable,
-    UUPSUpgradeable
+    UUPSUpgradeable,
+    IERC1643
 {
     // ── Roles ─────────────────────────────────────────────────────────────────
 
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant DOCUMENT_ROLE = keccak256("DOCUMENT_ROLE");
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -70,6 +75,10 @@ contract GyldBondToken is
         ISanctionsList sanctionsList;
         string isin;
         uint256 maturityTimestamp;
+        // ── IERC-1643 document management ────────────────────────────────────
+        // Appended fields — ERC-7201 layout-safe for the UUPS upgrade of live proxies.
+        mapping(bytes32 => Document) documents;
+        bytes32[] docNames;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1)) & ~bytes32(uint256(0xff))
@@ -89,6 +98,9 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error NotValidSanctionsList(address addr);
+    error EmptyDocumentUri();
+    error EmptyDocumentHash();
+    error DocumentDoesNotExist(bytes32 name);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -236,6 +248,55 @@ contract GyldBondToken is
         emit SanctionsListUpdated(newSanctionsList);
     }
 
+    // ── Document management (IERC-1643) ──────────────────────────────────────
+
+    /// @notice Set (add or replace) a document associated with this bond token.
+    /// @dev    Gated by DOCUMENT_ROLE — an ops multisig — so prospectus / supplement
+    ///         uploads are operational, not timelock-governed (decision on GLD-264). A
+    ///         document is only ever nullified by removeDocument: `uri` must be non-empty
+    ///         and `documentHash` non-zero here, so getDocument's revert-on-absent check is
+    ///         sound. `lastModified` records the block timestamp of this update.
+    ///         Existing documents are upserted in place (no array growth on replace).
+    function setDocument(bytes32 name, string calldata uri, bytes32 documentHash)
+        external
+        onlyRole(DOCUMENT_ROLE)
+    {
+        if (bytes(uri).length == 0) revert EmptyDocumentUri();
+        if (documentHash == bytes32(0)) revert EmptyDocumentHash();
+        GyldBondTokenStorage storage $ = _getStorage();
+        Document storage doc = $.documents[name];
+        bool isNew = bytes(doc.uri).length == 0;
+        if (isNew) $.docNames.push(name);
+        doc.uri = uri;
+        doc.documentHash = documentHash;
+        doc.lastModified = block.timestamp;
+        emit DocumentUpdated(name, uri, documentHash);
+    }
+
+    /// @notice Remove an existing document from this bond token.
+    /// @dev    Gated by DOCUMENT_ROLE. Reverts if `name` does not exist.
+    function removeDocument(bytes32 name) external onlyRole(DOCUMENT_ROLE) {
+        GyldBondTokenStorage storage $ = _getStorage();
+        if (bytes($.documents[name].uri).length == 0) revert DocumentDoesNotExist(name);
+        delete $.documents[name];
+        _removeDocName($.docNames, name);
+        emit DocumentRemoved(name);
+    }
+
+    /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
+    function getDocument(bytes32 name) external view returns (string memory, bytes32, uint256) {
+        GyldBondTokenStorage storage $ = _getStorage();
+        Document storage doc = $.documents[name];
+        if (bytes(doc.uri).length == 0) revert DocumentDoesNotExist(name);
+        return (doc.uri, doc.documentHash, doc.lastModified);
+    }
+
+    /// @notice Return the names of all documents on this token (unbounded — intended for
+    ///         the handful of docs each bond carries; see plan note on GLD-264).
+    function getAllDocuments() external view returns (bytes32[] memory) {
+        return _getStorage().docNames;
+    }
+
     // ── Pause ─────────────────────────────────────────────────────────────────
 
     function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
@@ -262,5 +323,18 @@ contract GyldBondToken is
     function _requireAccess(address account) internal view {
         ISanctionsList sl = _getStorage().sanctionsList;
         if (address(sl) != address(0) && sl.isSanctioned(account)) revert AccountSanctioned(account);
+    }
+
+    /// Remove `name` from the docNames array (swap-and-pop). The array's ordering is purely
+    /// for enumeration, never semantically meaningful, so a swap on removal is safe and O(1).
+    function _removeDocName(bytes32[] storage array, bytes32 name) internal {
+        uint256 len = array.length;
+        for (uint256 i; i < len; ++i) {
+            if (array[i] == name) {
+                array[i] = array[len - 1];
+                array.pop();
+                return;
+            }
+        }
     }
 }
