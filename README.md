@@ -37,6 +37,7 @@ DEFAULT_ADMIN_ROLE   →  TimelockController (48 h minimum in production)
 MINTER_ROLE          →  IssuanceManager (exclusively — never an EOA)
 BURNER_ROLE          →  IssuanceManager (exclusively)
 PAUSER_ROLE          →  Ops multisig hot wallet (no delay — emergency pause)
+DOCUMENT_ROLE        →  Ops multisig (IERC-1643 document set/remove — operational, no delay; GLD-264)
 
 WHITELIST_ADMIN_ROLE →  Compliance ops multisig
 SUBSCRIBER_ROLE      →  MPC wallet A  (subscribe / mint path only)
@@ -160,7 +161,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 | `GyldAtomicSwap.spec.t.sol` | The numbered invariant / finding catalogue (I-1…I-24, F-1…F-7) |
 | `GyldAtomicSwap.invariants.t.sol` | Stateful: never-mints, single-use quotes, fair-price rounding |
 | `GyldAtomicSwap.halmos.t.sol` | Halmos symbolic verification of I-1, I-2, I-3, I-10, I-11 (`check_` prefix; `forge test` skips these) |
-| `GyldBondToken.t.sol` | Transfer, sanctions, pause, permit, role management |
+| `GyldBondToken.t.sol` | Transfer, sanctions, pause, permit, role management, storage slot-pinning, UUPS upgrade, IERC-1643 document management |
 | `GyldBondToken.invariants.t.sol` | Supply invariants under fuzz |
 | `IssuanceManager.t.sol` | Subscribe, redeem, whitelist, token registry, role isolation, UUPS |
 | `KaleidoscopeNAVFeed.t.sol` | Price updates, deviation guard, interval guard, emergency updater + key separation, and `test_noStalenessRevertPathExists` |

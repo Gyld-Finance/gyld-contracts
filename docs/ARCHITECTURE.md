@@ -1139,6 +1139,7 @@ production. This is the table to read first if you are auditing the system.
 | `GyldBondToken` | `MINTER_ROLE` | `mint(to, amount)` | `IssuanceManager` **only** | Yes |
 | `GyldBondToken` | `BURNER_ROLE` | `burn(from, amount)` | `IssuanceManager` **only** | Yes |
 | `GyldBondToken` | `PAUSER_ROLE` | `pause()` **and** `unpause()` | Ops multisig (hot, no delay) | Yes |
+| `GyldBondToken` | `DOCUMENT_ROLE` | `setDocument`, `removeDocument` (IERC-1643) | Ops multisig (hot, no delay — operational, GLD-264) | Yes |
 | `IssuanceManager` | `DEFAULT_ADMIN_ROLE` | Grant/revoke all roles; **UUPS upgrade** | **TimelockController** (48 h) | **No** |
 | `IssuanceManager` | `SUBSCRIBER_ROLE` | `subscribe()` — the mint path | MPC / Fordefi wallet A | Yes |
 | `IssuanceManager` | `REDEEMER_ROLE` | `redeem()` — the burn path | MPC / Fordefi wallet B, **distinct from A** | Yes |
