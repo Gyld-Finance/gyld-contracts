@@ -22,6 +22,7 @@ contract TokenHandler is CommonBase, StdCheats, StdUtils {
     constructor(GyldBondToken token_, address[4] memory actors_) {
         token = token_;
         actors = actors_;
+        _initDocNames();
     }
 
     function mint(uint256 actorSeed, uint256 amount) external {
@@ -52,6 +53,56 @@ contract TokenHandler is CommonBase, StdCheats, StdUtils {
     function actorList() external view returns (address[4] memory) {
         return actors;
     }
+
+    // ── ERC-1643 documents (GLD-264) ─────────────────────────────────────────
+    // `documents` (the map) and `docNames` (the enumeration array) are two pieces of
+    // state that must stay in step across any sequence of add / replace / remove.
+    // The hand-written tests cover the sequences someone thought of; these actions let
+    // the fuzzer try the ones nobody did — re-adding a removed name, removing the last
+    // element, removing the middle of three, replacing without growing the array.
+    //
+    // foundry.toml sets fail_on_revert = true for invariants, so every action below must
+    // be revert-free BY CONSTRUCTION: names come from a fixed pool (never zero), uri and
+    // hash are never empty, and removal early-returns instead of calling into a revert.
+
+    bytes32[4] internal docNamePool;
+    mapping(bytes32 => bool) public docLive;
+    uint256 public liveDocCount;
+
+    function _initDocNames() internal {
+        docNamePool = [
+            bytes32("terms"),
+            bytes32("prospectus"),
+            bytes32("supplement-1"),
+            bytes32("annual-report")
+        ];
+    }
+
+    function setDocument(uint256 nameSeed, uint256 uriSeed) external {
+        bytes32 name = docNamePool[nameSeed % docNamePool.length];
+        string memory uri = string.concat("ipfs://Qm", vm.toString(uriSeed), "/doc.pdf");
+        token.setDocument(name, uri, sha256(abi.encode(uriSeed, name)));
+        if (!docLive[name]) {
+            docLive[name] = true;
+            ++liveDocCount;
+        }
+    }
+
+    function removeDocument(uint256 nameSeed) external {
+        bytes32 name = docNamePool[nameSeed % docNamePool.length];
+        if (!docLive[name]) return; // fail_on_revert = true — never call into a revert
+        token.removeDocument(name);
+        docLive[name] = false;
+        --liveDocCount;
+    }
+
+    function docNameAt(uint256 i) external view returns (bytes32) {
+        return docNamePool[i];
+    }
+
+    function docNamePoolLength() external view returns (uint256) {
+        return docNamePool.length;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,6 +132,7 @@ contract GyldBondTokenInvariantsTest is StdInvariant, Test {
 
         token.grantRole(token.MINTER_ROLE(), address(handler));
         token.grantRole(token.BURNER_ROLE(), address(handler));
+        token.grantRole(token.DOCUMENT_ROLE(), address(handler));
 
         // Seed initial balances.
         token.grantRole(token.MINTER_ROLE(), address(this));
@@ -120,6 +172,47 @@ contract GyldBondTokenInvariantsTest is StdInvariant, Test {
             sum += token.balanceOf(actors_[i]);
         }
         assertLe(sum, token.totalSupply(), "sum(balances) > totalSupply");
+    }
+
+    // ── Invariant: ERC-1643 document index (GLD-264) ──────────────────────────
+
+    /// getAllDocuments() and the documents map never diverge, under any sequence.
+    /// Catches: a broken isNew sentinel (duplicate pushes), _removeDocName popping the
+    /// wrong index, and a map entry left behind after its name left the array.
+    function invariant_docIndexMatchesLiveDocuments() external view {
+        bytes32[] memory enumerated = token.getAllDocuments();
+        assertEq(enumerated.length, handler.liveDocCount(), "getAllDocuments length != live count");
+
+        for (uint256 i; i < enumerated.length; ++i) {
+            assertTrue(handler.docLive(enumerated[i]), "enumerated a name believed removed");
+
+            // No duplicates — the failure mode if the isNew sentinel ever breaks.
+            for (uint256 j = i + 1; j < enumerated.length; ++j) {
+                assertTrue(enumerated[i] != enumerated[j], "duplicate name in getAllDocuments");
+            }
+
+            // Every enumerated name resolves to a real stored document.
+            (string memory uri,,) = token.getDocument(enumerated[i]);
+            assertGt(bytes(uri).length, 0, "enumerated name has no stored document");
+        }
+    }
+
+    /// The mirror direction: no live document is missing from the enumeration, so a name
+    /// can never become unreachable through getAllDocuments while still occupying the map.
+    function invariant_everyLiveDocumentIsEnumerated() external view {
+        bytes32[] memory enumerated = token.getAllDocuments();
+        uint256 poolLen = handler.docNamePoolLength();
+
+        for (uint256 i; i < poolLen; ++i) {
+            bytes32 name = handler.docNameAt(i);
+            if (!handler.docLive(name)) continue;
+
+            bool found;
+            for (uint256 j; j < enumerated.length; ++j) {
+                if (enumerated[j] == name) { found = true; break; }
+            }
+            assertTrue(found, "a live document is not enumerated");
+        }
     }
 }
 
