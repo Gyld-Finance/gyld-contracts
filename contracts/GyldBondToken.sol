@@ -98,6 +98,7 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error NotValidSanctionsList(address addr);
+    error EmptyDocumentName();
     error EmptyDocumentUri();
     error EmptyDocumentHash();
     error DocumentDoesNotExist(bytes32 name);
@@ -261,6 +262,17 @@ contract GyldBondToken is
         external
         onlyRole(DOCUMENT_ROLE)
     {
+        _setDocument(name, uri, documentHash);
+    }
+
+    /// @dev Shared writer for every document path. Validation lives HERE, not in the
+    ///      external function, so a future second entry point (e.g. the ERC-1643 terms
+    ///      accessor) physically cannot skip it. `name != 0` matches CMTAT's
+    ///      ERC1643InvalidName; the non-empty `uri` and non-zero `documentHash` checks
+    ///      are what make the `isNew` sentinel below and removeDocument's existence
+    ///      check sound — a stored document always has a non-empty uri.
+    function _setDocument(bytes32 name, string calldata uri, bytes32 documentHash) internal {
+        if (name == bytes32(0)) revert EmptyDocumentName();
         if (bytes(uri).length == 0) revert EmptyDocumentUri();
         if (documentHash == bytes32(0)) revert EmptyDocumentHash();
         GyldBondTokenStorage storage $ = _getStorage();

@@ -628,6 +628,36 @@ contract GyldBondTokenTest is Test {
         token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
     }
 
+    /// bytes32(0) is the default value of an unset name, so an empty name is the single
+    /// most likely miscall — and it would otherwise be pushed into docNames and returned
+    /// by getAllDocuments() as an entry no client can decode. Matches CMTAT's
+    /// ERC1643InvalidName. Specified in the GLD-264 plan; shipped without it.
+    function test_setDocument_zeroName_reverts() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), DOC_URI, DOC_HASH);
+    }
+
+    /// The zero-name check must reject before the uri/hash checks, so a call that is wrong
+    /// in more than one way still reports the name first — and so the check cannot be
+    /// bypassed by also passing an empty uri.
+    function test_setDocument_zeroName_takesPrecedenceOverEmptyUri() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), "", bytes32(0));
+    }
+
+    /// A rejected write must leave no trace: no docNames entry, nothing enumerable.
+    function test_setDocument_zeroName_doesNotGrowDocNames() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), DOC_URI, DOC_HASH);
+        assertEq(token.getAllDocuments().length, 0, "rejected write must not enumerate");
+    }
+
     function test_setDocument_emptyUri_reverts() public {
         _grantDocumentRole(operator);
         vm.prank(operator);
