@@ -303,10 +303,18 @@ contract GyldBondToken is
     }
 
     /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
+    /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
+    /// @dev    A name that was never set — or that was removed — yields EMPTY VALUES and
+    ///         does NOT revert, matching CMTAT and the ERC-1643 reference implementation.
+    ///         Reverting would poison batched reads: a Multicall3 aggregate or a subgraph
+    ///         handler asking for several names would fail wholesale because one was
+    ///         absent, rather than returning the ones that exist. There is no ambiguity
+    ///         in the empty result — `_setDocument` rejects an empty `uri`, so a stored
+    ///         document always has one, and a blank return means "not present" and
+    ///         nothing else. Use {getAllDocuments} to enumerate what exists.
+    ///         `DocumentDoesNotExist` is retained: {removeDocument} still reverts with it.
     function getDocument(bytes32 name) external view returns (string memory, bytes32, uint256) {
-        GyldBondTokenStorage storage $ = _getStorage();
-        Document storage doc = $.documents[name];
-        if (bytes(doc.uri).length == 0) revert DocumentDoesNotExist(name);
+        Document storage doc = _getStorage().documents[name];
         return (doc.uri, doc.documentHash, doc.lastModified);
     }
 

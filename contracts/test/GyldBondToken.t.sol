@@ -684,9 +684,12 @@ contract GyldBondTokenTest is Test {
         emit IERC1643.DocumentRemoved(name, DOC_URI, DOC_HASH);
         token.removeDocument(name);
 
-        // getDocument now reverts.
-        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, name));
-        token.getDocument(name);
+        // getDocument now returns empty values (CMTAT parity) — asserting the cleared
+        // struct directly proves removal wiped it, which the old revert only implied.
+        (string memory uriAfter, bytes32 hashAfter, uint256 modifiedAfter) = token.getDocument(name);
+        assertEq(bytes(uriAfter).length, 0, "uri not cleared");
+        assertEq(hashAfter, bytes32(0), "hash not cleared");
+        assertEq(modifiedAfter, 0, "lastModified not cleared");
 
         assertEq(token.getAllDocuments().length, 0, "docNames not emptied");
     }
@@ -721,10 +724,28 @@ contract GyldBondTokenTest is Test {
         assertEq(names[0], DOC_NAME2);
     }
 
-    /// getDocument reverts for a name that was never set.
-    function test_getDocument_nonexistent_reverts() public {
-        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, DOC_NAME));
-        token.getDocument(DOC_NAME);
+    /// getDocument on a name that was never set returns empty values and does NOT revert,
+    /// matching CMTAT and the ERC-1643 reference. A reverting view poisons batched reads:
+    /// one absent name would fail a whole Multicall3 aggregate. Unambiguous because
+    /// _setDocument rejects an empty uri, so a stored document always has one.
+    function test_getDocument_nonexistent_returnsEmptyValues() public view {
+        (string memory uri, bytes32 hash, uint256 lastModified) = token.getDocument(DOC_NAME);
+        assertEq(bytes(uri).length, 0, "uri must be empty");
+        assertEq(hash, bytes32(0), "hash must be zero");
+        assertEq(lastModified, 0, "lastModified must be zero");
+    }
+
+    /// The batched-read case this change exists for: several names read in one call, one
+    /// of them absent. Under the old reverting getDocument this whole read failed.
+    function test_getDocument_batchedReadSurvivesOneAbsentName() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+
+        (string memory presentUri,,) = token.getDocument(DOC_NAME);
+        (string memory absentUri,,)  = token.getDocument(DOC_NAME2);
+
+        assertEq(presentUri, DOC_URI, "present document must still read back");
+        assertEq(bytes(absentUri).length, 0, "absent document must read empty, not revert");
     }
 
     /// An empty token enumerates no documents.
