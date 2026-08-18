@@ -651,7 +651,7 @@ contract GyldBondTokenTest is Test {
 
         vm.prank(operator);
         vm.expectEmit(true, false, false, true, address(token));
-        emit IERC1643.DocumentRemoved(name);
+        emit IERC1643.DocumentRemoved(name, DOC_URI, DOC_HASH);
         token.removeDocument(name);
 
         // getDocument now reverts.

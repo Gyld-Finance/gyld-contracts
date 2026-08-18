@@ -36,8 +36,11 @@ interface IERC1643 {
 
     /// @dev Emitted when a document is added or replaced.
     event DocumentUpdated(bytes32 indexed name, string uri, bytes32 documentHash);
-    /// @dev Emitted when an existing document is removed.
-    event DocumentRemoved(bytes32 indexed name);
+    /// @dev Emitted when an existing document is removed. Carries the removed `uri` and
+    ///      `documentHash` so the log alone is a complete audit trail of what was deleted —
+    ///      and so the topic0 matches the ERC-1643 reference and CMTAT, which is what any
+    ///      standard-aware indexer filters on.
+    event DocumentRemoved(bytes32 indexed name, string uri, bytes32 documentHash);
 
     /// @notice Set (add or replace) the document named `name`.
     /// @param name         bytes32 identifier of the document.

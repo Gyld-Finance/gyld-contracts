@@ -277,10 +277,17 @@ contract GyldBondToken is
     /// @dev    Gated by DOCUMENT_ROLE. Reverts if `name` does not exist.
     function removeDocument(bytes32 name) external onlyRole(DOCUMENT_ROLE) {
         GyldBondTokenStorage storage $ = _getStorage();
-        if (bytes($.documents[name].uri).length == 0) revert DocumentDoesNotExist(name);
+        Document storage doc = $.documents[name];
+        // ORDER IS LOAD-BEARING: copy uri + documentHash into memory BEFORE the delete.
+        // `delete` zeroes the very storage the event operands read, and Solidity evaluates
+        // those operands at emit time — there is no snapshot. Emitting after the delete
+        // silently logs an empty string and a zero hash.
+        string memory uri = doc.uri;
+        bytes32 documentHash = doc.documentHash;
+        if (bytes(uri).length == 0) revert DocumentDoesNotExist(name);
         delete $.documents[name];
         _removeDocName($.docNames, name);
-        emit DocumentRemoved(name);
+        emit DocumentRemoved(name, uri, documentHash);
     }
 
     /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
