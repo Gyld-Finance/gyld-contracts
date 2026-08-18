@@ -254,11 +254,34 @@ contract GyldBondTokenTest is Test {
         // documents mapping offset: uri is a LONG string (> 31 bytes), so its length slot
         // at keccak256(name, slot3) holds 2*len+1 (the long-string marker). Proving that
         // slot carries the uri's length confirms the mapping itself sat at offset 3.
-        bytes32 uriLenSlot = keccak256(abi.encode(name, slot3));
+        bytes32 docBase = keccak256(abi.encode(name, slot3));
         assertEq(
-            uint256(vm.load(address(token), uriLenSlot)),
+            uint256(vm.load(address(token), docBase)),
             2 * bytes(uri).length + 1,
             "documents mapping not at offset 3"
+        );
+
+        // Document MEMBER order is live storage layout: `documents` is reached through a
+        // mapping, and ci/check_storage_layout.py records only the mapping's type LABEL —
+        // which is byte-identical however Document's members are ordered. Reordering them
+        // in IERC1643.sol therefore passes CI while re-pointing uri/documentHash/lastModified
+        // inside every document already stored on a live proxy, so a holder verifying a
+        // prospectus would read a timestamp as its hash. These three pins are the only
+        // guard against that; do not delete them, and extend them if Document gains a field.
+        assertEq(
+            vm.load(address(token), bytes32(uint256(docBase) + 1)),
+            hash,
+            "Document member 1 is not documentHash"
+        );
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(docBase) + 2))),
+            block.timestamp,
+            "Document member 2 is not lastModified"
+        );
+        assertEq(
+            vm.load(address(token), keccak256(abi.encode(docBase))),
+            bytes32(bytes(uri)),
+            "long-string uri payload is not at keccak256(docBase)"
         );
 
         // docNames array offset: length at slot4, first element at keccak256(slot4).
