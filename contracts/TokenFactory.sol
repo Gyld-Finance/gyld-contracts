@@ -20,6 +20,7 @@ import "./IssuanceManager.sol";
 /// Role wiring after deploy:
 ///   MINTER_ROLE + BURNER_ROLE → issuanceManager exclusively (not operator)
 ///   PAUSER_ROLE               → operator   (ops hot wallet — no delay needed)
+///   DOCUMENT_ROLE             → operator   (ERC-1643 doc set/remove — operational)
 ///   DEFAULT_ADMIN_ROLE        → owner()    (whoever owns the factory at deploy time)
 ///   NAVFeed owner             → navFeedOwner (KMS signer)
 ///
@@ -221,6 +222,10 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         t.grantRole(t.MINTER_ROLE(),        issuanceManager_);
         t.grantRole(t.BURNER_ROLE(),        issuanceManager_);
         t.grantRole(t.PAUSER_ROLE(),        operator_);
+        // DOCUMENT_ROLE rides with PAUSER: both are operational ops-hot-wallet powers that
+        // must not wait on the 48 h timelock. MUST stay above the DEFAULT_ADMIN_ROLE
+        // self-revoke below — the factory can only grant while it still holds admin.
+        t.grantRole(t.DOCUMENT_ROLE(),      operator_);
         t.grantRole(t.DEFAULT_ADMIN_ROLE(), owner());
         t.revokeRole(t.PAUSER_ROLE(),       address(this));
         t.revokeRole(t.DEFAULT_ADMIN_ROLE(), address(this));

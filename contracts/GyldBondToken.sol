@@ -98,6 +98,7 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error NotValidSanctionsList(address addr);
+    error EmptyDocumentName();
     error EmptyDocumentUri();
     error EmptyDocumentHash();
     error DocumentDoesNotExist(bytes32 name);
@@ -261,6 +262,17 @@ contract GyldBondToken is
         external
         onlyRole(DOCUMENT_ROLE)
     {
+        _setDocument(name, uri, documentHash);
+    }
+
+    /// @dev Shared writer for every document path. Validation lives HERE, not in the
+    ///      external function, so a future second entry point (e.g. the ERC-1643 terms
+    ///      accessor) physically cannot skip it. `name != 0` matches CMTAT's
+    ///      ERC1643InvalidName; the non-empty `uri` and non-zero `documentHash` checks
+    ///      are what make the `isNew` sentinel below and removeDocument's existence
+    ///      check sound — a stored document always has a non-empty uri.
+    function _setDocument(bytes32 name, string calldata uri, bytes32 documentHash) internal {
+        if (name == bytes32(0)) revert EmptyDocumentName();
         if (bytes(uri).length == 0) revert EmptyDocumentUri();
         if (documentHash == bytes32(0)) revert EmptyDocumentHash();
         GyldBondTokenStorage storage $ = _getStorage();
@@ -277,17 +289,32 @@ contract GyldBondToken is
     /// @dev    Gated by DOCUMENT_ROLE. Reverts if `name` does not exist.
     function removeDocument(bytes32 name) external onlyRole(DOCUMENT_ROLE) {
         GyldBondTokenStorage storage $ = _getStorage();
-        if (bytes($.documents[name].uri).length == 0) revert DocumentDoesNotExist(name);
+        Document storage doc = $.documents[name];
+        // ORDER IS LOAD-BEARING: copy uri + documentHash into memory BEFORE the delete.
+        // `delete` zeroes the very storage the event operands read, and Solidity evaluates
+        // those operands at emit time — there is no snapshot. Emitting after the delete
+        // silently logs an empty string and a zero hash.
+        string memory uri = doc.uri;
+        bytes32 documentHash = doc.documentHash;
+        if (bytes(uri).length == 0) revert DocumentDoesNotExist(name);
         delete $.documents[name];
         _removeDocName($.docNames, name);
-        emit DocumentRemoved(name);
+        emit DocumentRemoved(name, uri, documentHash);
     }
 
     /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
+    /// @notice Return `(uri, documentHash, lastModified)` for the document named `name`.
+    /// @dev    A name that was never set — or that was removed — yields EMPTY VALUES and
+    ///         does NOT revert, matching CMTAT and the ERC-1643 reference implementation.
+    ///         Reverting would poison batched reads: a Multicall3 aggregate or a subgraph
+    ///         handler asking for several names would fail wholesale because one was
+    ///         absent, rather than returning the ones that exist. There is no ambiguity
+    ///         in the empty result — `_setDocument` rejects an empty `uri`, so a stored
+    ///         document always has one, and a blank return means "not present" and
+    ///         nothing else. Use {getAllDocuments} to enumerate what exists.
+    ///         `DocumentDoesNotExist` is retained: {removeDocument} still reverts with it.
     function getDocument(bytes32 name) external view returns (string memory, bytes32, uint256) {
-        GyldBondTokenStorage storage $ = _getStorage();
-        Document storage doc = $.documents[name];
-        if (bytes(doc.uri).length == 0) revert DocumentDoesNotExist(name);
+        Document storage doc = _getStorage().documents[name];
         return (doc.uri, doc.documentHash, doc.lastModified);
     }
 

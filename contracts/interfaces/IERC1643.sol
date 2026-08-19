@@ -13,6 +13,21 @@ pragma solidity =0.8.28;
 ///         reference implementation.
 interface IERC1643 {
     /// @dev On-chain metadata for a single document.
+    ///
+    ///      ⚠ THESE THREE MEMBERS ARE LIVE STORAGE LAYOUT — APPEND ONLY, NEVER REORDER.
+    ///      This struct is the value type of `GyldBondTokenStorage.documents`, so member
+    ///      order is the physical layout of every document on every deployed proxy.
+    ///      Reordering them does not move any data — it re-points the labels, so
+    ///      getDocument() would return a block timestamp as `documentHash` and every
+    ///      holder verifying a prospectus would see a mismatch that reads as tampering.
+    ///
+    ///      ci/check_storage_layout.py CANNOT catch this: `documents` is reached through
+    ///      a mapping, and solc's type label for a mapping is byte-identical however the
+    ///      value struct's members are ordered — so the guard prints OK on a reorder.
+    ///      The only thing that catches it is
+    ///      GyldBondToken.t.sol::test_storageLayout_documentFieldsAppendedAtOffsets3and4,
+    ///      which pins each member's slot against a real proxy. Do not delete those pins;
+    ///      extend them if this struct gains a field.
     struct Document {
         string uri;
         bytes32 documentHash;
@@ -21,8 +36,11 @@ interface IERC1643 {
 
     /// @dev Emitted when a document is added or replaced.
     event DocumentUpdated(bytes32 indexed name, string uri, bytes32 documentHash);
-    /// @dev Emitted when an existing document is removed.
-    event DocumentRemoved(bytes32 indexed name);
+    /// @dev Emitted when an existing document is removed. Carries the removed `uri` and
+    ///      `documentHash` so the log alone is a complete audit trail of what was deleted —
+    ///      and so the topic0 matches the ERC-1643 reference and CMTAT, which is what any
+    ///      standard-aware indexer filters on.
+    event DocumentRemoved(bytes32 indexed name, string uri, bytes32 documentHash);
 
     /// @notice Set (add or replace) the document named `name`.
     /// @param name         bytes32 identifier of the document.

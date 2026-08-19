@@ -550,6 +550,30 @@ contract TokenFactoryTest is Test {
 
     // ── M2: exclusive role holders ────────────────────────────────────────────
 
+    /// End-to-end proof that the ERC-1643 feature is REACHABLE on a factory-deployed
+    /// token. The role assertions below prove the grant landed; this proves the grant is
+    /// sufficient — the operator can actually write a document with no governance step.
+    /// Before GLD-264's wiring fix every deployed series had zero DOCUMENT_ROLE holders,
+    /// so the first upload on any token required a 48 h timelock action, contradicting
+    /// README.md and ARCHITECTURE.md which both state "operational, no delay".
+    function test_deployToken_operatorCanSetDocumentWithoutGovernance() public {
+        (address token,,) = _deploy();
+        GyldBondToken t = GyldBondToken(token);
+
+        // Hoist BOTH operands before the prank: sha256() compiles to a staticcall to the
+        // 0x02 precompile, and vm.prank binds to the next call the test contract makes —
+        // so evaluating it inline consumes the prank and setDocument runs as address(this).
+        bytes32 docHash = sha256("terms.pdf");
+        bytes32 docName = bytes32("terms");
+
+        vm.prank(operator);
+        t.setDocument(docName, "ipfs://QmTerms/terms.pdf", docHash);
+
+        (string memory uri, bytes32 hash,) = t.getDocument(docName);
+        assertEq(uri, "ipfs://QmTerms/terms.pdf", "operator could not store a document");
+        assertEq(hash, docHash, "document hash not stored");
+    }
+
     function test_deployToken_exactlyOneHolderPerRole() public {
         (address token,,) = _deploy();
         GyldBondToken t = GyldBondToken(token);
@@ -571,6 +595,17 @@ contract TokenFactoryTest is Test {
         assertFalse(t.hasRole(t.PAUSER_ROLE(), address(factory)),     "factory must NOT have PAUSER_ROLE");
         assertFalse(t.hasRole(t.PAUSER_ROLE(), address(this)),        "deployer must NOT have PAUSER_ROLE");
         assertFalse(t.hasRole(t.PAUSER_ROLE(), navFeedOwner),         "navFeedOwner must NOT have PAUSER_ROLE");
+
+        // DOCUMENT_ROLE (GLD-264). This block is the repo's exhaustive-by-name role
+        // assertion, and it is the ONLY place that would have caught DOCUMENT_ROLE being
+        // added to GyldBondToken but never granted by _wireRoles — which is exactly what
+        // shipped. Every document test grants the role to itself first, so the feature
+        // suite is structurally blind to wiring. Add every future role here too.
+        assertTrue(t.hasRole(t.DOCUMENT_ROLE(), operator),                "operator must have DOCUMENT_ROLE");
+        assertFalse(t.hasRole(t.DOCUMENT_ROLE(), address(issuanceMgr)),   "issuanceMgr must NOT have DOCUMENT_ROLE");
+        assertFalse(t.hasRole(t.DOCUMENT_ROLE(), address(factory)),       "factory must NOT have DOCUMENT_ROLE");
+        assertFalse(t.hasRole(t.DOCUMENT_ROLE(), address(this)),          "deployer must NOT have DOCUMENT_ROLE");
+        assertFalse(t.hasRole(t.DOCUMENT_ROLE(), navFeedOwner),           "navFeedOwner must NOT have DOCUMENT_ROLE");
 
         assertTrue(t.hasRole(t.DEFAULT_ADMIN_ROLE(), address(this)),         "factory owner must have DEFAULT_ADMIN_ROLE");
         assertFalse(t.hasRole(t.DEFAULT_ADMIN_ROLE(), address(factory)),     "factory must NOT have DEFAULT_ADMIN_ROLE");

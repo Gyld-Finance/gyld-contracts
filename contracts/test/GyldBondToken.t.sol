@@ -254,11 +254,34 @@ contract GyldBondTokenTest is Test {
         // documents mapping offset: uri is a LONG string (> 31 bytes), so its length slot
         // at keccak256(name, slot3) holds 2*len+1 (the long-string marker). Proving that
         // slot carries the uri's length confirms the mapping itself sat at offset 3.
-        bytes32 uriLenSlot = keccak256(abi.encode(name, slot3));
+        bytes32 docBase = keccak256(abi.encode(name, slot3));
         assertEq(
-            uint256(vm.load(address(token), uriLenSlot)),
+            uint256(vm.load(address(token), docBase)),
             2 * bytes(uri).length + 1,
             "documents mapping not at offset 3"
+        );
+
+        // Document MEMBER order is live storage layout: `documents` is reached through a
+        // mapping, and ci/check_storage_layout.py records only the mapping's type LABEL —
+        // which is byte-identical however Document's members are ordered. Reordering them
+        // in IERC1643.sol therefore passes CI while re-pointing uri/documentHash/lastModified
+        // inside every document already stored on a live proxy, so a holder verifying a
+        // prospectus would read a timestamp as its hash. These three pins are the only
+        // guard against that; do not delete them, and extend them if Document gains a field.
+        assertEq(
+            vm.load(address(token), bytes32(uint256(docBase) + 1)),
+            hash,
+            "Document member 1 is not documentHash"
+        );
+        assertEq(
+            uint256(vm.load(address(token), bytes32(uint256(docBase) + 2))),
+            block.timestamp,
+            "Document member 2 is not lastModified"
+        );
+        assertEq(
+            vm.load(address(token), keccak256(abi.encode(docBase))),
+            bytes32(bytes(uri)),
+            "long-string uri payload is not at keccak256(docBase)"
         );
 
         // docNames array offset: length at slot4, first element at keccak256(slot4).
@@ -605,6 +628,36 @@ contract GyldBondTokenTest is Test {
         token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
     }
 
+    /// bytes32(0) is the default value of an unset name, so an empty name is the single
+    /// most likely miscall — and it would otherwise be pushed into docNames and returned
+    /// by getAllDocuments() as an entry no client can decode. Matches CMTAT's
+    /// ERC1643InvalidName. Specified in the GLD-264 plan; shipped without it.
+    function test_setDocument_zeroName_reverts() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), DOC_URI, DOC_HASH);
+    }
+
+    /// The zero-name check must reject before the uri/hash checks, so a call that is wrong
+    /// in more than one way still reports the name first — and so the check cannot be
+    /// bypassed by also passing an empty uri.
+    function test_setDocument_zeroName_takesPrecedenceOverEmptyUri() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), "", bytes32(0));
+    }
+
+    /// A rejected write must leave no trace: no docNames entry, nothing enumerable.
+    function test_setDocument_zeroName_doesNotGrowDocNames() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator);
+        vm.expectRevert(GyldBondToken.EmptyDocumentName.selector);
+        token.setDocument(bytes32(0), DOC_URI, DOC_HASH);
+        assertEq(token.getAllDocuments().length, 0, "rejected write must not enumerate");
+    }
+
     function test_setDocument_emptyUri_reverts() public {
         _grantDocumentRole(operator);
         vm.prank(operator);
@@ -628,12 +681,15 @@ contract GyldBondTokenTest is Test {
 
         vm.prank(operator);
         vm.expectEmit(true, false, false, true, address(token));
-        emit IERC1643.DocumentRemoved(name);
+        emit IERC1643.DocumentRemoved(name, DOC_URI, DOC_HASH);
         token.removeDocument(name);
 
-        // getDocument now reverts.
-        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, name));
-        token.getDocument(name);
+        // getDocument now returns empty values (CMTAT parity) — asserting the cleared
+        // struct directly proves removal wiped it, which the old revert only implied.
+        (string memory uriAfter, bytes32 hashAfter, uint256 modifiedAfter) = token.getDocument(name);
+        assertEq(bytes(uriAfter).length, 0, "uri not cleared");
+        assertEq(hashAfter, bytes32(0), "hash not cleared");
+        assertEq(modifiedAfter, 0, "lastModified not cleared");
 
         assertEq(token.getAllDocuments().length, 0, "docNames not emptied");
     }
@@ -668,10 +724,28 @@ contract GyldBondTokenTest is Test {
         assertEq(names[0], DOC_NAME2);
     }
 
-    /// getDocument reverts for a name that was never set.
-    function test_getDocument_nonexistent_reverts() public {
-        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.DocumentDoesNotExist.selector, DOC_NAME));
-        token.getDocument(DOC_NAME);
+    /// getDocument on a name that was never set returns empty values and does NOT revert,
+    /// matching CMTAT and the ERC-1643 reference. A reverting view poisons batched reads:
+    /// one absent name would fail a whole Multicall3 aggregate. Unambiguous because
+    /// _setDocument rejects an empty uri, so a stored document always has one.
+    function test_getDocument_nonexistent_returnsEmptyValues() public view {
+        (string memory uri, bytes32 hash, uint256 lastModified) = token.getDocument(DOC_NAME);
+        assertEq(bytes(uri).length, 0, "uri must be empty");
+        assertEq(hash, bytes32(0), "hash must be zero");
+        assertEq(lastModified, 0, "lastModified must be zero");
+    }
+
+    /// The batched-read case this change exists for: several names read in one call, one
+    /// of them absent. Under the old reverting getDocument this whole read failed.
+    function test_getDocument_batchedReadSurvivesOneAbsentName() public {
+        _grantDocumentRole(operator);
+        vm.prank(operator); token.setDocument(DOC_NAME, DOC_URI, DOC_HASH);
+
+        (string memory presentUri,,) = token.getDocument(DOC_NAME);
+        (string memory absentUri,,)  = token.getDocument(DOC_NAME2);
+
+        assertEq(presentUri, DOC_URI, "present document must still read back");
+        assertEq(bytes(absentUri).length, 0, "absent document must read empty, not revert");
     }
 
     /// An empty token enumerates no documents.
