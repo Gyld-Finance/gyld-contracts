@@ -12,7 +12,13 @@
 name: CI
 
 on:
+  # `push` is filtered to main on purpose. An unfiltered `push` fires alongside
+  # `pull_request` for every commit on a same-repo PR branch, and because the
+  # concurrency group keys on `github.event_name` the two runs do not cancel
+  # each other — every push paid for two full builds. Pushes to main still run;
+  # PR branches are covered exactly once by `pull_request`.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -25,9 +31,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Full-intensity suite on every push: 535 tests, fuzz runs = 10000,
-  # invariant runs = 1000 x depth 50 (the foundry.toml defaults — nothing is
-  # dialled down; the whole suite runs in seconds, see docs/ci.md).
+  # Full-intensity suite on every run: the entire test suite at fuzz runs =
+  # 10000 and invariant runs = 1000 x depth 50 (the foundry.toml defaults —
+  # nothing is dialled down; the whole suite runs in seconds, see docs/ci.md).
   test:
     name: forge test (full fuzz + invariants)
     runs-on: ubuntu-latest

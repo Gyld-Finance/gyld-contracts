@@ -1,4 +1,42 @@
-out/
-cache/
-broadcast/
-.env
+# Foundry build output. Anchored with a leading slash so these match only the
+# repo root — an unanchored `out/` would also swallow `lib/**/out/`, which
+# would hide files that belong to a submodule's own history.
+/out/
+/cache/
+/broadcast/
+
+# Secrets. `.env` alone matches that one filename exactly, so `.env.sepolia`
+# or `.env.local` holding a funded key would commit cleanly. `.env*` catches
+# the whole family; `.env.example` is tracked on purpose and is negated back.
+.env*
+!.env.example
+
+# ci/check_storage_layout.py mkdtemp()s this inside the repo root (it needs a
+# path relative to the Foundry root) and removes it in a `finally` — but a
+# Ctrl-C mid-run leaves the probe's src/, out/, cache/ and foundry.toml behind.
+.storage-layout-probe-*/
+
+# Editor / OS noise.
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Coverage and analysis artefacts.
+lcov.info
+coverage/
+crytic-export/
+
+# Generated docs and JS tooling.
+docs/book/
+node_modules/
+
+# foundry.toml sets `src = "contracts"`, so a stray .sol or .json dropped in
+# the repo root is invisible to `forge build` while remaining fully stageable
+# by `git add -A`. That is how third-party source can end up committed into
+# this BUSL-1.1 repo by accident. No tracked file lives at the root with
+# either extension, so these rules have no false positives. (foundry.lock has
+# no .json extension and is unaffected.)
+/*.sol
+/*.json

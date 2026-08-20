@@ -46,7 +46,7 @@ anything in section 4; `broadcast/` is history, not an address book.
 | Network | Chain ID | What IS deployed | What is NOT deployed | Source broadcast dir |
 |---|---|---|---|---|
 | Local Anvil | 31337 | Full stack incl. `GyldAtomicSwap` (`DeployAtomicSettlement`, `AtomicSettlementFlow`, `DeployAtomicSettlementE2E`, `DeployDevNet`, `DeployMockUSDC`) | — (ephemeral; gone on Anvil restart) | `broadcast/DeployAtomicSettlement.s.sol/31337` et al. |
-| Sepolia | 11155111 | **`GyldAtomicSwap` — LIVE** (proxy + implementation, 2026-07-31, commit `46050ea`, Blockscout-verified, settling Circle Sepolia USDC; addresses in `DEPLOYMENTS.md`), plus the older token stack from `DeployDevNet.s.sol` (May 2026 run): TimelockController, IssuanceManager proxy, TokenFactory, MockSanctionsList, three bond series (CAT / C / KO) — token-stack addresses below | — | `broadcast/DeployDevNet.s.sol/11155111`; swap addresses per `DEPLOYMENTS.md` |
+| Sepolia | 11155111 | **`GyldAtomicSwap` — LIVE** (proxy + implementation, 2026-07-31, commit `46050ea`, Blockscout-verified, settling Circle Sepolia USDC; addresses in `DEPLOYMENTS.md`), plus the older token stack from `DeployDevNet.s.sol` (May 2026 run): TimelockController, IssuanceManager proxy, TokenFactory, MockSanctionsList, three bond series (CAT / C / KO) — token-stack addresses in `DEPLOYMENTS.md` | — | `broadcast/DeployDevNet.s.sol/11155111`; swap addresses per `DEPLOYMENTS.md` |
 
 > **Warning — confirm the chain id before you broadcast.** A script's name is not
 > evidence of which chain it targets: a script with "test" in its name has misled
@@ -57,26 +57,32 @@ anything in section 4; `broadcast/` is history, not an address book.
 > `DeployGuards.isDevChain` are treated as dev; every other chain id is treated as
 > production by the scripts.
 
-> **Stale broadcast dir:** `broadcast/DeployDvpEscrow.s.sol/31337` still exists even
-> though the escrow contract and its deploy script were deleted in GYL-548. It is
-> history only — do not treat it as a deployable artifact.
-
 ### Sepolia (11155111) recorded addresses
 
-From `broadcast/DeployDevNet.s.sol/11155111/run-latest.json`. The bond-token triples
-were created inside `timelock.execute` internal transactions (`additionalContracts`),
-attributed here by deploy order (CAT → C → KO, per `DeployDevNet._deployBondTokens`).
-**Verify each on-chain (e.g. `cast call <token> "name()(string)"`) before reuse.**
+**They are not repeated here.** `DEPLOYMENTS.md` is the authoritative register:
+the gen-1 devnet stack (TimelockController, IssuanceManager proxy, TokenFactory,
+MockSanctionsList, and the CAT / C / KO series with their NAV feeds and
+forwarders) is listed there with source commit, privileged roles, verification
+status and — the part a runbook cannot restate safely — a per-row **status**
+that says which of them may be reused. Read those status columns before you copy
+any address into `.env`; a second copy of the table in this document would drift
+out of step with them.
 
-| Contract | Address |
-|---|---|
-| TimelockController | `0xf803f99b7bcfe4d0db52fde5a76c5fc257d9ef72` |
-| IssuanceManager (proxy) | `0x5ba267367f06378816c58d47c5850fc9863ce67f` |
-| TokenFactory | `0xb11bdcfe08c69c461f410453bdf80a8cb9cd07ae` |
-| MockSanctionsList | `0x7c1798643e0793eab998b777b2cd0b7c2f2870ad` |
-| TOKEN_CAT / NAVFEED_CAT / FORWARDER_CAT | `0xc545645b889027f5c2e7c1460566b08673273b07` / `0x0e21b8e3d40d92244a07977905c056ebf5f88dde` / `0xdcbd2c177212aebd18e8f1429457483644c50c00` |
-| TOKEN_C / NAVFEED_C / FORWARDER_C | `0xf62dd0722ed16593b0e8a00dd80d0ea43a0e0c1e` / `0x0248fab2aa4a481b6c7c81dddd28ac24e8eacec7` / `0x24a5eb80f6ab34c9563f5667d1bc1ccb3167b9c0` |
-| TOKEN_KO / NAVFEED_KO / FORWARDER_KO | `0xb7fc5791910ceddb54bbd53136d2cfc67719a2b4` / `0x5039770267e05a8a38023cf925b3b7ff6a8076d8` / `0x38bc14c8c39c62f712207c950d423957a51550ba` |
+> **Do not wire a new deployment to the gen-1 `MockSanctionsList`
+> (`0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad`).** `DEPLOYMENTS.md` records it
+> **do-not-reuse — ungated sanctions oracle**: in that deployed instance
+> `addToSanctionsList` / `removeFromSanctionsList` are plain `external` with no
+> owner and no access control, so **anyone on the internet can sanction or
+> unsanction any address**. Because token screening is fail-closed, that is a
+> permissionless transfer-freeze on every holder of every series wired to it —
+> and the existing Sepolia series already are. The owner-gated
+> `MockSanctionsList` in this repo's current source is a *different* contract
+> from the one at that address; do not reason from the source you can read.
+> Deploy a fresh sanctions oracle (platform `SanctionsOracleMirror`, GYL-1051, or
+> a freshly deployed owner-gated mock for pure dev) and pass it as
+> `SANCTIONS_LIST`. The oracle is baked into each token at `deployToken` time and
+> cannot be repointed afterwards, so this decision is unrecoverable once tokens
+> exist — see the TODO(compliance) below and readiness gap 5.
 
 - **TODO(ops):** confirm who controls the deployer key of that May 2026 Sepolia run,
   and whether the timelock proposer (GOVERNANCE_MULTISIG or deployer fallback) is
@@ -126,7 +132,8 @@ Config that must still be added even for Sepolia:
 
 ### 3.1 Environment variables the scripts actually read
 
-`DeployAtomicSettlement.s.sol` (`vm.envAddress` / `vm.envUint`, lines 117–127, 228, 234, 246):
+`DeployAtomicSettlement.s.sol` (read via `DeployGuards.envAddressRequired` /
+`envAddressProdRequired` and `vm.envAddress` / `vm.envUint`):
 
 | Var | Required? | Default | Testnet status |
 |---|---|---|---|
@@ -527,6 +534,8 @@ export SWAP=<atomic_swap_proxy>          # printed as EVM_ATOMIC_SWAP
 export TIMELOCK=<timelock>
 export DEPLOYER=$WALLET                  # the address that broadcast the deploy
 export ADMIN_ROLE=0x0000000000000000000000000000000000000000000000000000000000000000
+export NAVFEED=<nav_feed_of_a_registered_series>      # from THIS deploy, not a legacy feed
+export FORWARDER=<nav_forwarder_of_that_series>       # ditto
 ```
 
 ### 8.1 Right chain, right code
@@ -641,12 +650,18 @@ cast call $SWAP "maxNavAgeSecs()(uint32)" --rpc-url $RPC
 # push cadence. The ceiling is enforced on-chain, so a larger value cannot exist —
 # if this reads high, the keeper cadence is the thing that is wrong.
 
-cast call $NAVFEED_CAT "stalenessSeconds()(uint256)" --rpc-url $RPC
+cast call $NAVFEED "stalenessSeconds()(uint256)" --rpc-url $RPC
 # expected: a small number, and below maxNavAgeSecs above. This is the monitoring
 # entrypoint to alert on: a feed can sit stale for months while downstream consumers
 # keep quoting the last pinned answer silently, with nothing surfacing the fault.
+# Only feeds deployed at or after GYL-1135 have this selector: KaleidoscopeNAVFeed
+# is NOT upgradeable, so stalenessSeconds() cannot be retrofitted and this call
+# reverts on any older feed (the May 2026 gen-1 Sepolia feeds included) —
+# ARCHITECTURE.md section 4.1. On such a feed, derive age from updatedAt instead:
+#   cast call $NAVFEED "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
+# and compare its 4th value against `cast block latest --field timestamp`.
 
-cast call $FORWARDER_CAT "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
+cast call $FORWARDER "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
 # expected: positive answer; 4th value a recent unix timestamp.
 ```
 

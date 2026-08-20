@@ -38,7 +38,9 @@ of:
 
   - a `DeployGuards.<guard>()` call — the dev/production allowlist path; or
   - a positive `block.chainid == <id>` pin — for scripts written for exactly one
-    chain (the Euler steps on their production chain, the Anvil-only flow scripts).
+    chain. The only scripts relying solely on this branch today are the
+    Anvil-only local-devnet scripts, AtomicSettlementFlow.s.sol and
+    DeployAtomicSettlementE2E.s.sol, which both pin `block.chainid == 31337`.
 
 Usage: python3 ci/check_chain_guards.py [script-dir]   (default: contracts/script)
 Exit codes: 0 = clean, 1 = violation found, 2 = script dir missing.
