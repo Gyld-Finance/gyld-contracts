@@ -11,10 +11,9 @@ in a separate workflow so this one stays trustless.
 
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
-| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 501 tests) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
+| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 535 tests across 20 suites) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
 | `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
 | `test` (step) | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff — and NEITHER reached `main`. This check does not replace that review; it **forces** it, by turning a subtle Solidity diff into an explicit `ci/storage-layouts/` diff a reviewer cannot skim past, and giving an auditor a concrete artifact to read before an upgrade. The audit remains the thing that decides whether a layout change is safe. See "Storage layout" below |
-| `coverage` | `forge coverage --ir-minimum --report summary`, at reduced fuzz intensity, publishing the table to the run summary. **Non-blocking** (`continue-on-error: true`, no threshold) | Nothing, by design — it is a trend instrument, not a gate. See "Coverage" below for what the number is and is not |
 
 ## Why full fuzz intensity on every push
 
@@ -123,7 +122,18 @@ reinitializer and actually run it.
 - **Changes inside a struct reached only through a mapping or array.** The
   recursion follows nested struct *members*, but a struct used as a mapping
   value or array element is pinned by its label and width only, so reordering
-  *its* fields would pass. No such struct exists today.
+  *its* fields would pass. **This is live, not hypothetical:**
+  `GyldBondTokenStorage.documents` is a `mapping(bytes32 => IERC1643.Document)`,
+  and the type label is byte-identical however `Document`'s three members
+  (`uri`, `documentHash`, `lastModified`) are ordered — so a reorder passes this
+  check while silently re-pointing every document already stored on a live
+  proxy, and `getDocument` starts returning a block timestamp as the document
+  hash. Mitigated in Solidity, not here: `c1f240f` added member-offset pins to
+  `test_storageLayout_documentFieldsAppendedAtOffsets3and4` in
+  `GyldBondToken.t.sol`, which reads raw storage after a real `setDocument` and
+  asserts members 1 and 2 individually. That test is the only thing catching a
+  `Document` reorder — do not delete it, and extend it if `Document` gains a
+  field.
 - **Whether the deployed implementation matches this source.** The baseline is a
   property of the tree, not of any chain. It cannot tell you that a live proxy's
   storage actually has the shape recorded here — only that the shape has not
@@ -133,6 +143,11 @@ reinitializer and actually run it.
   repurposing a field's *meaning* while keeping name and type is invisible.
 
 ## Coverage
+
+**Local-only — there is no coverage job in CI.** The numbers below were measured
+by hand with the command in "Reproducing a failure locally"; they are a
+point-in-time reading kept for what they taught us, not something any job
+recomputes or gates on.
 
 `forge coverage` produced *nothing* on this repo until 2026-08. `via_ir = true`
 defeats solc's coverage instrumentation, and the documented workaround
@@ -200,8 +215,8 @@ Two honest caveats, in order of importance:
 2. **A 0-hit line is not necessarily untested.** Most of the 22 uncovered
    production lines are forge source-map attribution artifacts:
    - inline `assembly` bodies are not instrumented at all — every
-     `_getStorage()` (`GyldAtomicSwap:250`, `GyldBondToken:68`,
-     `IssuanceManager:62`) and the `create2` in `TokenFactory:172` reads as
+     `_getStorage()` (`GyldAtomicSwap:277`, `GyldBondToken:88`,
+     `IssuanceManager:60`) and the `create2` in `TokenFactory:175` reads as
      uncovered while being executed by essentially every test;
    - empty-bodied inherited initialisers (`__AccessControl_init`,
      `__Pausable_init`, `__ReentrancyGuard_init`, `__UUPSUpgradeable_init`)
@@ -217,15 +232,15 @@ Two honest caveats, in order of importance:
 
 Exactly two genuine gaps, both narrow, and neither on the hot path:
 
-- **`GyldAtomicSwap.sol:361`** — `initialize()`'s cash-token `decimals()` probe
+- **`GyldAtomicSwap.sol:397`** — `initialize()`'s cash-token `decimals()` probe
   failure branch (`!usdcOk || usdcData.length != 32`). Its wrong-decimals
-  sibling on line 363 *is* covered, and the analogous guard on
+  sibling on line 398 *is* covered, and the analogous guard on
   `registerSeries` is covered for both the wrong-decimals and the
   no-`decimals()`-at-all cases. The initializer's "cash token has no `decimals()`"
   case is now covered too, by `test_initialize_cashTokenWithoutDecimals_reverts` —
   worth having because `usdc` has no setter, so a bad cash token bricks the proxy
   permanently rather than failing loud on one series.
-- **`GyldBondToken.sol:192`** — `mint(to, 0)` → `ZeroAmount`. `burn(x, 0)` and
+- **`GyldBondToken.sol:218`** — `mint(to, 0)` → `ZeroAmount`. `burn(x, 0)` and
   `mint(address(0), …)` are both tested; this one is a symmetry gap.
 
 *(An earlier revision of this note flagged a constant-vs-constant comparison in
@@ -235,8 +250,8 @@ no longer seeds `maxQuoteTtl` at all — the field is read through
 slot, so there is no seeded value left to validate. See the constant's docstring
 for why the fallback shape is load-bearing on an upgraded proxy.)*
 
-**The reassuring part:** `executeSwap` (lines 471-570) and `_checkQuoteBand`
-(571-632) — the value-moving hot path — contain **zero** uncovered lines and
+**The reassuring part:** `executeSwap` (lines 497-568) and `_checkQuoteBand`
+(599-628) — the value-moving hot path — contain **zero** uncovered lines and
 **zero** uncovered branches. Every uncovered branch in `GyldAtomicSwap` is in
 `initialize()`. An uncovered branch in a settlement path and an uncovered
 branch in a deploy-time guard are not the same finding, and this repo only has
@@ -256,11 +271,11 @@ forge test -vvv                      # same command, same foundry.toml intensity
 python3 ci/check_chain_guards.py     # the chain-guard scan; exit 1 on violation
 python3 ci/check_storage_layout.py   # ERC-7201 layout diff; exit 1 on drift, 2 on tooling failure
 
-# Coverage. --ir-minimum is mandatory (via_ir breaks instrumentation); without
-# it forge emits no table at all. The env overrides match the CI job and are
-# free: they produce a byte-identical table (1053/1618 lines) in 1.4 s of test
-# time instead of 44 s, because coverage only asks whether a line was ever
-# reached. Drop them if you want to confirm that for yourself.
+# Coverage. Local only — no CI job runs this. --ir-minimum is mandatory (via_ir
+# breaks instrumentation); without it forge emits no table at all. The env
+# overrides are free: they produce a byte-identical table (1053/1618 lines) in
+# 1.4 s of test time instead of 44 s, because coverage only asks whether a line
+# was ever reached. Drop them if you want to confirm that for yourself.
 FOUNDRY_FUZZ_RUNS=256 FOUNDRY_INVARIANT_RUNS=64 FOUNDRY_INVARIANT_DEPTH=25 \
   forge coverage --ir-minimum --report summary
 ```
@@ -308,9 +323,9 @@ CI log if you need the exact case.
   to a script with no guard at all — which is how the ungated
   `DeployMockUSDC.s.sol` survived the first pass of GYL-1135.
 
-- **A coverage threshold / `--fail-under` gate** — rejected, while the
-  `coverage` job itself was adopted as informational. A minimum picked from the
-  first-ever measurement is an arbitrary number that then gets defended as if
+- **A coverage threshold / `--fail-under` gate** — rejected, and so, for now, is
+  any `coverage` job at all: the measurement stays local. A minimum picked from
+  the first-ever measurement is an arbitrary number that then gets defended as if
   it were a standard: it would either sit far enough below 95% to never fire, or
   be set at 95% and start blocking PRs over source-map artifacts (see
   "Coverage" — `IssuanceManager`'s 9% "gap" is entirely uninstrumented
@@ -318,11 +333,11 @@ CI log if you need the exact case.
   `--ir-minimum` bytecode, so a gate would be enforcing a property of code that
   never ships. Watch the trend for a few months; if it justifies a floor, set
   the floor on `contracts/*.sol` only and on branches rather than lines.
-- **Making `coverage` a blocking job** — rejected for now. It is one optimiser
+- **A blocking `coverage` job** — rejected for now. It would be one optimiser
   configuration away from the `test` job, and the two failures that had to be
   fixed to make it run at all were both optimiser-sensitivity bugs. Until the
   suite has proven itself stable under both pipelines for a while, a red
-  `coverage` should be a signal to investigate, not a merge block. Note that
+  coverage run should be a signal to investigate, not a merge block. Note that
   `--ir-minimum` is a genuinely useful second opinion — it caught two tests
   that were passing by accident — so if it starts failing, read it before
   dismissing it.

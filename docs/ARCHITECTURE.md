@@ -4,8 +4,8 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on `main` @ `2e84151` (501 tests,
-19 suites, all passing). Every claim here was checked against the source at the
+Verified against the Solidity on `main` @ `c1f240f` (535 tests,
+20 suites, all passing). Every claim here was checked against the source at the
 time of writing; claims carried forward from older docs and found **false** are
 recorded in [§19 Corrections](#19-corrections--claims-that-were-false).
 
@@ -14,7 +14,7 @@ recorded in [§19 Corrections](#19-corrections--claims-that-were-false).
 | Language | Solidity `=0.8.28` (exact pin; `foundry.toml` also pins `solc = "0.8.28"`) |
 | Build | Foundry, `via_ir = true`, `optimizer_runs = 200` |
 | Libraries | OpenZeppelin `contracts` + `contracts-upgradeable` **v5.3.0** |
-| Live chains | Base mainnet (8453), Ethereum Sepolia (11155111), local Anvil (31337) |
+| Live chains | Ethereum Sepolia (11155111), local Anvil (31337) |
 | Licence | 7 core contracts BUSL-1.1 → GPL-2.0-or-later on 2028-07-09; see [§4.2](#42-licensing) |
 
 ### If you arrived here from a stale reference
@@ -27,7 +27,7 @@ name some of them; this is where their content went.
 | `docs/contracts.md` | [§5 Contract reference](#5-contract-reference), [§14 Deployed addresses](#14-deployed-addresses) |
 | `docs/atomic-settlement.md` | [§5.7](#57-gyldatomicswap), [§7](#7-custody-model-and-loss-ceilings), [§9.1](#91-atomic-path--gyldatomicswapexecuteswap), [§19.4–19.5](#194-architecture-claims-overtaken-by-gyl-548) |
 | `docs/atomic-swap-spec.md` | **Never existed in this repo.** Its invariant catalogue is reconstructed at [§16.2](#162-the-gyldatomicswap-invariant-catalogue); I-6, I-7 and F-2 are unrecoverable |
-| `docs/atomic-settlement-testnet-runbook.md` | **Never existed in this repo.** Sepolia is the supported testnet; see [§13](#13-deployment-model) |
+| `docs/atomic-settlement-testnet-runbook.md` | **Still present and maintained** — [`atomic-settlement-testnet-runbook.md`](atomic-settlement-testnet-runbook.md). Sepolia is the supported testnet; see [§13](#13-deployment-model) |
 | `docs/blockchain-status.md` | [§11 Oracle design](#11-oracle-design), [§16 Verification surface](#16-verification-surface), [§18 Known gaps](#18-known-gaps-and-open-decisions) |
 | `docs/architecture.md` (Kaleidoscope backend) | [§2 Scope boundary](#2-scope-boundary--contracts-vs-kaleidoscope-backend) keeps only the off-chain context a contract reader needs; the rest belongs in the `kaleidoscope` repo |
 | `docs/morpho-integration.md`, `docs/euler-integration.md`, `docs/aave-v3-listing.md`, `docs/erc4626-compatibility.md` | [§15 DeFi integrations](#15-defi-integrations) — every address, market ID, LLTV and IRM parameter preserved |
@@ -265,7 +265,7 @@ totalSupply()      = sum of all balances, exact, no rounding
 ```
 
 Inheritance: `Initializable`, `ERC20Upgradeable`, `ERC20PermitUpgradeable`,
-`AccessControlUpgradeable`, `PausableUpgradeable`, `UUPSUpgradeable`.
+`AccessControlUpgradeable`, `PausableUpgradeable`, `UUPSUpgradeable`, `IERC1643`.
 
 **Immutable metadata**, set at `initialize` and never writable afterwards:
 
@@ -344,6 +344,7 @@ deliberately asymmetric.)
 | `MINTER_ROLE` | `mint(to, amount)` — rejects zero address, zero amount |
 | `BURNER_ROLE` | `burn(from, amount)` — rejects zero address, zero amount |
 | `PAUSER_ROLE` | `pause()` / `unpause()` |
+| `DOCUMENT_ROLE` | `setDocument(name, uri, docHash)` / `removeDocument(name)` — the ERC-1643 document register (GLD-264) |
 
 `renounceRole` is overridden to revert `CannotRenounceAdminRole` for
 `DEFAULT_ADMIN_ROLE` — losing it would permanently brick UUPS upgrades and all
@@ -489,6 +490,7 @@ deployToken(name, symbol, isin, maturityTimestamp, operator, issuanceManager, na
   │     grant  MINTER_ROLE         → issuanceManager
   │     grant  BURNER_ROLE         → issuanceManager
   │     grant  PAUSER_ROLE         → operator
+  │     grant  DOCUMENT_ROLE       → operator         (rides with PAUSER: both operational)
   │     grant  DEFAULT_ADMIN_ROLE  → owner()          (the Timelock in production)
   │     revoke PAUSER_ROLE         from address(this)
   │     revoke DEFAULT_ADMIN_ROLE  from address(this)
@@ -608,8 +610,9 @@ compromised key; it does not hold against compromise of both.
 
 `renounceOwnership()` is disabled outright (GLD-165). Note this is **not
 retrofittable** — the feed is not upgradeable, so feeds deployed before this
-guard (including the live Base mainnet feed, `DEPLOYMENTS.md`) do not have it and
-still depend on the runbook rule. The feed is not
+guard (including the retired Base mainnet demo feed, whose records were removed —
+see [§14.1](#141-base-mainnet-8453--retired-demo-records-removed)) do not have it
+and still depend on the runbook rule. The feed is not
 upgradeable and its reads never revert on staleness, so an owner-less feed would
 serve its last answer forever with no recovery path — and if an
 `_emergencyUpdater` were set at the time, that address would keep unbounded price
@@ -985,13 +988,17 @@ under the earlier seed-based design. Soft-pausing via the TTL was never usable
 anyway: setting it requires the 48 h timelock, whereas `pause()` is a hot key
 (`PAUSER_ROLE`, ops multisig) and lands in one block.
 
-> As of the commit this document was verified against (`54f0104`),
-> `MAX_NAV_AGE_CEILING` is the only such ceiling: `maxQuoteDeviationBps` is bounded
-> only by `BPS_DENOMINATOR` (a ±100 % band, which admits any price from zero to 2×
-> NAV) and `setMaxQuoteTtl` validates nothing at all. Both permissive ends are
-> reachable by a single `DEFAULT_ADMIN_ROLE` call and both weaken quote-signer
-> containment, so ceilings for them are a natural extension of GYL-1135. Re-check
-> this paragraph against the source before relying on it.
+> `MAX_NAV_AGE_CEILING` is no longer the only such ceiling. Since `8c41817` all
+> three admin-tunable bounds are structurally capped: `MAX_NAV_AGE_CEILING` (**72 h**,
+> `InvalidNavAge`), `MAX_QUOTE_DEVIATION_BPS_CEILING` (**1000 bps = 10 %**,
+> `InvalidDeviationBps`, enforced in both `initialize` and
+> `setMaxQuoteDeviationBps`) and `MAX_QUOTE_TTL_CEILING` (**1 h**,
+> `InvalidQuoteTtl`, enforced in `setMaxQuoteTtl`; zero stays legal and still means
+> *unset* → fall back to `DEFAULT_MAX_QUOTE_TTL`). Before that, the deviation band
+> was bounded only by `BPS_DENOMINATOR` — a ±100 % band, which admits any price from
+> zero to 2× NAV — and `setMaxQuoteTtl` validated nothing at all; both permissive
+> ends were reachable by a single `DEFAULT_ADMIN_ROLE` call, which is why GYL-1135
+> closed them.
 
 #### Quote invalidation
 
@@ -1029,8 +1036,9 @@ updates its forwarder — which is also the escape hatch if a forwarder is brick
 `deregisterSeries(token)` reverts `SeriesNotEmpty` while the contract still holds
 any balance of the series: silently orphaning inventory that can no longer be
 priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
-mappings. `seriesCount()` / `seriesAt(i)` expose the list; **order is not stable
-across deregistrations** (finding F-5, invariant I-24).
+mappings. The list is **not** externally observable — the `seriesCount()` /
+`seriesAt(i)` getters were dropped from this PR — and **order is not stable across
+deregistrations** (finding F-5, invariant I-24).
 
 #### Treasury withdrawal
 
@@ -1148,14 +1156,14 @@ production. This is the table to read first if you are auditing the system.
 | `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to factories deployed before it. |
 | `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer`, `setEmergencyUpdater` | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
 | `KaleidoscopeNAVFeed` | `emergencyUpdater` | `emergencyUpdateAnswer` — bypasses **both** interval and deviation caps | Ops Gnosis Safe, **contract-enforced ≠ `owner()`** | n/a |
-| `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to forwarders already deployed (incl. Base mainnet `0x09907C78D4eB531495962120464BFd9044390337`).
+| `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to forwarders already deployed.
 | `SanctionsOracleMirror` | `DEFAULT_ADMIN_ROLE` | Grant/revoke roles; `setForwardingOracle` | Compliance ops Gnosis Safe | **No** |
 | `SanctionsOracleMirror` | `SANCTIONS_UPDATER_ROLE` | `addToSanctionsList`, `removeFromSanctionsList` | Keeper-bot hot wallet | Yes |
 | `GyldAtomicSwap` | `DEFAULT_ADMIN_ROLE` | **UUPS upgrade**; `unpause`; `registerSeries` / `deregisterSeries`; `setMaxQuoteDeviationBps`; `setMaxNavAgeSecs`; `setMaxQuoteTtl`; `setWithdrawalWallet`; `bumpQuoteEpoch`; role grants | **TimelockController** (48 h) | **No** |
 | `GyldAtomicSwap` | `ALLOWLIST_ADMIN_ROLE` | `setAllowed()` — the taker allowlist, **and nothing else** | KMS compliance/ops hot key (`EVM_KMS_SWAP_ADMIN_*`) | Yes |
 | `GyldAtomicSwap` | `QUOTE_SIGNER_ROLE` | Passive — checked via `hasRole` against the recovered EIP-712 signer. The role registry **is** the signer set. | Quote-service KMS key(s) | Yes |
-| `GyldAtomicSwap` | `TREASURER_ROLE` | `withdraw()` — only ever to the admin-fixed `withdrawalWallet`. **Live while paused.** | Ops MPC wallet | **No** |
-| `GyldAtomicSwap` | `PAUSER_ROLE` | `pause()` **only** — resuming needs the admin | Ops multisig | **No** |
+| `GyldAtomicSwap` | `TREASURER_ROLE` | `withdraw()` — only ever to the admin-fixed `withdrawalWallet`. **Live while paused.** | Ops MPC wallet | Yes |
+| `GyldAtomicSwap` | `PAUSER_ROLE` | `pause()` **only** — resuming needs the admin | Ops multisig | Yes |
 | `TimelockController` | `PROPOSER_ROLE` | Schedule operations | Governance Gnosis Safe | — |
 | `TimelockController` | `EXECUTOR_ROLE` | Execute after the delay | `address(0)` = **anyone**, once the delay has elapsed | — |
 | `TimelockController` | `DEFAULT_ADMIN_ROLE` | Timelock self-administration | `address(0)` at construction → self-administered from birth; **no separate admin that could bypass the delay** | — |
@@ -2572,28 +2580,29 @@ consequence, and the two upstream properties a vault builder must document are i
 
 ### 16.1 Test suites
 
-`forge test` — **501 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **535 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `GyldAtomicSwapTest` | 77 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; permit front-run; withdrawal-wallet family; zero amounts |
-| `TokenFactoryTest` | 56 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
-| `IssuanceManagerTest` | 50 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
+| `GyldAtomicSwapTest` | 82 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; permit front-run; withdrawal-wallet family; zero amounts |
+| `KaleidoscopeNAVFeedTest` | 79 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, emergency updater + key separation, **`test_noStalenessRevertPathExists`** |
+| `TokenFactoryTest` | 60 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
+| `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
-| `KaleidoscopeNAVFeedTest` | 74 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, emergency updater + key separation, **`test_noStalenessRevertPathExists`** |
-| `GyldAtomicSwapSpecTest` | 40 | The numbered invariant / finding catalogue below |
-| `NAVFeedForwarderTest` | 36 | Delegation, upstream swap, probe matrix, future-dated rejection, access control |
-| `GyldBondTokenTest` | 22 | Core token functions |
-| `GyldBondTokenUnitTest` | 15 | Sanctions transfer paths, `setSanctionsList`, pause |
+| `GyldAtomicSwapSpecTest` | 48 | The numbered invariant / finding catalogue below |
+| `GyldBondTokenTest` | 42 | Core token functions; ERC-1643 document set/remove and `DOCUMENT_ROLE` gating |
+| `NAVFeedForwarderTest` | 39 | Delegation, upstream swap, probe matrix, future-dated rejection, access control |
 | `TimelockTest` | 15 | 48 h delay enforcement, cancellation, `IssuanceManager` admin wiring |
+| `GyldBondTokenUnitTest` | 15 | Sanctions transfer paths, `setSanctionsList`, pause |
 | `MockSanctionsListTest` | 14 | Dev-stub behaviour, owner-only writes |
 | `GyldBondTokenFuzzTest` | 11 | Mint/burn round-trip, transfer conservation, sanctions, pause, NAV model |
 | `AtomicSettlementDeployTest` | 5 | `DeployAtomicSettlement` end-to-end incl. topology assertions |
 | `SwapFuzzTest` | 5 | Fair-price rounding, single-use replay, draw range |
+| `GyldBondTokenInvariantsTest` | 5 | `totalSupply == Σ balances`; per-actor balance bounds |
 | `DeployMockSanctionsListTest` | 4 | Dev-only guard |
-| `GyldBondTokenInvariantsTest` | 3 | `totalSupply == Σ balances`; per-actor balance bounds |
+| `DeployMockUSDCTest` | 4 | Dev-only guard, Anvil pre-mint |
 | `DeployGuardsTest` | 3 | Allowlist classification, prod-required env vars |
 | `GyldAtomicSwapInvariantsTest` | 2 | Stateful: bond `totalSupply` never changes across BUY/REDEEM (**never-mints**); quote single-use |
 | `DeployScriptsTest` | 1 | Script revert assertions |
@@ -2645,7 +2654,7 @@ Remediated findings:
 | F-2 | **Not recoverable** — no surviving reference | — |
 | **F-3** | The usage bitmap is not epoch-scoped, so id reuse after a bump would silently break | Documented invariant I-5 + test; the quote service must use one monotonic counter |
 | **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **15 min**, ceiling 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
-| **F-5** | `seriesList` was unobservable, so swap-and-pop was untestable | `seriesCount()` / `seriesAt(i)` getters + test |
+| **F-5** | `seriesList` was unobservable, so swap-and-pop was untestable | **Not implemented.** The proposed `seriesCount()` / `seriesAt(i)` getters were dropped from this PR, so the list is still unobservable and the swap-and-pop loop has no external assertion point — see I-24. |
 | **F-6** | A future-dated `updatedAt` satisfies `now > updatedAt + maxAge` forever | Explicit `updatedAt > block.timestamp` → `StaleNav`; plus the forwarder's configuration-time probe |
 | **F-7** | A sole `PAUSER`/`TREASURER` holder could renounce, removing the halt and the paused-state evacuation path | **Rejected, not implemented.** The guard was inert (the admin administers both roles and re-grants in one tx; `renounceRole` is self-only; both roles are M-of-N in production) and mildly harmful — it blocked a holder with a known-compromised key from shedding it immediately. See §Non-renounceable roles. |
 
@@ -2667,7 +2676,7 @@ the contract's own `hashSwapMessage`.
 `forge build --force` produces **two** solc warnings, both cosmetic and both in
 test code: state mutability restrictable to `view` at
 `contracts/test/GyldAtomicSwap.halmos.t.sol:235`, and to `pure` at
-`contracts/test/GyldAtomicSwap.spec.t.sol:599`. There are also ~40 `forge lint`
+`contracts/test/GyldAtomicSwap.spec.t.sol:608`. There are also ~40 `forge lint`
 notes (`erc20-unchecked-transfer`, `unsafe-typecast`). The tree is not currently
 `forge fmt`-clean. See [`ci.md`](ci.md) for why none of these are enforced yet.
 
@@ -2865,8 +2874,8 @@ bytecode, so the corrections are recorded rather than silently dropped.
 | "All **six** contracts use `pragma solidity =0.8.28`" | `blockchain-status.md` | There are **seven** core contracts (the atomic swap was added after that sentence was written). The pin itself is correct on all seven. |
 | Contract table listing all seven core contracts as "Platform (**MIT**)" | `blockchain-status.md` | **False** — they are **BUSL-1.1**. `contracts.md` had this right. |
 | "Test and deployment-script files under `contracts/test/` and `contracts/script/` remain **MIT**" | `README.md`, `contracts.md` | **False.** 22 are `UNLICENSED`, 7 are MIT, 6 are `GPL-2.0-or-later`. Full breakdown in [§4.2](#42-licensing). |
-| "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `2e84151`): **501 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
-| "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml:29` | Stale. Now 483. The workflow comment is outside this document's remit and still says 471. |
+| "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `c1f240f`): **535 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
+| "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml:29` | Stale. Now 535. The workflow comment was corrected to 535 in the same pass. |
 | "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | **8 of 14.** Six reference `DeployGuards`; the eight that do not are the six Euler steps plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
 | Fireblocks ERC20F / DenyList contracts "remain in the repo for reference only" at `contracts/erc20f/` | `blockchain-status.md` | **The directory does not exist** in this tree. |
 | "`docs/contracts.md` \| Deployed addresses (**Hoodi testnet + mainnet**)" | `README.md` docs table | **False.** That file listed Ethereum Sepolia and local Anvil. No Hoodi addresses appear anywhere in `docs/`, and the Hoodi deployment described in the run-books never happened. |
