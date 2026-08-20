@@ -16,13 +16,13 @@ interface ITimelockLike {
 ///
 /// ## Why this exists (GYL-1135)
 ///
-/// The live Base mainnet stack was deployed with `delay = 0`, `executors[0] = address(0)`
+/// The live production stack was deployed with `delay = 0`, `executors[0] = address(0)`
 /// and `initialize(deployer, deployer, deployer)` — the deployer EOA ended up holding
 /// every privileged role behind a timelock that imposes no delay at all. Two design
 /// defects made that possible and both are fixed here:
 ///
 ///  1. **Denylist chain guards.** Every "mainnet protection" check in the scripts was
-///     `require(block.chainid != 1, ...)`. Base (8453), Arbitrum, Optimism, Polygon and
+///     `require(block.chainid != 1, ...)`. A production L2 (chain 8453), Arbitrum, Optimism, Polygon and
 ///     every future L2 sail straight through it. {isDevChain} inverts this into an
 ///     ALLOWLIST: only Anvil (31337) and Sepolia (11155111) are development chains, and
 ///     an unrecognised chain defaults to "production". A new chain now fails closed.
@@ -36,7 +36,7 @@ interface ITimelockLike {
 ///
 /// {saltFor} / {requireVacant} give every bootstrap contract a CREATE2 salt that includes
 /// `block.chainid`, so the same deployer+nonce can no longer produce COLLIDING addresses
-/// across chains (today `0x7c1798…70ad` is a live GyldBondToken on Base and a
+/// across chains (today `0x7c1798…70ad` is a live GyldBondToken on a production L2 and a
 /// MockSanctionsList on Sepolia).
 library DeployGuards {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -143,7 +143,7 @@ library DeployGuards {
     }
 
     /// @notice On production, a timelock delay below 48h is rejected before any gas is
-    ///         spent. `TIMELOCK_DELAY_SECONDS=0` on Base is exactly how the incident happened.
+    ///         spent. `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the incident happened.
     function requireProdMinDelay(uint256 delay) internal view {
         if (isDevChain()) return;
         if (delay < MIN_PROD_TIMELOCK_DELAY) {
@@ -162,7 +162,7 @@ library DeployGuards {
 
     /// @notice On production, `who` must not be the deployer EOA. No-op on dev chains.
     /// @dev    A privileged role pointed at the broadcaster is the exact shape of the
-    ///         Base incident: the handover reads as done but nothing actually moved.
+    ///         GYL-1135 incident: the handover reads as done but nothing actually moved.
     function requireNotDeployer(address who, address deployer, string memory key) internal view {
         if (isDevChain()) return;
         if (who == deployer) {

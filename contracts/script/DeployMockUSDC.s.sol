@@ -12,7 +12,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 /// ── Why the chain guard exists (GYL-1135) ─────────────────────────────────────
 /// This was the LAST script under `contracts/script/` with no chain guard of any kind —
 /// not even the `block.chainid != 1` denylist the others had. `forge script DeployMockUSDC
-/// --rpc-url <base>` therefore deployed a fake "USD Coin" on a production chain and minted
+/// --rpc-url <production-rpc>` therefore deployed a fake "USD Coin" on a production chain and minted
 /// 100,000 of it to three hardcoded Anvil accounts, one of which (`0x7099…79C8`,
 /// {DeployGuards.ANVIL_ACCOUNT_1}) has a private key published in the Anvil banner. The
 /// token is worthless, so the direct blast radius is small — but {MockUSDC} has a

@@ -12,7 +12,7 @@ in a separate workflow so this one stays trustless.
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
 | `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 535 tests across 20 suites) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
-| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — how a zero-delay timelock and a bare-EOA admin reached live Base mainnet. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
+| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — a production L2 satisfies `!= 1`, so a zero-delay timelock and a bare-EOA admin sail onto a live chain unopposed. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
 | `test` (step) | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff — and NEITHER reached `main`. This check does not replace that review; it **forces** it, by turning a subtle Solidity diff into an explicit `ci/storage-layouts/` diff a reviewer cannot skim past, and giving an auditor a concrete artifact to read before an upgrade. The audit remains the thing that decides whether a layout change is safe. See "Storage layout" below |
 
 ## Why full fuzz intensity on every push
@@ -202,8 +202,8 @@ The repo-wide `Total` that `--report summary` prints is **65.08%**. Ignore it:
 it is dominated by broadcast-only scripts such as `AtomicSettlementFlow` that
 have no test harness, so it measures how many deploy scripts have tests, not
 how well the contracts are tested. (It was more dominated still when the
-`DeployEulerStep*` family was in the tree; those were removed with the Base
-demo, so the figure quoted above predates their removal.)
+`DeployEulerStep*` family was in the tree; those have since been removed, so the
+figure quoted above predates their removal.)
 
 Two honest caveats, in order of importance:
 
@@ -316,8 +316,9 @@ CI log if you need the exact case.
 - ~~**Broadcast-without-guard job**~~ — **adopted**, and it starts green. The
   earlier objection was that 8 of the then-14 broadcasting scripts (six of
   them the since-removed `DeployEulerStep*` family) pinned their chain with a
-  bare `require(block.chainid == 8453)` and never referenced `DeployGuards`, so a
-  check for a `DeployGuards` *call* would start red. The fix was to check for
+  bare `require(block.chainid == <one production chain id>)` and never
+  referenced `DeployGuards`, so a check for a `DeployGuards` *call* would start
+  red. The fix was to check for
   a **chain guard**, not for the library: a positive `block.chainid ==` pin is
   a fail-closed allowlist of exactly one chain and counts. Both forms are
   accepted, so no script needed rewriting and the job is green at adoption.

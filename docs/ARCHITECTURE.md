@@ -220,7 +220,7 @@ immutable, so their behaviour cannot be changed under live integrators at all.
 
 The consequence of immutability is real and load-bearing: `stalenessSeconds()`
 was added to `KaleidoscopeNAVFeed` under GYL-1135 and **cannot be retrofitted**
-to already-deployed feeds, including the Base mainnet feed. Alerting on existing
+to already-deployed feeds. Alerting on existing
 feeds must derive age from `latestRoundData().updatedAt` or from the
 `AnswerUpdated` / `EmergencyAnswerUpdated` events, which exist on every version.
 
@@ -609,9 +609,7 @@ compromised key; it does not hold against compromise of both.
 
 `renounceOwnership()` is disabled outright (GLD-165). Note this is **not
 retrofittable** — the feed is not upgradeable, so feeds deployed before this
-guard (including the retired Base mainnet demo feed, whose records were removed —
-see [§14.1](#141-base-mainnet-8453--retired-demo-records-removed)) do not have it
-and still depend on the runbook rule. The feed is not
+guard do not have it and still depend on the runbook rule. The feed is not
 upgradeable and its reads never revert on staleness, so an owner-less feed would
 serve its last answer forever with no recovery path — and if an
 `_emergencyUpdater` were set at the time, that address would keep unbounded price
@@ -640,8 +638,7 @@ Historical rounds are not stored. DeFi protocols use `latestRoundData()`
 exclusively; `getRoundData` exists solely to satisfy the interface. A future
 time-weighted-NAV requirement needs a new feed that stores a round history.
 
-The full reasoning for non-reverting reads, and the incident that tested it, is
-in [§11](#11-oracle-design).
+The full reasoning for non-reverting reads is in [§11](#11-oracle-design).
 
 `stalenessSeconds()` returns a magnitude rather than a bool so an alerting rule
 can choose its own threshold (page at ~26 h, escalate at 96 h) instead of being
@@ -719,7 +716,7 @@ mainnet included (GYL-1051). Plain `AccessControl`, immutable, no proxy, no
 pause.
 
 This reverses the contract's own original premise. It was built for chains where
-Chainalysis had never deployed (Mantle, Base, most L2s), as a "deployment gap
+Chainalysis had never deployed (Mantle, most L2s), as a "deployment gap
 adapter" that would be retired once a vendor oracle appeared. That framing is
 dead: the mirror is now the primary oracle everywhere, and a vendor oracle is
 consumed *through* it rather than instead of it.
@@ -1035,9 +1032,8 @@ updates its forwarder — which is also the escape hatch if a forwarder is brick
 `deregisterSeries(token)` reverts `SeriesNotEmpty` while the contract still holds
 any balance of the series: silently orphaning inventory that can no longer be
 priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
-mappings. The list is **not** externally observable — the `seriesCount()` /
-`seriesAt(i)` getters were dropped from this PR — and **order is not stable across
-deregistrations** (finding F-5, invariant I-24).
+mappings. The list is **not** externally observable, and **order is not stable
+across deregistrations** (invariant I-24).
 
 #### Treasury withdrawal
 
@@ -1359,8 +1355,6 @@ priority of the stale-feed and keeper gaps in [§18](#18-known-gaps-and-open-dec
 
 Two throwaway testnet proxies still carry the old extension bytecode and must
 never be reused for a new series — they are listed in [§14](#14-deployed-addresses).
-The live Base mainnet token stack predates the extension and never carried it, so
-no mainnet cleanup is needed.
 
 ### 8.4 Peer comparison
 
@@ -1696,14 +1690,13 @@ Reads always succeed and always carry the true `updatedAt`. **Every consumer is
 responsible for its own age check.** This is the Chainlink aggregator contract, and
 it is deliberate.
 
-**This is not theoretical.** The Base mainnet feed has been stale since
-**2026-05-19**. The two live integrations diverged exactly along the "does the
-consumer age-check?" line:
+**This is not theoretical.** When a feed stops being pushed, the integrations
+diverge exactly along the "does the consumer age-check?" line:
 
-| Consumer | Own staleness check | Behaviour during the outage |
+| Consumer | Own staleness check | Behaviour on a stale feed |
 |---|---|---|
-| Euler V2 | Yes — `PriceOracle_TooStale`, `maxStaleness = 86400` | **Froze the market. Correct.** |
-| Morpho Blue | **None** | Kept quoting the pinned $100.00 indefinitely. |
+| Euler V2 | Yes — `PriceOracle_TooStale`, `maxStaleness = 86400` | **Freezes the market. Correct.** |
+| Morpho Blue | **None** | Keeps quoting the last pushed answer indefinitely. |
 | `GyldAtomicSwap` | Yes — `StaleNav`, bounded `maxNavAgeSecs` | Fails closed on `executeSwap` |
 
 Morpho's behaviour is a real, open exposure. **No change to the feed fixes it.**
@@ -1720,12 +1713,12 @@ Morpho's behaviour is a real, open exposure. **No change to the feed fixes it.**
 
 #### Why not just make reads revert
 
-1. **It breaks the consumers that behave correctly.** Euler age-checks and froze
+1. **It breaks the consumers that behave correctly.** Euler age-checks and freezes
    exactly as designed. A reverting feed would hand it a raw revert instead of a
    price plus a timestamp — same freeze, less information, and a failure mode its
    error handling does not model.
-2. **It destroys diagnosability.** `updatedAt` is what told us the feed died on
-   2026-05-19 and for how long. A revert carries no timestamp.
+2. **It destroys diagnosability.** `updatedAt` is what tells you that a feed died,
+   and for how long. A revert carries no timestamp.
 3. **It freezes liquidations, unfixably.** This is the decisive one. On Morpho a
    reverting oracle blocks *liquidations* as well as borrows. Positions already
    underwater before the outage cannot be closed, and bad debt grows for the whole
@@ -1758,9 +1751,9 @@ age check.*
    reject an upstream reporting a future `updatedAt`, closing the silent fail-open
    that would otherwise disarm every integrator at once.
 3. **Ops — and no contract change substitutes for this.** The NAV keeper must push
-   after every market close and alerting must page when it does not. The 2026-05-19
-   outage was a keeper/alerting failure, not a contract failure: every contract
-   behaved as written. `isFresh()` and `stalenessSeconds()` exist to be *polled*;
+   after every market close and alerting must page when it does not. A stalled feed
+   is a keeper/alerting failure, not a contract failure: every contract behaves as
+   written. `isFresh()` and `stalenessSeconds()` exist to be *polled*;
    they protect nobody if nothing polls them. A missed daily push is visible within
    ~26 h, which is far earlier than the 96 h `MAX_STALENESS` threshold — page on the
    magnitude, not on the bool.
@@ -1855,7 +1848,7 @@ cost is that additions like `stalenessSeconds()` reach only future deployments.
 
 ### 13.1 The incident that motivated all of it
 
-The live Base mainnet stack was deployed with `delay = 0`,
+A production stack was once deployed with `delay = 0`,
 `executors[0] = address(0)` and `initialize(deployer, deployer, deployer)`. The
 deployer EOA ended up holding **every privileged role**, behind a timelock that
 imposed no delay at all. The handover read as done; nothing had actually moved.
@@ -1863,14 +1856,14 @@ imposed no delay at all. The handover read as done; nothing had actually moved.
 Two design defects made it possible:
 
 1. **Denylist chain guards.** Every "mainnet protection" check in the scripts was
-   `require(block.chainid != 1, ...)`. Base (8453), Arbitrum, Optimism, Polygon and
-   every future L2 sail straight through it.
+   `require(block.chainid != 1, ...)`. Every production L2 — Arbitrum, Optimism,
+   Polygon and every L2 that does not exist yet — sails straight through it.
 2. **Silent fallbacks.** Privileged addresses fell back to the deployer EOA, and the
    timelock handover was skipped with at most a `console.log` when its env var was
    unset.
 
 A third, related defect: the same deployer + nonce produced **colliding addresses
-across chains**. `0x7c1798...70ad` is a live `GyldBondToken` on Base and a
+across chains**. `0x7c1798...70ad` is a `GyldBondToken` on one chain and a
 `MockSanctionsList` on Sepolia.
 
 `contracts/script/lib/DeployGuards.sol` (GYL-1135) fixes all three.
@@ -1884,7 +1877,7 @@ function isDevChain() internal view returns (bool) {
 }
 ```
 
-**Only those two chains** are development chains. Everything else — Base, Arbitrum,
+**Only those two chains** are development chains. Everything else — Arbitrum,
 Ethereum mainnet, and every chain that does not exist yet — is production and takes
 the strict path. A new chain now **fails closed**.
 
@@ -1901,7 +1894,7 @@ Guards must be allowlists.
 | `envAddressRequired(key)` | Reverts if unset, unparseable, or zero. |
 | `envAddressProdRequired(key, devFallback)` | Falls back to `devFallback` **only** on a dev chain; on production an unset or zero value reverts. |
 | `envUintProdRequired(key, devFallback)` | Same, for uints. |
-| `requireProdMinDelay(delay)` | On production, rejects `delay < 48 hours`. `TIMELOCK_DELAY_SECONDS=0` on Base is exactly how the incident happened. |
+| `requireProdMinDelay(delay)` | On production, rejects `delay < 48 hours`. `TIMELOCK_DELAY_SECONDS=0` is exactly how the incident happened. |
 | `requireNotDeployer(who, deployer, key)` | On production, a privileged address must not be the broadcaster. This is the exact shape of the incident. |
 | `requireDistinct(a, b, keyA, keyB)` | On production, two roles that exist to split a quorum must be different addresses — e.g. `SUBSCRIBER_ADDRESS` vs `REDEEMER_ADDRESS`. |
 | `requireProdContract(target, label)` | On production, `target.code.length != 0`. Catches a sanctions "oracle" or forwarder owner that is silently a wallet. |
@@ -1938,10 +1931,9 @@ timelock and off the deployer, that the timelock is sane, and — on production 
 | `AtomicSettlementFlow.s.sol` | Repeatable live-Anvil settlement flow | Does not reference `DeployGuards` |
 
 **2 of the 8 broadcasting scripts do not reference `DeployGuards`**:
-`AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. (It was 8 of 14 until the six
-Euler steps were removed with the Base demo.) Both pin a
-single chain with a bare equality `require`, which is an allowlist and therefore not
-the bug class the incident came from — but they do not get the env-var,
+`AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. Both pin a single chain with
+a bare equality `require`, which is an allowlist and therefore not the bug class the
+incident came from — but they do not get the env-var,
 not-the-deployer, min-delay or post-deploy-assertion coverage. Extending the
 refactor to them is tracked in [§18](#18-known-gaps-and-open-decisions).
 
@@ -1996,28 +1988,9 @@ refactor to them is tracked in [§18](#18-known-gaps-and-open-decisions).
 
 ## 14. Deployed addresses
 
-Deployer for all Base and Sepolia work below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
+Deployer for all Sepolia work below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
 
-### 14.1 Base mainnet (8453) — retired demo, records removed
-
-The Base mainnet demo stack (a dummy "Test Bond Alpha" token behind a Morpho Blue
-market, deployed 2026-05-18 to produce a shareable `app.morpho.org` link) is
-**retired and no longer tracked here.** Its addresses were removed from this
-document and from `DEPLOYMENTS.md` on 2026-08-12 by owner decision (GLD-148): it is
-a learning/demo artefact, nothing in the platform depends on it, and it is not a
-deployment target.
-
-**The lesson it produced is kept, and is the important part** — this stack is why
-[§13](#13-deployment-model)'s deploy guards exist. It was deployed with `delay = 0`,
-an open executor and deployer-held roles, and `DeployBaseTest.s.sol` (deleted in
-`ea6683c`, GYL-1135) is why `isDevChain()` is now a **allowlist** rather than the
-`require(block.chainid != 1)` denylist that let an L2 through. See
-[§13.1](#13-deployment-model) and D-15 in the decision log.
-
-The addresses remain recoverable from git history (this file and `DEPLOYMENTS.md`
-prior to 2026-08-12) if they are ever needed.
-
-### 14.2 Ethereum Sepolia (11155111)
+### 14.1 Ethereum Sepolia (11155111)
 
 Morpho compatibility test stack, 2026-05-14/15:
 
@@ -2033,8 +2006,8 @@ Morpho compatibility test stack, 2026-05-14/15:
 | USDC (Circle Sepolia) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
 
 > `0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad` is the cross-chain address collision
-> that motivated chain-salted CREATE2: the same address is a live `GyldBondToken` on
-> Base and a `MockSanctionsList` here.
+> that motivated chain-salted CREATE2: the same address is a `MockSanctionsList`
+> here and a `GyldBondToken` on another chain.
 
 Atomic-settlement integrator test instance, 2026-07-31:
 
@@ -2056,7 +2029,7 @@ a signed BUY quote executed (2 USDC → 0.02 bonds, `quoteId 1` burned).
 > since-dropped ERC-8056 display extension** — do not reuse that proxy for a new
 > series.
 
-### 14.3 Orphaned ERC-8056 evaluation artefacts — do not reuse
+### 14.2 Orphaned ERC-8056 evaluation artefacts — do not reuse
 
 | Network | Token | Address |
 |---|---|---|
@@ -2073,36 +2046,12 @@ All three lending integrations consume `NAVFeedForwarder`. **Point every protoco
 at the forwarder, never at `KaleidoscopeNAVFeed` directly** — that is the whole
 reason the forwarder exists.
 
-### 15.1 Morpho Blue — live on Base
+### 15.1 Morpho Blue
 
 Permissionless: anyone can create an isolated market in a single `createMarket()`
 call, no approval and no governance vote. Five immutable parameters baked in at
 creation: loan token, collateral token, oracle, IRM, LLTV. Markets appear on
 `app.morpho.org` immediately.
-
-**Live market**
-
-| | |
-|---|---|
-| Market ID | `0x9840633fea7b077c2efac0f819ccef9fa69e2641844fcc749e756cafb0bfd453` |
-| URL | `https://app.morpho.org/base/market/0x9840633fea7b077c2efac0f819ccef9fa69e2641844fcc749e756cafb0bfd453` |
-| Loan token | USDC |
-| Collateral token | TBA |
-| **LLTV** | **86 %** |
-| Oracle | `MorphoChainlinkOracleV2` at `0xeD5F6eFb1a4D486642dAc48AC129af5834d7ca6A` |
-
-**Base mainnet protocol addresses** (official — do not change)
-
-| Contract | Address |
-|---|---|
-| Morpho Blue | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
-| AdaptiveCurveIRM | `0x46415998764C29aB2a25CbeA6254146D50D22687` |
-| MorphoChainlinkOracleV2Factory | `0x2DC205F24BCb6B311E5cdf0745B0741648Aebd3d` |
-| VaultV2Factory | `0x4501125508079A99ebBebCE205DeC9593C2b5857` |
-| MorphoMarketV1AdapterV2Factory | `0x9a1B378C43BA535cDB89934230F0D3890c51C0EB` |
-| AdapterRegistry | `0x5C2531Cbd2cf112Cf687da3Cd536708aDd7DB10a` |
-| USDC (Base) | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| Chainlink USDC/USD feed | `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B` |
 
 **Sepolia protocol addresses**
 
@@ -2146,7 +2095,7 @@ NAVFeedForwarder (AggregatorV3Interface, 8-decimal USD NAV)
 
 ```bash
 # verify after deploy
-cast call $MORPHO_ORACLE "price()(uint256)" --rpc-url $BASE_RPC
+cast call $MORPHO_ORACLE "price()(uint256)" --rpc-url $RPC_URL
 # expect ~100000000000000000000000000  (100 × 10^24)
 ```
 
@@ -2206,17 +2155,17 @@ observed over the session: 37 units ($0.000037).
 | Link shareable? | Yes | Yes |
 | Shows on the market list? | No (direct URL only) | Yes |
 | Time to ready | Minutes | ~1 week |
-| Cost on Base | ~$0.50 | ~$1–2 |
+| Cost | ~$0.50 | ~$1–2 |
 | What is needed | `createMarket()` + seed | The above + Vault V2 + a GitHub PR |
 
-**Path A is live now** — a yellow banner is shown, the user clicks "I understand"
-and can trade normally.
+Under Path A a yellow banner is shown, the user clicks "I understand" and can
+trade normally.
 
 Path B steps: deploy a Vault V2, deploy a market adapter, configure caps, allocate
 so the market appears in the vault's withdrawal queue (**this is the exact trigger
 that sets `listed: true` on the Morpho API**), then open a PR to
 `morpho-org/morpho-blue-api-metadata` adding entries to `data/vaults-v2-listing.json`
-(vault address, `chainId=8453`, image, description), `data/tokens.json`
+(vault address, chain id, image, description), `data/tokens.json`
 (`isListed: true, isWhitelisted: true`) and `data/curators-listing.json` (Gyld as
 curator, `verified=true`), then await 2 approvals from `@morpho-org/integration`
 reviewers — typically same-day to 4 days.
@@ -2243,64 +2192,45 @@ Warning taxonomy:
 
 All warnings are informational; users can dismiss them and trade.
 
-### 15.2 Euler V2 — live on Base
+### 15.2 Euler V2
 
-Deployed 2026-05-19. Euler V2 (EVK + EVC) is modular: no single `createMarket()`
-exists. Each component — oracle adapter, router, IRM, vaults — is deployed
-separately. That is a deliberate tradeoff: the same oracle and IRM can be reused
-across vaults, enabling cross-vault collateral.
+Euler V2 (EVK + EVC) is modular: no single `createMarket()` exists. Each
+component — oracle adapter, router, IRM, vaults — is deployed separately. That is a
+deliberate tradeoff: the same oracle and IRM can be reused across vaults, enabling
+cross-vault collateral.
 
 **`NAVFeedForwarder` is plug-in compatible with no wrapper** — Euler's
 `ChainlinkOracle` adapter accepts `AggregatorV3Interface` feeds directly.
 
-**Official Base mainnet contracts** (do not change)
+The five components are an oracle adapter (`ChainlinkOracle`), an `EulerRouter`, a
+`KinkIRM`, a collateral escrow vault and a USDC lending vault.
 
-| Contract | Address |
-|---|---|
-| EVC | `0x5301c7dD20bD945D2013b48ed0DEE3A284ca8989` |
-| eVaultFactory | `0x7F321498A801A191a93C840750ed637149dDf8D0` |
-| oracleRouterFactory | `0xA9287853987B107969f181Cce5e25e0D09c1c116` |
-| kinkIRMFactory | `0x2d94C898a17f9D8c0bA75010A51cd61BF55b402E` |
-| adaptiveCurveIRMFactory | `0xae752d786ecAf6683f61b7D910F221edD003895b` |
-| oracleAdapterRegistry | `0x3cD76476bB7933A99Fa5bAa05446e71e07CDe0ca` |
-| EscrowedCollateralPerspective | `0x977590fA311755DA2fa1421c1A944520b684f90F` |
-
-> **No official Euler V2 testnet deployment exists** on Base Sepolia or Ethereum
-> Sepolia. All Euler testing must be done on Base mainnet.
+> **No official Euler V2 testnet deployment exists** on Ethereum Sepolia, so Euler
+> testing must be done against a production deployment.
 >
 > `oracleAdapterRegistry` is owned by Euler Labs — we cannot register our adapter
 > there. Registration is optional; the adapter works without it.
 
-**Gyld-deployed Euler contracts**
+Oracle adapter parameters: base = the bond token, quote = USDC, feed =
+`NAVFeedForwarder`, **`maxStaleness = 86400` (24 h) — reverts if the price is
+older**. This is the check that freezes the market correctly when the feed stops
+being pushed.
 
-| Step | Contract | Address |
-|---|---|---|
-| 1 | `ChainlinkOracle` adapter (TBA/USDC) | `0xC976C499a86aDAf73E4b258BDb3EB3A8e5BE134d` |
-| 2 | EulerRouter V1 — **retired** | `0xe2Cf003AA0855D035c01c32B1cdEb081f7666428` |
-| 3 | KinkIRM | `0xE0EF36466d5d6Fce7764339d278Fe786a4cA573d` |
-| 4 | TBA Escrow Vault | `0x155872FAA8c6C47BAE55cbE14deFb324663ec3F4` |
-| 5a | EulerRouter V2 — **active** | `0xBD8535B344293e96C0eFE7E9224aB54CE880471E` |
-| 5b | USDC Lending Vault | `0xCF8930030FbA9c8599A534304B94972762d79F71` |
+**Vault configuration**
 
-Oracle adapter parameters: base = TBA, quote = USDC, feed = `NAVFeedForwarder`
-`0x09907C78...`, **`maxStaleness = 86400` (24 h) — reverts if the price is older**.
-This is the check that froze the market correctly during the 2026-05-19 outage.
-
-**Vault state**
-
-| Escrow vault (TBA) | Value |
+| Escrow vault (bond token) | Value |
 |---|---|
-| `asset()` | TBA `0xD9e587D18A6aA190eba22dFce06fb84a8cdfEFA3` |
+| `asset()` | the bond token |
 | `oracle()` | `address(0)` — collateral-only, no pricing needed |
 | `unitOfAccount()` | `address(0)` — collateral-only |
 | `governorAdmin()` | `address(0)` — renounced |
 
 | Lending vault (USDC) | Value |
 |---|---|
-| `asset()` | USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| `oracle()` | EulerRouter V2 `0xBD8535B3...` |
+| `asset()` | USDC |
+| `oracle()` | EulerRouter V2 |
 | `unitOfAccount()` | USDC |
-| `interestRateModel()` | KinkIRM `0xE0EF3646...` |
+| `interestRateModel()` | KinkIRM |
 | **Borrow LTV** | **75 %** |
 | **Liquidation LTV** | **80 %** (a 5 pp gap gives liquidators an incentive window) |
 | `governorAdmin()` | `address(0)` — renounced |
@@ -2336,13 +2266,13 @@ router must know `escrowVaultAddress` is a vault so it can call
 reverts `PriceOracle_NotSupported(escrowVaultAddress, USDC)`.
 
 ```bash
-# 1 TBA → USDC  (~$100)
-cast call 0xC976C499a86aDAf73E4b258BDb3EB3A8e5BE134d \
+# 1 bond token → USDC  (~$100)
+cast call $CHAINLINK_ORACLE_ADAPTER \
   'getQuote(uint256,address,address)(uint256)' \
   1000000000000000000 \
-  0xD9e587D18A6aA190eba22dFce06fb84a8cdfEFA3 \
-  0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
-  --rpc-url https://mainnet.base.org
+  $BOND_TOKEN \
+  $USDC \
+  --rpc-url $RPC_URL
 # → 100000000 = $100.00
 ```
 
@@ -2386,7 +2316,7 @@ Verified post-borrow state: `totalAssets` 755,962 USDC, `totalBorrows` 300,000 U
    was configured with `govSetConfig` but `govSetResolvedVault` was missed, and
    governance had already been renounced to `address(0)` — unrecoverable, hence Router
    V2. Configure fully, **then** renounce. Never the reverse.
-3. **BaseScan shows "execution reverted" on successful EVault deposits.** A display
+3. **A block explorer may show "execution reverted" on successful EVault deposits.** A display
    artefact of the EVC's deferred liquidity check: `deposit()` triggers an internal
    `checkVaultStatus()` try/catch probe. Verify success by **token transfer events**,
    not the revert label.
@@ -2449,8 +2379,8 @@ permission is granted; getting permission is the hard part.
 
 **Why the shared pool matters:** in Morpho, a bad oracle on the bond market affects
 only that market's borrowers. In Aave, every asset shares risk — a broken bond
-oracle could impact all Aave Base suppliers. Hence the strictness and the near-certain
-requirement of isolation mode with conservative caps first.
+oracle could impact every supplier in the shared pool. Hence the strictness and the
+near-certain requirement of isolation mode with conservative caps first.
 
 `AaveOracle.setAssetSources([token], [NAVFeedForwarder])` is all the oracle wiring
 needed. One edge case: **`AaveOracle` reverts if `latestAnswer()` returns zero or
@@ -2458,28 +2388,12 @@ negative.** Push a price before registering the oracle. (Note the correction to
 earlier guidance: on a feed with no price pushed, `latestAnswer()` **reverts
 `NoPriceSet`** — it does not return 0.)
 
-**Aave V3 Base mainnet** (official, do not change) — source:
-[`bgd-labs/aave-address-book` → `AaveV3Base.sol`](https://github.com/bgd-labs/aave-address-book/blob/main/src/AaveV3Base.sol)
+Per-chain Aave V3 addresses (`PoolAddressesProvider`, `Pool`, `PoolConfigurator`,
+`AaveOracle`, `ACLManager`) come from
+[`bgd-labs/aave-address-book`](https://github.com/bgd-labs/aave-address-book) — take
+them from there rather than copying them into this document.
 
-| Contract | Address |
-|---|---|
-| PoolAddressesProvider | `0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D` |
-| Pool (proxy) | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
-| PoolConfigurator | `0x5731a04B1E775f0fdd454Bf70f3335886e9A96be` |
-| AaveOracle | `0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156` |
-| ACLManager | `0x43955b0899Ab7232E3a454cf84AedD22Ad46FD33` |
-
-**Aave V3 Base Sepolia** — source: `AaveV3BaseSepolia.sol`
-
-| Contract | Address |
-|---|---|
-| PoolAddressesProvider | `0xE4C23309117Aa30342BFaae6c95c6478e0A4Ad00` |
-| Pool | `0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27` |
-| PoolConfigurator | `0x0Bf6bdFF4da24C272BC524d521Ab0db20601D384` |
-| AaveOracle | `0x943b0dE18d4abf4eF02A85912F8fc07684C141dF` |
-| ACLManager | `0x9f09F541Adf314341d8d45E5B18961147b9050E9` |
-
-On the public Base Sepolia deployment `POOL_ADMIN` is held by the Aave/BGD team — we
+On Aave's public testnet deployments `POOL_ADMIN` is held by the Aave/BGD team — we
 have no admin access, so testing means a fork or our own deployment.
 
 **Risk parameters we would propose** (starting values for isolation mode; final
@@ -2503,22 +2417,22 @@ Short Executor timelock (1 d). **Minimum ~20 days; realistically 4–8 weeks.** 
 fast track (asset already listed on another Aave market) skips Temp Check entirely —
 ARFC + Snapshot + AIP only, ~10 days minimum — but requires a Chainlink price feed
 live for 90+ days, a supply cap ≤ 50 % of on-chain token supply, and risk-provider
-feedback. Voting power is based on Ethereum mainnet balances even for Base listings.
+feedback. Voting power is based on Ethereum mainnet balances even for L2 listings.
 **There is no bypass for listings.**
 
 **Three testing paths:**
 
 - **Path A — local fork test (recommended first).** Zero cost, runs in CI, 1–2 days
-  to write. Fork Base mainnet, impersonate an existing `POOL_ADMIN`, grant
+  to write. Fork a chain where Aave V3 is live, impersonate an existing `POOL_ADMIN`, grant
   `ASSET_LISTING_ADMIN`, `setAssetSources([token],[forwarder])`, `initReserves`,
   configure isolation mode, then test supply → borrow → repay → withdraw and a
   `vm.mockCall` price drop triggering liquidation. Deliverable:
   `AaveV3Integration.t.sol`. **Not yet written.**
-- **Path B — own Aave V3 deployment on Base Sepolia (84532).** Deployer holds all
+- **Path B — our own Aave V3 deployment on a testnet.** Deployer holds all
   admin roles, no governance needed. Complication: `app.aave.com` only shows known
-  pool addresses, so a custom deployment needs a custom UI or `cast`/BaseScan for
-  demos.
-- **Path C — Base mainnet governance listing.** Pre-requisites: forwarder live and
+  pool addresses, so a custom deployment needs a custom UI or `cast`/a block explorer
+  for demos.
+- **Path C — mainnet governance listing.** Pre-requisites: forwarder live and
   pushing for 90+ days, Path A passing, a commissioned risk report, internal legal
   sign-off, and AAVE holders with 320 k+ voting power willing to support.
 
@@ -2565,9 +2479,9 @@ consequence, and the two upstream properties a vault builder must document are i
   normally after `unpause()`.
 - **Protocol addresses are screened as spenders.** Morpho's and Euler's contract
   addresses go through the sanctions oracle on every collateral deposit and
-  withdrawal, as `to`/`from` and as `transferFrom` spender. Verified passing on both
-  Sepolia (against `MockSanctionsList`) and Base (against the official Chainalysis
-  oracle at `0x3A91A31c...`).
+  withdrawal, as `to`/`from` and as `transferFrom` spender. Verified passing on
+  Sepolia (against `MockSanctionsList`) and on a production chain (against the
+  official Chainalysis oracle).
 - **Market parameters are immutable on Morpho.** Once `createMarket()` is called,
   oracle, IRM and LLTV cannot change. A new market must be created to change any of
   them. The same is true of Euler's IRM after deployment.
@@ -2643,7 +2557,7 @@ references resolve to something.
 | **I-21** | Series deregistration then re-registration restores tradability | `test_deregisterSeries_thenReregister_restoresTradability` |
 | **I-22** | Permit is never load-bearing for authorization — a `tokenIn` with no `permit()` at all still settles via a plain approval | `test_executeSwap_permitOnTokenWithoutPermit_doesNotBrick` |
 | **I-23** | Quote expiry is TTL-bounded: `block.timestamp <= expiry <= block.timestamp + maxQuoteTtl`, upper edge **inclusive** | `test_executeSwap_quoteExpiryTtlBound_inclusiveEdge` |
-| **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | **Not covered.** The `seriesCount`/`seriesAt` getters that made the list externally observable were dropped from this PR, and `seriesList` is read by no other contract logic — so the swap-and-pop loop (`registerSeries`/`deregisterSeries`) has no external assertion point. Pre-existing gap on `main`; restoring the two view functions is the cheapest fix. |
+| **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | **Not covered.** `seriesList` is not externally observable and is read by no other contract logic, so the swap-and-pop loop (`registerSeries`/`deregisterSeries`) has no external assertion point. Pre-existing gap on `main`. |
 
 Remediated findings:
 
@@ -2653,7 +2567,6 @@ Remediated findings:
 | F-2 | **Not recoverable** — no surviving reference | — |
 | **F-3** | The usage bitmap is not epoch-scoped, so id reuse after a bump would silently break | Documented invariant I-5 + test; the quote service must use one monotonic counter |
 | **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **15 min**, ceiling 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
-| **F-5** | `seriesList` was unobservable, so swap-and-pop was untestable | **Not implemented.** The proposed `seriesCount()` / `seriesAt(i)` getters were dropped from this PR, so the list is still unobservable and the swap-and-pop loop has no external assertion point — see I-24. |
 | **F-6** | A future-dated `updatedAt` satisfies `now > updatedAt + maxAge` forever | Explicit `updatedAt > block.timestamp` → `StaleNav`; plus the forwarder's configuration-time probe |
 | **F-7** | A sole `PAUSER`/`TREASURER` holder could renounce, removing the halt and the paused-state evacuation path | **Rejected, not implemented.** The guard was inert (the admin administers both roles and re-grants in one tx; `renounceRole` is self-only; both roles are M-of-N in production) and mildly harmful — it blocked a holder with a known-compromised key from shedding it immediately. See §Non-renounceable roles. |
 
@@ -2709,7 +2622,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-12 | **Capped-allowance quote, single draw** | Lets the desk sign "up to $1,000 at this price" and the taker choose the size in one call, while keeping the quote strictly single-use. Multi-draw was explicitly deferred. [§5.7](#57-gyldatomicswap) |
 | D-13 | **`ALLOWLIST_ADMIN_ROLE` split off `DEFAULT_ADMIN_ROLE`** (GYL-1050) | Per-taker allowlisting must stay a same-day operational action after the timelock handover. It grants access to swap, never to funds or upgrades. |
 | D-14 | **Asymmetric pause on the swap; symmetric on the token** | The swap runs off a hot signing key, so re-arming it is deliberately slow. |
-| D-15 | **Chain-allowlist deploy guards, fail-closed** (GYL-1135) | Denylist guards let every L2 through; that is how a zero-delay timelock and a bare-EOA admin reached live Base. [§13](#13-deployment-model) |
+| D-15 | **Chain-allowlist deploy guards, fail-closed** (GYL-1135) | Denylist guards let every L2 through; that is how a zero-delay timelock and a bare-EOA admin reached a production chain. [§13](#13-deployment-model) |
 | D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. |
 | D-17 | **ERC-8056 dropped on EVM** (GYL-1201) | Splits standard used as a NAV mirror; no EVM wallet implements it; observed display divergence on our own deployment; nobody in our category uses it. Standing record: [`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md). [§8.3](#83-erc-8056-was-evaluated-and-dropped) |
 
@@ -2747,91 +2660,72 @@ Carried forward honestly. Ordered by severity.
 
 ### High
 
-1. **The two Base mainnet findings are CLOSED — retired demo, records removed
-   (2026-08-12, GLD-148).** Former High #1 (NAV feed stale since 2026-05-19, Morpho
-   doing no age check) and former High #2 (the GYL-1135 incident configuration:
-   `delay = 0`, deployer-held roles, open executor) were re-verified on-chain and were
-   accurate. They are closed as **accepted, not remediated**: the stack was a
-   learning/demo deployment with a dummy asset and a ~1 USDC dust seed on which Gyld
-   held both sides, nothing in the platform reads it, and the bug class is closed at
-   source by [§13](#13-deployment-model)'s guards. Its addresses were removed from
-   [§14.1](#141-base-mainnet-8453--retired-demo-records-removed) and `DEPLOYMENTS.md`;
-   see git history prior to 2026-08-12 if they are ever needed.
-
-   *For auditors:* do not re-file these, and note that "wire up NAV keeper alerting for
-   the Base series" is **not implementable** — `ChainId` has only `Ethereum` and
-   `Solana` (`kaleidoscope crates/core-types/src/domain/chain.rs`), so Base is
-   unrepresentable in the backend domain model and the feed never had a writer.
-
-2. *(retired — see #1)*
-3. **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently.**
+1. **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently.**
    Neither the contract nor `DeployDevNet.s.sol` ever revokes it — on any stack
-   deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The exploitable surface is narrow (the
-   factory is immutable and has no `registerToken` passthrough) but the README asserted
-   the opposite as a security property, and any threat model built on that assertion is
-   wrong.
-4. **Dropping ERC-8056 makes the NAV feed the sole on-chain value-display channel.**
-   It is now load-bearing for display as well as for pricing, which raises the priority
-   of gaps 1 and 2 rather than lowering it.
-5. **The atomic swap's loss ceiling is unbounded under `DEFAULT_ADMIN_ROLE`
+   deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The
+   exploitable surface is narrow (the factory is immutable and has no `registerToken`
+   passthrough) but the README asserted the opposite as a security property, and any
+   threat model built on that assertion is wrong.
+2. **The NAV feed is the sole on-chain value-display channel.** It is load-bearing
+   for display as well as for pricing.
+3. **The atomic swap's loss ceiling is unbounded under `DEFAULT_ADMIN_ROLE`
    compromise** — `sum(balanceOf(swap))`, with the 48 h timelock as the only brake.
    Mitigation is operational: keep inventory small and sweep net flow.
 
 ### Medium
 
-6. **2 of 8 broadcasting scripts do not use `DeployGuards`** — `AtomicSettlementFlow`
-   and `DeployAtomicSettlementE2E` (was 8 of 14 before the six Euler steps were removed
-   with the Base demo). Both pin a single
-   chain with a bare equality `require`, so they are not the denylist bug class, but they
-   lack env-var, not-the-deployer, min-delay and post-deploy-assertion coverage. A CI job
+4. **2 of 8 broadcasting scripts do not use `DeployGuards`** — `AtomicSettlementFlow`
+   and `DeployAtomicSettlementE2E`. Both pin a single chain with a bare equality
+   `require`, so they are not the denylist bug class, but they lack env-var,
+   not-the-deployer, min-delay and post-deploy-assertion coverage. A CI job
    asserting that every `vm.startBroadcast` script calls `DeployGuards` would start red
    today, which is why it was rejected rather than added.
-7. **No `AaveV3Integration.t.sol` fork test.** It is the recommended first step for
+5. **No `AaveV3Integration.t.sol` fork test.** It is the recommended first step for
    Aave and would run in CI at zero cost. Three specific unknowns need it: whether a
    contract liquidator passes the sanctions screen, whether the aToken layer stays clear
    of the underlying's checks, and the exact 8-decimal price assertion.
-8. **No deploy-script fork test for the atomic settlement run-book** — all steps
+6. **No deploy-script fork test for the atomic settlement run-book** — all steps
    against a fork, then one BUY and one REDEEM end-to-end. `AtomicSettlementDeployTest`
    covers the deploy script but not a forked-mainnet sequence.
-9. **`AaveOracle` has no staleness check** — it just calls `latestAnswer()`. Consider
+7. **`AaveOracle` has no staleness check** — it just calls `latestAnswer()`. Consider
    a CAPO wrapper or explicit staleness-revert logic before any Aave listing.
-10. **The sanctions keeper bot does not exist in any repo yet.** The mirror's write
+8. **The sanctions keeper bot does not exist in any repo yet.** The mirror's write
     path is designed and tested; the 4-hourly OFAC delta job that feeds it is unbuilt.
     Until it runs, the mirror's local list is whatever was seeded plus whatever the
     forwarding oracle contributes.
-11. **`SANCTIONS_UPDATER_ROLE` separation is procedural, not cryptographic.**
+9. **`SANCTIONS_UPDATER_ROLE` separation is procedural, not cryptographic.**
     `DEFAULT_ADMIN_ROLE` can grant itself the updater role and write. The control is that
     doing so is visible in the role-grant event log — worth an alerting rule.
-12. **An oracle outage halts secondary transfers including DeFi liquidations**, and
+10. **An oracle outage halts secondary transfers including DeFi liquidations**, and
     recovery via `setSanctionsList` takes 48 h on production. There is no faster path by
     design.
-13. **Zero-amount guards are inconsistent across the codebase.** Worth a sweep for
+11. **Zero-amount guards are inconsistent across the codebase.** Worth a sweep for
     ops-alert hygiene: functions that succeed vacuously and emit events are noise in
     monitoring.
 
 ### Low / accepted
 
-14. **A sanctioned address can hold economic exposure via an ERC-4626 wrapper's
+12. **A sanctioned address can hold economic exposure via an ERC-4626 wrapper's
     shares** without ever triggering the oracle. Accepted consequence of a plain ERC-20
     underlying; a compliance decision, not a technical one. [§10.5](#105-the-known-compliance-gap-erc-4626-wrappers)
-15. **The probe idiom accepts any contract returning exactly 32 bytes** for the probed
+13. **The probe idiom accepts any contract returning exactly 32 bytes** for the probed
     selector — a returning fallback passes. Inherent to the pattern, shared by every
     probe in the codebase.
-16. **Residual permit allowance** — `permitIn.value` may exceed `requestedAmountIn`.
+14. **Residual permit allowance** — `permitIn.value` may exceed `requestedAmountIn`.
     Safe (only spendable via a taker-initiated `executeSwap`) but the quote service should
     issue exact-value permits.
-17. **`forge fmt --check` and `forge build --deny-warnings` are not enforced.** The tree
+15. **`forge fmt --check` and `forge build --deny-warnings` are not enforced.** The tree
     is not fmt-clean and there are two live solc warnings plus ~40 lint notes. Both jobs
     would start red and be ignored; fix first, then enforce. [`ci.md`](ci.md)
-18. **No gas snapshots.** No baseline exists, most hot paths are fuzz tests with
+16. **No gas snapshots.** No baseline exists, most hot paths are fuzz tests with
     nondeterministic gas, and `via_ir` makes diffs churn on unrelated edits. A flaky
     snapshot job teaches people to ignore CI.
-19. **The normative `docs/atomic-swap-spec.md` is absent from this repository**, though
+17. **The normative `docs/atomic-swap-spec.md` is absent from this repository**, though
     four test files reference it by name for invariant identifiers and §-numbers. The
     catalogue is reconstructed in [§16.2](#162-the-gyldatomicswap-invariant-catalogue);
     I-6, I-7 and F-2 are unrecoverable. Either restore the spec or renumber the tests
     against this document.
-20. **A relayer path for `permit()`** — implemented in the token but no relayer exposed.
+18. **A relayer path for `permit()`** — implemented in the token but no relayer exposed.
     Pending a product decision.
 ---
 
@@ -2845,7 +2739,7 @@ bytecode, so the corrections are recorded rather than silently dropped.
 
 | Claimed | Where | Truth |
 |---|---|---|
-| "`REGISTRAR_ROLE` → TokenFactory (**self-revokes post-deployment**)" and "TokenFactory holds `DEFAULT_ADMIN_ROLE` and `REGISTRAR_ROLE` only during deployment and **self-revokes both** before returning. It holds **no permanent permissions** post-deploy." | `README.md` | **False, and it was a stated security property.** `TokenFactory._wireRoles` revokes only `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, and only **on the token**. `REGISTRAR_ROLE` lives on the `IssuanceManager`; the string `REGISTRAR` appears in `TokenFactory.sol` exactly twice, both in the `MissingRegistrarRole` preflight — there is no `revokeRole` for it anywhere in the contract, and `DeployDevNet.s.sol` grants it (line 302) and never revokes it. On live Base mainnet `hasRole(REGISTRAR_ROLE, factory) == true`. The factory also never holds `DEFAULT_ADMIN_ROLE` on the `IssuanceManager` at all. |
+| "`REGISTRAR_ROLE` → TokenFactory (**self-revokes post-deployment**)" and "TokenFactory holds `DEFAULT_ADMIN_ROLE` and `REGISTRAR_ROLE` only during deployment and **self-revokes both** before returning. It holds **no permanent permissions** post-deploy." | `README.md` | **False, and it was a stated security property.** `TokenFactory._wireRoles` revokes only `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, and only **on the token**. `REGISTRAR_ROLE` lives on the `IssuanceManager`; the string `REGISTRAR` appears in `TokenFactory.sol` exactly twice, both in the `MissingRegistrarRole` preflight — there is no `revokeRole` for it anywhere in the contract, and `DeployDevNet.s.sol` grants it (line 302) and never revokes it. On any stack deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The factory also never holds `DEFAULT_ADMIN_ROLE` on the `IssuanceManager` at all. |
 | "`MAX_STALENESS` \| **36 hours** \| `latestRoundData()` / `latestAnswer()` **revert** if price is older" | `blockchain-status.md`, `decisions/gyld-bond-token-design.md` §4 | **Both halves false, and always were.** The constant is **96 hours** and gates only `isFresh()`. No read function has ever reverted on staleness. The only revert on a read is `NoPriceSet`, before the first push. Already annotated as superseded in those files; the underlying diagram at `blockchain-status.md:220` still said "36-hr staleness cap", contradicting its own correction 40 lines below. |
 | "Both check staleness via **`_requireFresh()`** before returning." | `decisions/gyld-bond-token-design.md` §4 | **False.** No such function has ever existed in `KaleidoscopeNAVFeed.sol`. A `PriceStale` error was declared and never thrown; it was deleted under GYL-1135 so the source no longer implies a revert path that is not there. |
 | "`MAX_PRICE_DEVIATION_BPS` has no emergency override — this is intentional." | `decisions/gyld-bond-token-design.md` §4 | **Reversed.** `emergencyUpdateAnswer(int256)` ships and bypasses both the deviation cap and the interval gate, gated on a separate `emergencyUpdater` key. |
@@ -2876,7 +2770,7 @@ bytecode, so the corrections are recorded rather than silently dropped.
 | "Test and deployment-script files under `contracts/test/` and `contracts/script/` remain **MIT**" | `README.md`, `contracts.md` | **False.** 22 are `UNLICENSED`, 7 are MIT, 6 are `GPL-2.0-or-later`. Full breakdown in [§4.2](#42-licensing). |
 | "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `c1f240f`): **535 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
 | "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml:29` | Stale. Now 535. The workflow comment was corrected to 535 in the same pass. |
-| "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | Was **8 of 14** when written; **2 of 8** since the six Euler steps were removed with the Base demo. The two that do not reference `DeployGuards` are `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
+| "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | Was **8 of 14** when written; it is now **2 of 8**. The two that do not reference `DeployGuards` are `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
 | Fireblocks ERC20F / DenyList contracts "remain in the repo for reference only" at `contracts/erc20f/` | `blockchain-status.md` | **The directory does not exist** in this tree. |
 | "`docs/contracts.md` \| Deployed addresses (**Hoodi testnet + mainnet**)" | `README.md` docs table | **False.** That file listed Ethereum Sepolia and local Anvil. No Hoodi addresses appear anywhere in `docs/`, and the Hoodi deployment described in the run-books never happened. |
 | Deployment run-books targeting **Hoodi (chain 560048)** as the public testnet | `atomic-settlement.md`, and `blockchain-status.md` env defaults (`PRIVKEY_CHAIN_ID` default 560048) | Superseded. `DeployGuards.isDevChain()` allowlists **only** Anvil 31337 and Ethereum Sepolia 11155111. Hoodi would be classified as production and take the strict path. The atomic swap's integrator instance went to Sepolia. |

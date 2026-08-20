@@ -312,8 +312,8 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.stalenessSeconds(), 3 hours);
 
         // Past MAX_STALENESS it keeps counting rather than saturating or reverting —
-        // an alert needs the magnitude to escalate on, which is exactly what the Base
-        // mainnet feed (silent since 2026-05-19) had no way to expose.
+        // an alert needs the magnitude to escalate on, which is exactly what the live
+        // production feed (silent since 2026-05-19) had no way to expose.
         vm.warp(1_000_000 + 100 days);
         assertEq(feed.stalenessSeconds(), 100 days);
         assertFalse(feed.isFresh());

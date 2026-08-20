@@ -13,23 +13,23 @@ Deployer EOA for everything below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
 ## WARNING: never treat `broadcast/` as an address book
 
 Foundry keys `broadcast/` output **by chain ID only**. A local Anvil node
-started with `--chain-id 8453` writes its run files into
-`broadcast/<Script>.s.sol/8453/` — byte-for-byte indistinguishable in layout
-from a genuine Base mainnet broadcast. This repository's verification workflow
-deliberately runs production code paths against local nodes that borrow real
-chain IDs (8453, 11155111), so the tree routinely accumulates records of
-contracts that **do not exist** on the real chain.
+started with `--chain-id 1` writes its run files into
+`broadcast/<Script>.s.sol/1/` — byte-for-byte indistinguishable in layout
+from a genuine production-mainnet broadcast. This repository's verification
+workflow deliberately runs production code paths against local nodes that borrow
+real chain IDs — production chain IDs and 11155111 alike — so the tree routinely
+accumulates records of contracts that **do not exist** on the real chain.
 
 This was not hypothetical. Before the 2026-08-04 cleanup, `run-latest.json`
-under `DeployAtomicSettlement.s.sol/8453/` and `DeployDevNet.s.sol/8453/`
-described "Base" deployments whose receipts were at blocks 2–12 (Anvil), whose
-sender was Anvil dev account 0 (`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`,
-private key public), and whose addresses were **empty on real Base**. Worse,
-two addresses named in spoofed Sepolia artifacts (`0x09635F…ceBef`, listed as
-"MockUSDC", and `0xc3e53F…63690`, listed as "GyldBondToken") resolve on real
-Sepolia to a **stranger's "My Hardhat Token" (MHT)** owned by that same public
-Hardhat account — anyone who copied those into a config would have been
-approving or transferring to a contract they do not control.
+files sitting under borrowed production chain IDs described deployments whose
+receipts were at blocks 2–12 (Anvil), whose sender was Anvil dev account 0
+(`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`, private key public), and whose
+addresses had **no code on the real chain**. Worse, two addresses named in
+spoofed Sepolia artifacts (`0x09635F…ceBef`, listed as "MockUSDC", and
+`0xc3e53F…63690`, listed as "GyldBondToken") resolve on real Sepolia to a
+**stranger's "My Hardhat Token" (MHT)** owned by that same public Hardhat
+account — anyone who copied those into a config would have been approving or
+transferring to a contract they do not control.
 
 Rules:
 
@@ -44,14 +44,6 @@ Rules:
 
 ---
 
-## Base mainnet (chainId 8453) — removed 2026-08-12
-
-The Base demo stack's addresses were **removed from this address book** by owner
-decision (GLD-148). It was a learning/demo deployment (dummy "Test Bond Alpha"
-token, ~1 USDC dust seed, Gyld on both sides of the Morpho market), nothing in the
-platform reads it, and it is not a deployment target. Recoverable from git history
-if ever needed.
-
 ## Ethereum Sepolia (chainId 11155111)
 
 Two generations coexist. **Do not mix them.**
@@ -60,7 +52,7 @@ Two generations coexist. **Do not mix them.**
 
 | Contract | Address | Source commit | Privileged roles | Explorer verified | Status |
 |---|---|---|---|---|---|
-| TimelockController | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` | 6349ec5 | minDelay = 0; proposer = deployer EOA; open executor | Yes (Blockscout) | live (test) — the retired Base demo stack produced this same address (same deployer, same nonces); that record is gone from this file, so **this row is Sepolia-only — do not conflate** |
+| TimelockController | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` | 6349ec5 | minDelay = 0; proposer = deployer EOA; open executor | Yes (Blockscout) | live (test) — **this row is a Sepolia record and nothing else.** The same deployer at the same nonces produces this same address on any chain, so never read this address as identifying the same contract elsewhere |
 | IssuanceManager (ERC1967 proxy) | `0x5BA267367f06378816c58d47C5850fC9863Ce67F` | 6349ec5 | DEFAULT_ADMIN_ROLE = timelock | Yes (Blockscout) | live (test) |
 | IssuanceManager (implementation) | `0xEA637cdB348d4d14d1329E304F025cC8FD428E5a` | 6349ec5 | — | Yes (Blockscout) | live (test) |
 | MockSanctionsList | `0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad` | 6349ec5 (pre-GYL-1135 version) | **NONE — `addToSanctionsList`/`removeFromSanctionsList` are plain `external`, no owner, no access control. Anyone on the internet can sanction or unsanction any address.** Because token screening is fail-closed, this is a permissionless transfer-freeze on every holder of every series wired to it. | Yes (Blockscout) | **do-not-reuse — ungated sanctions oracle.** Never point a new deployment at it. (The hardened, owner-gated version exists only in current source; this deployed instance predates it — its `owner()` selector reverts.) |
@@ -102,7 +94,7 @@ GYL-1201; the record is kept as history, reachable via tag
 
 ## Source-commit preservation — resolved 2026-08-05
 
-- **`6349ec5`** (Base + Sepolia gen-1): on `main` and `origin/main`. Safe.
+- **`6349ec5`** (Sepolia gen-1): on `main` and `origin/main`. Safe.
 - **`46050ea`** (Sepolia gen-2 + BSC testnet ERC-8056 bytecode): **not on
   `main`** — the extension was removed under GYL-1201, so this source will never
   be reachable from `main`. It is preserved by the annotated tag

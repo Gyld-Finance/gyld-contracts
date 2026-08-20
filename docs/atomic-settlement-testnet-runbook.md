@@ -47,16 +47,15 @@ anything in section 4; `broadcast/` is history, not an address book.
 |---|---|---|---|---|
 | Local Anvil | 31337 | Full stack incl. `GyldAtomicSwap` (`DeployAtomicSettlement`, `AtomicSettlementFlow`, `DeployAtomicSettlementE2E`, `DeployDevNet`, `DeployMockUSDC`) | — (ephemeral; gone on Anvil restart) | `broadcast/DeployAtomicSettlement.s.sol/31337` et al. |
 | Sepolia | 11155111 | **`GyldAtomicSwap` — LIVE** (proxy + implementation, 2026-07-31, commit `46050ea`, Blockscout-verified, settling Circle Sepolia USDC; addresses in `DEPLOYMENTS.md`), plus the older token stack from `DeployDevNet.s.sol` (May 2026 run): TimelockController, IssuanceManager proxy, TokenFactory, MockSanctionsList, three bond series (CAT / C / KO) — token-stack addresses below | — | `broadcast/DeployDevNet.s.sol/11155111`; swap addresses per `DEPLOYMENTS.md` |
-| Base **MAINNET** | 8453 | Euler/Morpho listing experiment — retired. Its scripts (`DeployBaseTest.s.sol`, `DeployEulerStep1..6.s.sol`) are deleted from the tree; the deployment itself remains live on-chain and untracked | **`GyldAtomicSwap` — not deployed** | `broadcast/DeployBaseTest.s.sol/8453`, `broadcast/DeployEulerStep*/8453` (history only) |
 
-> **Warning — 8453 is Base MAINNET, not a testnet.** The script was named
-> `DeployBaseTest.s.sol` and that name had already misled people; it hardcoded
-> `delay = 0` and `initialize(deployer, deployer, deployer)` and was guarded to run
-> **only** on Base mainnet. **GYL-1135 deleted it** — the broadcast dir remains as
-> history of what is live, not as something you can re-run. Anything broadcast to
-> chain 8453 spends real ETH on a production chain. Base **Sepolia** would be chain
-> 84532, for which no broadcast exists — and note 84532 is **not** on the dev
-> allowlist, so the scripts treat it as production.
+> **Warning — confirm the chain id before you broadcast.** A script's name is not
+> evidence of which chain it targets: a script with "test" in its name has misled
+> people into believing it pointed at a testnet when it did not. Run
+> `cast chain-id --rpc-url $RPC` and confirm the answer is the testnet you intend
+> before any `--broadcast` — anything sent to a production chain spends real funds
+> and cannot be undone. Note also that only the chain ids on
+> `DeployGuards.isDevChain` are treated as dev; every other chain id is treated as
+> production by the scripts.
 
 > **Stale broadcast dir:** `broadcast/DeployDvpEscrow.s.sol/31337` still exists even
 > though the escrow contract and its deploy script were deleted in GYL-548. It is
@@ -91,14 +90,13 @@ attributed here by deploy order (CAT → C → KO, per `DeployDevNet._deployBond
 
 ## 2. Target testnet recommendation
 
-| Criterion | Sepolia (11155111) | Base Sepolia (84532) |
-|---|---|---|
-| Existing Gyld token stack | **Yes** — `DeployDevNet` stack above (reusable or cheap to redeploy) | None |
-| `foundry.toml` verification config | **Yes** — `[etherscan] sepolia` entry exists | **No entry** — must be added before `--verify` works |
-| Real Circle USDC (EIP-2612 permit, domain version "2") | **Yes** — `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` (already in `.env.example`), fundable via Circle's faucet | Circle publishes an official USDC on Base Sepolia, but its address is not recorded anywhere in this repo — TODO(ops): confirm from Circle's developer docs if this path is ever chosen |
-| Chainalysis sanctions oracle | Mainnet-only product; **not on Sepolia**. Substitute: platform `SanctionsOracleMirror` (the production oracle on every chain per GYL-1051) or `MockSanctionsList` for dev | Same — Chainalysis exists on Base *mainnet* (`0x3A91A31cB3dC49b4db9Ce721F50a9D076c8D739B`, see `.env.example`), **not on Base Sepolia** |
-| Matches the Base mainnet Euler/Morpho path | No | Yes — but that path is a DeFi-listing experiment, not the atomic-swap stack |
-| `.env.example` orientation | Default `RPC` is a Sepolia endpoint; Morpho Sepolia addresses pre-filled | Only Base *mainnet* variables exist |
+| Criterion | Sepolia (11155111) |
+|---|---|
+| Existing Gyld token stack | **Yes** — `DeployDevNet` stack above (reusable or cheap to redeploy) |
+| `foundry.toml` verification config | **Yes** — `[etherscan] sepolia` entry exists |
+| Real Circle USDC (EIP-2612 permit, domain version "2") | **Yes** — `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` (already in `.env.example`), fundable via Circle's faucet |
+| Chainalysis sanctions oracle | Mainnet-only product; **not on Sepolia**. Substitute: platform `SanctionsOracleMirror` (the production oracle on every chain per GYL-1051) or `MockSanctionsList` for dev |
+| `.env.example` orientation | Default `RPC` is a Sepolia endpoint |
 
 **Recommendation: Sepolia (11155111).**
 
@@ -107,10 +105,8 @@ deployed (or trivially redeployable) `DeployDevNet` token/NAV stack that
 `DeployAtomicSettlement.s.sol` explicitly builds on top of, (b) working `--verify`
 config in `foundry.toml`, and (c) real Circle USDC with EIP-2612 permit, so the
 optional `permitIn` path in `executeSwap` can be exercised against the real
-non-standard USDC permit (domain version "2") instead of a mock. Base Sepolia buys
-nothing for the swap itself: the Euler/Morpho alignment argument applies to the
-lending-listing workstream, not to atomic settlement, and it would cost a full
-token-stack deploy plus new verification config.
+non-standard USDC permit (domain version "2") instead of a mock. Any other testnet
+would cost a full token-stack deploy plus new verification config.
 
 Config that must still be added even for Sepolia:
 
@@ -123,8 +119,6 @@ Config that must still be added even for Sepolia:
   (`0x_QUOTE_SERVICE_KMS_KEY` and friends). Copy the block into `.env` and fill in real
   addresses — the example file tells you which variables the script reads, not what to
   point them at.
-- If Base Sepolia were ever chosen instead, add to `foundry.toml`:
-  `base-sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532, url = "https://api-sepolia.basescan.org/api" }`.
 
 ---
 
@@ -158,8 +152,9 @@ Config that must still be added even for Sepolia:
 rejected if its bytecode matches this repo's `MockSanctionsList`; on a dev chain,
 unset still deploys the mock. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
 48 h on any other chain**, and on production `< 48 h` now **reverts before any gas is
-spent** (`requireProdMinDelay`) — `TIMELOCK_DELAY_SECONDS=0` is exactly how the Base
-incident happened. On Sepolia it is still accepted, which is what keeps a single-pass
+spent** (`requireProdMinDelay`) — `TIMELOCK_DELAY_SECONDS=0` is exactly how a
+deployment ends up with a timelock that gates nothing. On Sepolia it is still
+accepted, which is what keeps a single-pass
 testnet deploy possible; it also means the delay you get is the delay you asked for
 and nothing checks it for you (step 8.3).
 
@@ -473,10 +468,10 @@ $TREASURER_KEY` → funds land at `withdrawalWallet()`, nowhere else.
    the timelock handover, or the gateway allowlist routes revert. No such key exists
    for Sepolia yet. TODO(ops): provision it and test `setAllowed` both grant and
    revoke after handover.
-7. **[LOW] Missing verification config for Base Sepolia.** Only relevant if the
-   recommendation is overridden: `foundry.toml` has no `[etherscan]` entry for 84532
-   (section 2). Also `ETHERSCAN_API_KEY` in `.env.example` is a placeholder even for
-   Sepolia. TODO(ops).
+7. **[LOW] Verification key not provisioned.** `ETHERSCAN_API_KEY` in `.env.example`
+   is a placeholder even for Sepolia, so `--verify` cannot work until a real key is
+   supplied. Any chain other than Sepolia would additionally need its own
+   `[etherscan]` entry in `foundry.toml`. TODO(ops).
 8. **[LOW] NAV keeper cadence.** `MAX_NAV_AGE_SECS` defaults to 1 day; without a
    scheduled `updateAnswer` push the whole swap soft-bricks into `StaleNav`.
    TODO(keeper team): stand up the Sepolia push job before the smoke test.
@@ -512,9 +507,9 @@ Notes:
 
 ## 8. Fresh-deploy checklist (independent `cast` verification)
 
-**Why this section exists (GYL-1135).** The live Base stack was deployed with a
-zero-delay timelock and a bare EOA holding every privileged role, and nobody noticed
-because nothing ever checked. The deploy scripts now assert their own outcome in-band
+**Why this section exists (GYL-1135).** A deploy can land with a zero-delay timelock
+and a bare EOA holding every privileged role, and go unnoticed indefinitely if nothing
+ever checks. The deploy scripts now assert their own outcome in-band
 (`DeployGuards.assertRoleHandover` / `assertTimelockSane`), but those assertions are
 **part of the thing being verified** — and on Sepolia they are skipped entirely,
 because Sepolia is on the dev allowlist. This checklist re-verifies every safety
@@ -538,7 +533,8 @@ export ADMIN_ROLE=0x000000000000000000000000000000000000000000000000000000000000
 
 ```bash
 cast chain-id --rpc-url $RPC
-# expected: exactly the chain you intended. 8453 is Base MAINNET — stop.
+# expected: exactly the chain you intended, and a testnet — if it is a production
+# chain id, stop.
 
 for c in $SWAP $TIMELOCK $EVM_ISSUANCE_MANAGER $EVM_FACTORY_ADDRESS; do
   cast code $c --rpc-url $RPC | head -c 12; echo "  <- $c";
@@ -549,7 +545,7 @@ done
 
 ### 8.2 No privileged role is still held by the deployer
 
-This is the check that would have caught the Base incident on day one.
+This is the check that catches a deployer that quietly kept privileged roles.
 
 ```bash
 for role in $ADMIN_ROLE $(cast keccak "QUOTE_SIGNER_ROLE") $(cast keccak "TREASURER_ROLE") \
@@ -574,7 +570,7 @@ cast call $SWAP "hasRole(bytes32,address)(bool)" $ADMIN_ROLE $TIMELOCK --rpc-url
 # expected: true    (DEFAULT_ADMIN_ROLE actually moved to the timelock)
 
 cast call $TIMELOCK "getMinDelay()(uint256)" --rpc-url $RPC
-# expected: >= 172800 (48h). 0 is the live-Base defect verbatim.
+# expected: >= 172800 (48h). 0 means the timelock gates nothing at all.
 
 for role in $(cast keccak "PROPOSER_ROLE") $(cast keccak "CANCELLER_ROLE") \
             $(cast keccak "EXECUTOR_ROLE") $ADMIN_ROLE; do
@@ -587,7 +583,8 @@ done
 cast call $TIMELOCK "hasRole(bytes32,address)(bool)" $(cast keccak "EXECUTOR_ROLE") \
   0x0000000000000000000000000000000000000000 --rpc-url $RPC
 # expected: false — an open executor (address(0)) lets ANYONE execute a scheduled
-# proposal. This was `executors[0] = address(0)` on live Base.
+# proposal. A deploy script that passes `executors[0] = address(0)` produces exactly
+# this.
 
 cast call $TIMELOCK "hasRole(bytes32,address)(bool)" $(cast keccak "PROPOSER_ROLE") \
   $GOVERNANCE_MULTISIG --rpc-url $RPC
@@ -646,10 +643,8 @@ cast call $SWAP "maxNavAgeSecs()(uint32)" --rpc-url $RPC
 
 cast call $NAVFEED_CAT "stalenessSeconds()(uint256)" --rpc-url $RPC
 # expected: a small number, and below maxNavAgeSecs above. This is the monitoring
-# entrypoint to alert on — on the Base stack the feed sat stale from 2026-05-19 while
-# Morpho kept quoting the pinned $100.00 silently. That finding is closed: Base was
-# retired in `1e9ffa8` and its address records removed. The failure mode is not closed,
-# which is why this check stays in the list.
+# entrypoint to alert on: a feed can sit stale for months while downstream consumers
+# keep quoting the last pinned answer silently, with nothing surfacing the fault.
 
 cast call $FORWARDER_CAT "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
 # expected: positive answer; 4th value a recent unix timestamp.
@@ -658,5 +653,5 @@ cast call $FORWARDER_CAT "latestRoundData()(uint80,int256,uint256,uint256,uint80
 ### 8.7 Record the result
 
 Append the checklist output, the deployed addresses and the role→key assignments to
-this document's next revision (see gap 2's TODO). An unrecorded deploy is how the
-Base configuration stayed unexamined for months.
+this document's next revision (see gap 2's TODO). An unrecorded deploy is how a
+misconfiguration stays unexamined for months.

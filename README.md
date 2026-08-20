@@ -169,7 +169,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 | `SanctionsOracleMirror.t.sol` | Add/remove, role separation, forwarding-oracle probe and gas cap |
 | `TokenFactory.t.sol` | Atomic deployment, CREATE2 prediction, role wiring, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
 | `Timelock.t.sol` | Delay enforcement, cancellation |
-| `AtomicSettlementDeploy.t.sol`, `DeployScripts.t.sol` | Deploy scripts including the fail-closed guards; `DeployMockUSDCTest` covers the dev-chain allowlist on `DeployMockUSDC` — refused on every production chain and on Base Sepolia, still funds the Anvil accounts on a dev chain |
+| `AtomicSettlementDeploy.t.sol`, `DeployScripts.t.sol` | Deploy scripts including the fail-closed guards; `DeployMockUSDCTest` covers the dev-chain allowlist on `DeployMockUSDC` — refused on every production chain and on any testnet outside the dev-chain allowlist, still funds the Anvil accounts on a dev chain |
 
 ---
 
@@ -204,9 +204,7 @@ at the root.
 
 Known gaps are tracked honestly in
 [`docs/ARCHITECTURE.md` §18](docs/ARCHITECTURE.md) — including the residual
-`REGISTRAR_ROLE` above. The two Base mainnet gaps (a stale NAV feed and a stack still
-carrying the GYL-1135 incident configuration) are **closed**: that demo deployment was
-retired and its address records removed (GLD-148).
+`REGISTRAR_ROLE` above.
 
 ---
 

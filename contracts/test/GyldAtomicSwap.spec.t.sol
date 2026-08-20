@@ -844,7 +844,7 @@ contract GyldAtomicSwapSpecTest is Test {
 
     /// REGRESSION TEST FOR THE INCIDENT CLASS (GYL-1135).
     ///
-    /// On Base mainnet the NAV feed stopped being pushed on 2026-05-19. Euler froze on
+    /// On a production chain the NAV feed stopped being pushed on 2026-05-19. Euler froze on
     /// its own staleness check; Morpho, which has none, kept quoting the last pushed
     /// $100.00 answer indefinitely. This contract is on the Euler side of that line
     /// only because maxNavAgeSecs is small — and that was, until now, one admin
