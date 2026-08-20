@@ -549,7 +549,7 @@ contract IssuanceManagerTest is Test {
     }
     // ── ERC-7201 storage layout (GYL-1208) ────────────────────────────────────
 
-    /// Pin the namespaced layout. This proxy is LIVE on Base mainnet
+    /// Pin the namespaced layout. This proxy is LIVE on a production chain
     /// (0x5BA267367f06378816c58d47C5850fC9863Ce67F, commit 6349ec5) with
     /// DEFAULT_ADMIN_ROLE on a deployer EOA, so an upgrade needs no governance
     /// proposal — and nothing in this file asserted a single storage slot before now.

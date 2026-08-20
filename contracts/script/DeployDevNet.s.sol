@@ -21,7 +21,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///
 /// ── Dev vs production (GYL-1135) ──────────────────────────────────────────────
 /// Development chains are an ALLOWLIST: 31337 and 11155111 only (see
-/// {DeployGuards.isDevChain}). Everything else — Base, Arbitrum, Ethereum, and every
+/// {DeployGuards.isDevChain}). Everything else — Ethereum, Arbitrum, every L2, and every
 /// chain that does not exist yet — takes the production path, where:
 ///   * every privileged env var below is REQUIRED and must not be the deployer EOA;
 ///   * TIMELOCK_DELAY_SECONDS is REQUIRED and must be >= 48h;
@@ -158,7 +158,7 @@ contract DeployDevNet is Script {
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
 
         // On production none of these may be the broadcasting EOA — that is precisely
-        // the shape of the Base incident, where "handover complete" meant nothing moved.
+        // the shape of the GYL-1135 incident, where "handover complete" meant nothing moved.
         DeployGuards.requireNotDeployer(c.governanceMultisig, c.deployer, "GOVERNANCE_MULTISIG");
         DeployGuards.requireNotDeployer(c.opsMultisig, c.deployer, "OPS_MULTISIG");
         DeployGuards.requireNotDeployer(c.subscriber, c.deployer, "SUBSCRIBER_ADDRESS");
@@ -277,7 +277,7 @@ contract DeployDevNet is Script {
         // bricked `transferOwnership`. Deployed with plain CREATE it was the LAST bootstrap
         // contract whose address was `keccak(deployer, nonce)` — no chain component — which
         // is exactly how `0x18ce55…6317` ended up a GyldBondToken on Sepolia and a
-        // TokenFactory on Base. The deployer owns it only transiently; {_handOverToTimelock}
+        // TokenFactory on a production L2. The deployer owns it only transiently; {_handOverToTimelock}
         // moves ownership to the timelock inside this same broadcast.
         bytes memory factoryInit =
             abi.encodePacked(type(TokenFactory).creationCode, abi.encode(bondImpl, sanctionsOracle, c.deployer));

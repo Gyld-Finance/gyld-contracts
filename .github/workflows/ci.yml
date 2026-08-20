@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Full-intensity suite on every push: 501 tests, fuzz runs = 10000,
+  # Full-intensity suite on every push: 535 tests, fuzz runs = 10000,
   # invariant runs = 1000 x depth 50 (the foundry.toml defaults — nothing is
   # dialled down; the whole suite runs in seconds, see docs/ci.md).
   test:

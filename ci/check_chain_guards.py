@@ -3,13 +3,13 @@
 
 Why this exists (GYL-1135)
 --------------------------
-The live Base mainnet stack was once deployed with a zero-delay timelock and a
+The live production stack was once deployed with a zero-delay timelock and a
 bare EOA holding every privileged role. The scripts *had* a "mainnet
 protection" — but it was written as a denylist:
 
     require(block.chainid != 1, "not on mainnet");
 
-Ethereum mainnet is chain 1, so the check passed on Base (8453) — and on
+Ethereum mainnet is chain 1, so the check passed on a production L2 (8453) — and on
 Arbitrum, Optimism, Polygon and every other L2 — and the dev-only fallbacks
 (deployer-as-admin, delay = 0, mock sanctions oracle) ran on a production
 chain. The fix is `DeployGuards.isDevChain()`: an ALLOWLIST where only Anvil
@@ -38,7 +38,7 @@ of:
 
   - a `DeployGuards.<guard>()` call — the dev/production allowlist path; or
   - a positive `block.chainid == <id>` pin — for scripts written for exactly one
-    chain (the Euler steps on Base, the Anvil-only flow scripts).
+    chain (the Euler steps on their production chain, the Anvil-only flow scripts).
 
 Usage: python3 ci/check_chain_guards.py [script-dir]   (default: contracts/script)
 Exit codes: 0 = clean, 1 = violation found, 2 = script dir missing.
@@ -149,7 +149,7 @@ def main() -> int:
         print(
             "\nA script with no chain check runs on EVERY chain, which is how an"
             "\nungated DeployMockUSDC could mint a fake 'USD Coin' to publicly-keyed"
-            "\nAnvil accounts on Base mainnet (GYL-1135). The denylist scan above"
+            "\nAnvil accounts on a production chain (GYL-1135). The denylist scan above"
             "\ncannot catch this: it only sees guards that are written, never guards"
             "\nthat are absent."
             "\n"
@@ -165,9 +165,9 @@ def main() -> int:
             print(f"  {path}:{lineno}: {line}")
         print(
             "\n`block.chainid != <x>` guards are how a zero-delay timelock and a"
-            "\nbare-EOA admin ended up on live Base mainnet (GYL-1135): the old"
+            "\nbare-EOA admin ended up on a live production chain (GYL-1135): the old"
             "\n`require(block.chainid != 1, ...)` check only knows about Ethereum"
-            "\nmainnet, so Base, Arbitrum, Optimism and every future L2 walk straight"
+            "\nmainnet, so chain 8453, Arbitrum, Optimism and every future L2 walk straight"
             "\npast it and get the dev-only code path. Chain guards must be"
             "\nALLOWLISTS that fail closed on chains they do not recognise."
             "\n"

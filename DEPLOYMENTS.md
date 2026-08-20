@@ -2,8 +2,8 @@
 
 This file is the **only** authoritative list of Gyld contracts on public chains.
 Every row below was verified directly against the chain with `cast code` /
-`cast call` on **2026-08-04** (Base head ~49,523,972; Sepolia head ~11,416,602;
-BSC testnet head ~123,091,110). If an address is not in this file, do not send
+`cast call` on **2026-08-04** (Sepolia head ~11,416,602; BSC testnet head
+~123,091,110). If an address is not in this file, do not send
 funds to it, approve it, or wire it into a config.
 
 Deployer EOA for everything below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
@@ -13,23 +13,23 @@ Deployer EOA for everything below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
 ## WARNING: never treat `broadcast/` as an address book
 
 Foundry keys `broadcast/` output **by chain ID only**. A local Anvil node
-started with `--chain-id 8453` writes its run files into
-`broadcast/<Script>.s.sol/8453/` — byte-for-byte indistinguishable in layout
-from a genuine Base mainnet broadcast. This repository's verification workflow
-deliberately runs production code paths against local nodes that borrow real
-chain IDs (8453, 11155111), so the tree routinely accumulates records of
-contracts that **do not exist** on the real chain.
+started with `--chain-id 1` writes its run files into
+`broadcast/<Script>.s.sol/1/` — byte-for-byte indistinguishable in layout
+from a genuine production-mainnet broadcast. This repository's verification
+workflow deliberately runs production code paths against local nodes that borrow
+real chain IDs — production chain IDs and 11155111 alike — so the tree routinely
+accumulates records of contracts that **do not exist** on the real chain.
 
 This was not hypothetical. Before the 2026-08-04 cleanup, `run-latest.json`
-under `DeployAtomicSettlement.s.sol/8453/` and `DeployDevNet.s.sol/8453/`
-described "Base" deployments whose receipts were at blocks 2–12 (Anvil), whose
-sender was Anvil dev account 0 (`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`,
-private key public), and whose addresses were **empty on real Base**. Worse,
-two addresses named in spoofed Sepolia artifacts (`0x09635F…ceBef`, listed as
-"MockUSDC", and `0xc3e53F…63690`, listed as "GyldBondToken") resolve on real
-Sepolia to a **stranger's "My Hardhat Token" (MHT)** owned by that same public
-Hardhat account — anyone who copied those into a config would have been
-approving or transferring to a contract they do not control.
+files sitting under borrowed production chain IDs described deployments whose
+receipts were at blocks 2–12 (Anvil), whose sender was Anvil dev account 0
+(`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`, private key public), and whose
+addresses had **no code on the real chain**. Worse, two addresses named in
+spoofed Sepolia artifacts (`0x09635F…ceBef`, listed as "MockUSDC", and
+`0xc3e53F…63690`, listed as "GyldBondToken") resolve on real Sepolia to a
+**stranger's "My Hardhat Token" (MHT)** owned by that same public Hardhat
+account — anyone who copied those into a config would have been approving or
+transferring to a contract they do not control.
 
 Rules:
 
@@ -44,14 +44,6 @@ Rules:
 
 ---
 
-## Base mainnet (chainId 8453) — removed 2026-08-12
-
-The Base demo stack's addresses were **removed from this address book** by owner
-decision (GLD-148). It was a learning/demo deployment (dummy "Test Bond Alpha"
-token, ~1 USDC dust seed, Gyld on both sides of the Morpho market), nothing in the
-platform reads it, and it is not a deployment target. Recoverable from git history
-if ever needed.
-
 ## Ethereum Sepolia (chainId 11155111)
 
 Two generations coexist. **Do not mix them.**
@@ -60,7 +52,7 @@ Two generations coexist. **Do not mix them.**
 
 | Contract | Address | Source commit | Privileged roles | Explorer verified | Status |
 |---|---|---|---|---|---|
-| TimelockController | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` | 6349ec5 | minDelay = 0; proposer = deployer EOA; open executor | Yes (Blockscout) | live (test) — same address as the Base timelock (same nonces), **different chain, do not conflate** |
+| TimelockController | `0xf803F99B7BCFE4D0db52FDE5a76c5FC257D9ef72` | 6349ec5 | minDelay = 0; proposer = deployer EOA; open executor | Yes (Blockscout) | live (test) — **this row is a Sepolia record and nothing else.** The same deployer at the same nonces produces this same address on any chain, so never read this address as identifying the same contract elsewhere |
 | IssuanceManager (ERC1967 proxy) | `0x5BA267367f06378816c58d47C5850fC9863Ce67F` | 6349ec5 | DEFAULT_ADMIN_ROLE = timelock | Yes (Blockscout) | live (test) |
 | IssuanceManager (implementation) | `0xEA637cdB348d4d14d1329E304F025cC8FD428E5a` | 6349ec5 | — | Yes (Blockscout) | live (test) |
 | MockSanctionsList | `0x7C1798643e0793EAB998B777b2CD0B7c2F2870Ad` | 6349ec5 (pre-GYL-1135 version) | **NONE — `addToSanctionsList`/`removeFromSanctionsList` are plain `external`, no owner, no access control. Anyone on the internet can sanction or unsanction any address.** Because token screening is fail-closed, this is a permissionless transfer-freeze on every holder of every series wired to it. | Yes (Blockscout) | **do-not-reuse — ungated sanctions oracle.** Never point a new deployment at it. (The hardened, owner-gated version exists only in current source; this deployed instance predates it — its `owner()` selector reverts.) |
@@ -87,7 +79,10 @@ Two generations coexist. **Do not mix them.**
 
 ## BSC testnet (chainId 97)
 
-Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
+Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**). (That
+script no longer exists in the tree — it went with the ERC-8056 extension under
+GYL-1201; the record is kept as history, reachable via tag
+`deployed/sepolia-bsc-gen2-46050ea`.)
 
 | Contract | Address | Source commit | Privileged roles | Explorer verified | Status |
 |---|---|---|---|---|---|
@@ -99,7 +94,7 @@ Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
 
 ## Source-commit preservation — resolved 2026-08-05
 
-- **`6349ec5`** (Base + Sepolia gen-1): on `main` and `origin/main`. Safe.
+- **`6349ec5`** (Sepolia gen-1): on `main` and `origin/main`. Safe.
 - **`46050ea`** (Sepolia gen-2 + BSC testnet ERC-8056 bytecode): **not on
   `main`** — the extension was removed under GYL-1201, so this source will never
   be reachable from `main`. It is preserved by the annotated tag
@@ -109,9 +104,12 @@ Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
   deletion is routine here. The tag message carries the address list and the
   do-not-upgrade caveats.
 - Bytecode check confirming the gap: the current working tree builds a
-  GyldBondToken runtime of 11,283 bytes; the live Sepolia/BSC implementations
-  are 13,184 bytes (and Base's is 11,585). Current source does **not**
-  reproduce any deployed implementation.
+  GyldBondToken runtime of 13,202 bytes (ERC-1643 added ~1.9 KB in `c1f240f`);
+  the live Sepolia/BSC implementations are 13,184 bytes.
+  Current source still does **not** reproduce any deployed implementation — but
+  read that conclusion carefully now: the margin against the live 13,184 is
+  **18 bytes**, not two kilobytes. Size is no longer evidence either way here;
+  only a bytecode comparison settles it.
 
 ## Known hazards, in one place
 
@@ -145,17 +143,17 @@ Deployed 2026-08-03 (`Erc8056ExplorerDemo`, commit era **`46050ea`**).
    gated mock in a handful of transactions, no upgrade needed. Note that timelock has
    `minDelay = 0` and an open executor, which is its own problem (see GYL-1206).
 
-   The same address on **Base** = the GyldBondToken implementation. Copying addresses
-   between chains here is not a theoretical risk; it is two different contracts.
+   Chain matters: this is a **Sepolia** record and nothing else. The same 20 bytes
+   reached on another chain are a different contract — copying addresses between
+   chains here is not a theoretical risk.
 2. `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` (Sepolia GTB8056) and
    `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` (BSC GBSCD): **do-not-reuse**
    ERC-8056 proxies.
-3. `0xe2Cf003AA0855D035c01c32B1cdEb081f7666428` (Base EulerRouter #1):
-   permanently misconfigured, governance already renounced. Use router #2.
-4. `0x09635F643e140090A9A8Dcd712eD6285858ceBef` and
+3. `0x09635F643e140090A9A8Dcd712eD6285858ceBef` and
    `0xc3e53F4d16Ae77Db1c982e75a937B9f60FE63690` on Sepolia are a stranger's
    "My Hardhat Token" — they appeared in (now deleted) spoofed broadcast
    artifacts as "MockUSDC" and "GyldBondToken". Never use them.
-5. Both timelocks have `minDelay = 0` and an open executor role: they provide
-   accounting, not delay. All privileged control ultimately rests with the
-   single deployer EOA `0xcEae…FEAd`.
+4. The single timelock left in this file, Sepolia `0xf803…ef72`, has
+   `minDelay = 0` and an open executor role: it provides accounting, not delay.
+   All privileged control ultimately rests with the single deployer EOA
+   `0xcEae…FEAd`.

@@ -275,7 +275,7 @@ contract AtomicSettlementDeployTest is Test {
         assertTrue(swap.hasRole(adminRole, address(timelock)), "timelock lacks DEFAULT_ADMIN after handover");
         assertFalse(swap.hasRole(adminRole, address(this)), "deployer kept DEFAULT_ADMIN after handover");
 
-        // (c2) GYL-1135: the hand-over must not be cosmetic. On Base the timelock had a
+        // (c2) GYL-1135: the hand-over must not be cosmetic. On the production L2 the timelock had a
         // zero delay and the deployer as its sole proposer, so "admin is the timelock"
         // was true and meant nothing. These are the properties
         // DeployGuards.assertTimelockSane now enforces in-band during the deploy.

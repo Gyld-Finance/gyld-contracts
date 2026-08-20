@@ -322,8 +322,8 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     ///         mistaken for a just-updated one.
     ///
     ///         NOT retrofittable: KaleidoscopeNAVFeed is not upgradeable (no proxy,
-    ///         Ownable2Step only), so feeds already deployed — including the Base
-    ///         mainnet feed — do not have this function. It benefits future deployments
+    ///         Ownable2Step only), so feeds already deployed — including the live
+    ///         production feed — do not have this function. It benefits future deployments
     ///         only. Monitoring of existing feeds must derive age off-chain from
     ///         `latestRoundData().updatedAt` (or watch `AnswerUpdated` /
     ///         `EmergencyAnswerUpdated`), which works on every version of this contract.

@@ -17,7 +17,7 @@ Solidity `0.8.28`, compiled with Foundry, on OpenZeppelin v5.3.0.
 
 | Contract | Upgrade | Purpose |
 |---|---|---|
-| `GyldBondToken` | UUPS | ERC-20 per bond series. Fixed balances — value accrues in the NAV feed, never in balances. On-chain sanctions check on every secondary transfer, fail-closed. Pausable. EIP-2612 permit. |
+| `GyldBondToken` | UUPS | ERC-20 per bond series. Fixed balances — value accrues in the NAV feed, never in balances. On-chain sanctions check on every secondary transfer, fail-closed. Pausable. EIP-2612 permit. IERC-1643 document management (prospectus / supplements), gated by `DOCUMENT_ROLE`. |
 | `IssuanceManager` | UUPS | Single mint/burn gate for all bond series. Only whitelisted Authorised Participants (APs) may receive minted tokens or be recorded as redemption beneficiaries. |
 | `TokenFactory` | None (`Ownable2Step`) | Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed, NAVFeedForwarder)` triple atomically and wires the token's roles in one transaction. |
 | `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval, plus a separate-key emergency override. |
@@ -56,7 +56,7 @@ afterwards.
 
 > **It does not revoke `REGISTRAR_ROLE`.** That role lives on the `IssuanceManager`,
 > and the factory keeps it permanently — there is no `revokeRole` for it in the
-> contract or in any deploy script, and on live Base mainnet
+> contract or in any deploy script, and on any stack deployed by the factory
 > `hasRole(REGISTRAR_ROLE, factory) == true`. An earlier version of this README
 > claimed the factory "self-revokes both" and holds "no permanent permissions
 > post-deploy"; that was false and should not be relied on in a threat model. See
@@ -133,7 +133,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 483 tests, 19 suites; fuzz runs = 10000
+forge test                  # 535 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage
 
@@ -153,7 +153,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 483 tests across 19 suites, all at full `foundry.toml` intensity.
+`forge test` — 535 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|
@@ -169,18 +169,21 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 | `SanctionsOracleMirror.t.sol` | Add/remove, role separation, forwarding-oracle probe and gas cap |
 | `TokenFactory.t.sol` | Atomic deployment, CREATE2 prediction, role wiring, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
 | `Timelock.t.sol` | Delay enforcement, cancellation |
-| `AtomicSettlementDeploy.t.sol`, `DeployScripts.t.sol` | Deploy scripts including the fail-closed guards |
+| `AtomicSettlementDeploy.t.sol`, `DeployScripts.t.sol` | Deploy scripts including the fail-closed guards; `DeployMockUSDCTest` covers the dev-chain allowlist on `DeployMockUSDC` — refused on every production chain and on any testnet outside the dev-chain allowlist, still funds the Anvil accounts on a dev chain |
 
 ---
 
 ## Docs
 
-The doc set is deliberately three files.
+The doc set is deliberately small — four files under `docs/`, plus `DEPLOYMENTS.md`
+at the root.
 
 | Document | Contents |
 |---|---|
+| [`DEPLOYMENTS.md`](DEPLOYMENTS.md) | **The authoritative on-chain address register.** The only place an address is canonical; if a contract is not listed there, do not send funds to it, approve it or wire it into a config. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **The authoritative reference.** Every contract, the complete role and permission matrix, custody and loss ceilings, value accrual, both settlement flows, compliance, oracle design, deployment model, deployed addresses, Morpho / Euler / Aave / ERC-4626 integration parameters, the verification surface, the decision record, known gaps, and a log of documentation claims found false against the code. |
 | [`docs/ci.md`](docs/ci.md) | What CI runs and why, what was considered and rejected, how to reproduce a failure locally. Referenced directly by `.github/workflows/ci.yml`. |
+| [`docs/atomic-settlement-testnet-runbook.md`](docs/atomic-settlement-testnet-runbook.md) | Deployment runbook and readiness assessment for taking the `GyldAtomicSwap` stack to a public testnet, including the fresh-deploy checklist. |
 | [`docs/decisions/erc8056-dropped-on-evm.md`](docs/decisions/erc8056-dropped-on-evm.md) | Standing ADR: why ERC-8056 (Scaled UI Amount) was dropped on EVM. Kept dated and separate so the decision is not re-litigated. |
 
 ---
@@ -200,9 +203,8 @@ The doc set is deliberately three files.
   no fork cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`
 
 Known gaps are tracked honestly in
-[`docs/ARCHITECTURE.md` §18](docs/ARCHITECTURE.md) — including a stale Base mainnet
-NAV feed, a Base stack still carrying the GYL-1135 incident configuration, and the
-residual `REGISTRAR_ROLE` above.
+[`docs/ARCHITECTURE.md` §18](docs/ARCHITECTURE.md) — including the residual
+`REGISTRAR_ROLE` above.
 
 ---
 
@@ -217,7 +219,6 @@ Date (2028-07-09), after which these files convert to `GPL-2.0-or-later`.
 
 Files under `contracts/test/` and `contracts/script/` are **not** uniformly MIT, as
 an earlier version of this README stated: 22 are `UNLICENSED` (the test suites and
-most deploy scripts), 7 are `MIT` (the five test doubles plus the two mock deploy
-scripts), and 6 are `GPL-2.0-or-later` (`DeployEulerStep1..6.s.sol`, which link
-Euler's GPL price-oracle library). Per-file breakdown:
+most deploy scripts) and 7 are `MIT` (the five test doubles plus the two mock deploy
+scripts). Per-file breakdown:
 [`docs/ARCHITECTURE.md` §4.2](docs/ARCHITECTURE.md).

@@ -13,7 +13,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 /// This script had NO chain guard whatsoever, and it is the one contract in the repo whose
 /// entire purpose is to be a fake compliance oracle. Since
 /// {DeployGuards.requireProdContract} can only check `code.length != 0`, a mock deployed
-/// on Base or BSC by this script SATISFIES the production `SANCTIONS_LIST` requirement —
+/// on a production L2 or BSC by this script SATISFIES the production `SANCTIONS_LIST` requirement —
 /// which is a live route straight around the hardening the rest of GYL-1135 added. It is
 /// now gated on the same dev ALLOWLIST every other script uses (Anvil 31337 /
 /// Sepolia 11155111); anything else fails closed, before any gas is spent.

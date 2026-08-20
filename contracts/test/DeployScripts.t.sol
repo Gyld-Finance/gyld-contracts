@@ -50,7 +50,7 @@ contract DeployGuardsTest is Test {
     /// Catches the root cause of the whole ticket.
     ///
     /// Every "mainnet protection" guard in the scripts was `require(block.chainid != 1)`.
-    /// Base — the chain the incident happened on — is 8453, so it walked straight through,
+    /// The incident chain was a production L2 (chain 8453), not chain 1, so it walked straight through,
     /// as does every other L2 and every chain that does not exist yet. The replacement is
     /// an ALLOWLIST: an unrecognised chain is production and gets the strict path.
     function test_isDevChain_isAnAllowlist_notADenylist() public {
@@ -70,7 +70,7 @@ contract DeployGuardsTest is Test {
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
     /// Plain CREATE addresses are `keccak(deployer, nonce)` — no chain component at all,
-    /// which is why `0x7c1798…70ad` is a live GyldBondToken on Base and a
+    /// which is why `0x7c1798…70ad` is a live GyldBondToken on a production L2 and a
     /// MockSanctionsList on Sepolia. The salt now carries `block.chainid`.
     function test_saltFor_isChainScoped() public {
         string[6] memory names = [
@@ -86,14 +86,14 @@ contract DeployGuardsTest is Test {
         ];
         for (uint256 i = 0; i < names.length; i++) {
             vm.chainId(8453);
-            bytes32 onBase = harness.saltFor(names[i]);
+            bytes32 onProdL2 = harness.saltFor(names[i]);
             vm.chainId(11155111);
             bytes32 onSepolia = harness.saltFor(names[i]);
             vm.chainId(31337);
             bytes32 onAnvil = harness.saltFor(names[i]);
 
-            assertTrue(onBase != onSepolia, string.concat("Base/Sepolia salt collision: ", names[i]));
-            assertTrue(onBase != onAnvil, string.concat("Base/Anvil salt collision: ", names[i]));
+            assertTrue(onProdL2 != onSepolia, string.concat("ProdL2/Sepolia salt collision: ", names[i]));
+            assertTrue(onProdL2 != onAnvil, string.concat("ProdL2/Anvil salt collision: ", names[i]));
             assertTrue(onSepolia != onAnvil, string.concat("Sepolia/Anvil salt collision: ", names[i]));
         }
     }
@@ -117,8 +117,8 @@ contract DeployGuardsTest is Test {
 /// @title DeployScriptsTest
 /// @notice Executes the deploy scripts themselves — nothing in the suite did before.
 ///
-/// Every scenario below is calibrated against THE CONFIGURATION THAT IS LIVE ON BASE
-/// MAINNET TODAY (GYL-1135): a TimelockController with `delay = 0` whose sole proposer is
+/// Every scenario below is calibrated against THE CONFIGURATION THAT IS LIVE ON A
+/// PRODUCTION L2 TODAY (GYL-1135): a TimelockController with `delay = 0` whose sole proposer is
 /// the deployer EOA, and `IssuanceManager.initialize(deployer, deployer, deployer)` with
 /// no hand-over at all. Each `_reject…` scenario feeds the scripts one slice of that
 /// configuration and asserts they now refuse to deploy it.
@@ -142,7 +142,7 @@ contract DeployGuardsTest is Test {
 /// exactly as it does when broadcasting, so the deterministic addressing below is the real
 /// production scheme rather than a test-only approximation.
 contract DeployScriptsTest is ScriptRevertAsserts {
-    uint256 constant BASE = 8453; // the chain the incident happened on
+    uint256 constant PROD_L2 = 8453; // a production L2 that a `!= 1` denylist lets through
     uint256 constant SEPOLIA = 11155111;
     uint256 constant ANVIL = 31337;
 
@@ -176,15 +176,15 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     /// Single entry point — see the contract-level note on why these are not separate
     /// test functions. Each scenario restores EVM state before the next one starts.
-    function test_deployScripts_rejectTheLiveBaseConfiguration() public {
+    function test_deployScripts_rejectTheLiveIncidentConfiguration() public {
         snap = vm.snapshotState();
 
         // ── DeployDevNet ──────────────────────────────────────────────────────
         _run(this.reject_devNet_unsetGovernanceMultisig);
         _run(this.reject_devNet_governanceIsTheDeployer);
-        _run(this.reject_devNet_zeroTimelockDelayOnBase);
-        _run(this.reject_devNet_unsetTimelockDelayOnBase);
-        _run(this.reject_devNet_unsetSanctionsListOnBase);
+        _run(this.reject_devNet_zeroTimelockDelayOnProdL2);
+        _run(this.reject_devNet_unsetTimelockDelayOnProdL2);
+        _run(this.reject_devNet_unsetSanctionsListOnProdL2);
         _run(this.reject_devNet_sanctionsListWithoutCode);
         _run(this.reject_devNet_sanctionsListIsADevMock);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
@@ -195,7 +195,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
         // ── DeployTimelock ────────────────────────────────────────────────────
         _run(this.reject_timelock_unsetIssuanceManagerOnProd);
-        _run(this.reject_timelock_zeroDelayOnBase);
+        _run(this.reject_timelock_zeroDelayOnProdL2);
         _run(this.reject_timelock_multisigIsTheDeployer);
         _run(this.accept_timelock_productionHappyPath);
 
@@ -219,26 +219,26 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// exported. `_envOrDefault("GOVERNANCE_MULTISIG", msg.sender)` made an unset var
     /// indistinguishable from "the deployer is governance".
     function reject_devNet_unsetGovernanceMultisig() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         vm.setEnv("GOVERNANCE_MULTISIG", "");
         _expectRunRevert(address(new DeployDevNet()), "env var GOVERNANCE_MULTISIG is required on chainId 8453");
     }
 
-    /// Catches: the exact live Base topology — a privileged role pointed at the
+    /// Catches: the exact live incident topology — a privileged role pointed at the
     /// broadcaster. Setting the var is not enough; it must not name the deployer.
     function reject_devNet_governanceIsTheDeployer() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         _setAddr("GOVERNANCE_MULTISIG", DEFAULT_SENDER);
         _expectRunRevert(address(new DeployDevNet()), "GOVERNANCE_MULTISIG must not be the deployer EOA");
     }
 
     /// Catches: `TIMELOCK_DELAY_SECONDS=0` on a production chain — the single value that
-    /// turned the live Base timelock into a rubber stamp, and what `.env.example` shipped
+    /// turned the live production timelock into a rubber stamp, and what `.env.example` shipped
     /// on line 2. The old guard (`block.chainid == 31337 ? 0 : 172800`) had no floor at all.
-    function reject_devNet_zeroTimelockDelayOnBase() external {
-        vm.chainId(BASE);
+    function reject_devNet_zeroTimelockDelayOnProdL2() external {
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
@@ -248,18 +248,18 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     }
 
     /// Catches: relying on an implicit default for the delay on production.
-    function reject_devNet_unsetTimelockDelayOnBase() external {
-        vm.chainId(BASE);
+    function reject_devNet_unsetTimelockDelayOnProdL2() external {
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "");
         _expectRunRevert(address(new DeployDevNet()), "env var TIMELOCK_DELAY_SECONDS is required");
     }
 
     /// Catches: deploying a WRITABLE MockSanctionsList as the compliance oracle on a
-    /// production chain. The old guard was `require(block.chainid != 1)`, so on Base this
+    /// production chain. The old guard was `require(block.chainid != 1)`, so on a production L2 this
     /// would have wired in a mock that screens nobody.
-    function reject_devNet_unsetSanctionsListOnBase() external {
-        vm.chainId(BASE);
+    function reject_devNet_unsetSanctionsListOnProdL2() external {
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         vm.setEnv("SANCTIONS_LIST", "");
         _expectRunRevert(address(new DeployDevNet()), "env var SANCTIONS_LIST is required on chainId 8453");
@@ -268,7 +268,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// Catches: a sanctions oracle that is an EOA or a typo'd address with no code —
     /// every `isSanctioned` staticcall against it fails or returns nothing.
     function reject_devNet_sanctionsListWithoutCode() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         _setAddr("SANCTIONS_LIST", address(0xDEAD));
         _expectRunRevert(address(new DeployDevNet()), "SANCTIONS_LIST (0x000000000000000000000000000000000000dEaD) has no code");
@@ -283,7 +283,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// a single unguarded `forge script` away). Screening is fail-closed in GyldBondToken,
     /// so whoever can write that list can freeze every holder of every series.
     function reject_devNet_sanctionsListIsADevMock() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         _setAddr("SANCTIONS_LIST", address(sanctions));
         _expectRunRevert(
@@ -294,7 +294,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     /// Catches: collapsing the deliberate mint/burn two-key quorum into one address.
     function reject_devNet_subscriberEqualsRedeemer() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
         _setAddr("REDEEMER_ADDRESS", SUBSCRIBER);
         _expectRunRevert(
@@ -304,7 +304,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     }
 
     /// Every bond series this run deploys must leave DEFAULT_ADMIN_ROLE with the timelock
-    /// and NOT with the broadcaster — the per-token form of the Base-incident property
+    /// and NOT with the broadcaster — the per-token form of the GYL-1135 property
     /// (the other scenarios in this file assert it for IssuanceManager and the swap, but
     /// this is the only place it is checked on the tokens themselves).
     ///
@@ -329,7 +329,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// script finishes, the deployer holds NOTHING, the timelock is a real 48h gate the
     /// deployer cannot propose through, and the publicly-known Anvil key is not an AP.
     function accept_devNet_productionHappyPath() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _devNetProdEnv();
 
         DeployDevNet script = new DeployDevNet();
@@ -389,8 +389,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     }
 
     /// Catches: identical bootstrap addresses on different chains — the H-3 finding, where
-    /// `0x7c1798…70ad` is a MockSanctionsList on Sepolia but a live GyldBondToken on Base,
-    /// and `0x18ce55…6317` is a GyldBondToken on Sepolia but a TokenFactory on Base.
+    /// `0x7c1798…70ad` is a MockSanctionsList on Sepolia but a live GyldBondToken on a
+    /// production L2, and `0x18ce55…6317` is a GyldBondToken on Sepolia but a TokenFactory there.
     ///
     /// Deployed through the canonical CREATE2 proxy, an address depends ONLY on
     /// (salt, initcode) — the deployer's nonce is irrelevant. The constructor arguments
@@ -409,15 +409,15 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _devNetProdEnv();
         uint256 pristine = vm.snapshotState();
 
-        vm.chainId(BASE);
-        DeployDevNet onBase = new DeployDevNet();
-        onBase.run();
-        address baseScript = address(onBase);
-        address baseTimelock = address(onBase.timelock());
-        address baseIssuance = address(onBase.issuanceMgr());
-        address baseFactory = address(onBase.factory());
+        vm.chainId(PROD_L2);
+        DeployDevNet onProdL2 = new DeployDevNet();
+        onProdL2.run();
+        address prodScript = address(onProdL2);
+        address prodTimelock = address(onProdL2.timelock());
+        address prodIssuance = address(onProdL2.issuanceMgr());
+        address prodFactory = address(onProdL2.factory());
 
-        // Rewind everything the Base run touched, including nonces, so the Sepolia run
+        // Rewind everything the production-L2 run touched, including nonces, so the Sepolia run
         // starts from a byte-identical world with only `block.chainid` differing.
         vm.revertToState(pristine);
 
@@ -427,11 +427,11 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
         // Guard on the premise: if the two runs did not start from the same deployer+nonce
         // the divergence assertions below would pass for the wrong reason.
-        assertEq(baseScript, address(onSepolia), "the two runs must model the same deployer at the same nonce");
+        assertEq(prodScript, address(onSepolia), "the two runs must model the same deployer at the same nonce");
 
-        assertTrue(baseTimelock != address(onSepolia.timelock()), "TimelockController collides across chains");
-        assertTrue(baseIssuance != address(onSepolia.issuanceMgr()), "IssuanceManager proxy collides across chains");
-        assertTrue(baseFactory != address(onSepolia.factory()), "TokenFactory collides across chains");
+        assertTrue(prodTimelock != address(onSepolia.timelock()), "TimelockController collides across chains");
+        assertTrue(prodIssuance != address(onSepolia.issuanceMgr()), "IssuanceManager proxy collides across chains");
+        assertTrue(prodFactory != address(onSepolia.factory()), "TokenFactory collides across chains");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -442,7 +442,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// meant a forgotten export left the deployer as the IssuanceManager's sole
     /// DEFAULT_ADMIN while the script still printed "complete".
     function reject_timelock_unsetIssuanceManagerOnProd() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _timelockProdEnv();
         vm.setEnv("ISSUANCE_MANAGER_ADDRESS", "");
         _expectRunRevert(
@@ -450,10 +450,10 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         );
     }
 
-    /// Catches: `TIMELOCK_DELAY_SECONDS=0` on Base. The old check was
+    /// Catches: `TIMELOCK_DELAY_SECONDS=0` on a production L2. The old check was
     /// `block.chainid != 1 || d >= 48 hours` — it accepted 0 on every chain except Ethereum.
-    function reject_timelock_zeroDelayOnBase() external {
-        vm.chainId(BASE);
+    function reject_timelock_zeroDelayOnProdL2() external {
+        vm.chainId(PROD_L2);
         _timelockProdEnv();
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
@@ -464,14 +464,14 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     /// Catches: a timelock whose only proposer is the deployer — governance in name only.
     function reject_timelock_multisigIsTheDeployer() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _timelockProdEnv();
         _setAddr("MULTISIG_ADDRESS", DEFAULT_SENDER);
         _expectRunRevert(address(new DeployTimelock()), "MULTISIG_ADDRESS must not be the deployer EOA");
     }
 
     function accept_timelock_productionHappyPath() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         (TokenFactory factory, IssuanceManager im) = _timelockProdEnv();
 
         DeployTimelock script = new DeployTimelock();
@@ -493,7 +493,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// contract that HOLDS the settlement inventory. It used to print
     /// "!! TIMELOCK_ADDRESS unset - deployer keeps DEFAULT_ADMIN (dev only)" and continue.
     function reject_atomic_unsetTimelockOnProd() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _atomicProdEnv();
         vm.setEnv("TIMELOCK_ADDRESS", "");
         _expectRunRevert(
@@ -503,7 +503,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     /// Catches: a privileged swap role pointed back at the broadcaster.
     function reject_atomic_treasurerIsTheDeployer() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _atomicProdEnv();
         _setAddr("TREASURER_ADDRESS", DEFAULT_SENDER);
         _expectRunRevert(address(new DeployAtomicSettlement()), "TREASURER_ADDRESS must not be the deployer EOA");
@@ -513,9 +513,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// the timelock really does hold DEFAULT_ADMIN and the deployer really was revoked —
     /// but the timelock has `delay = 0` and the deployer is its proposer, so the deployer
     /// can still execute anything instantly. Role-level assertions all pass here; only
-    /// {DeployGuards.assertTimelockSane} catches it. This is the live Base timelock.
+    /// {DeployGuards.assertTimelockSane} catches it. This is the live incident timelock.
     function reject_atomic_cosmeticZeroDelayTimelock() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _atomicProdEnv();
         _setAddr("TIMELOCK_ADDRESS", address(_timelock(0, DEFAULT_SENDER)));
         _expectRunRevert(
@@ -526,7 +526,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// Same shape with a compliant 48h delay but the deployer still holding PROPOSER_ROLE:
     /// the delay alone does not make governance non-unilateral.
     function reject_atomic_deployerIsSoleProposer() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _atomicProdEnv();
         _setAddr("TIMELOCK_ADDRESS", address(_timelock(48 hours, DEFAULT_SENDER)));
         _expectRunRevert(
@@ -535,7 +535,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     }
 
     function accept_atomic_productionHappyPath() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _atomicProdEnv();
 
         DeployAtomicSettlement script = new DeployAtomicSettlement();
@@ -561,7 +561,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// Catches: the forwarder — the permanent address Morpho/Aave read prices from —
     /// owned by a single EOA that can repoint `setUpstreamOracle` at anything it likes.
     function reject_navFeed_forwarderOwnerIsAnEoa() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _navFeedEnv();
         _setAddr("FORWARDER_OWNER", address(0xB0B));
         _expectRunRevert(
@@ -572,7 +572,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// Catches: FORWARDER_OWNER silently falling back to OPERATOR_ADDRESS (the hot
     /// NAV-pushing key) on a production chain — what `catch { forwarderOwner = operator; }` did.
     function reject_navFeed_unsetForwarderOwnerOnProd() external {
-        vm.chainId(BASE);
+        vm.chainId(PROD_L2);
         _navFeedEnv();
         vm.setEnv("FORWARDER_OWNER", "");
         _expectRunRevert(address(new DeployNAVFeed()), "env var FORWARDER_OWNER is required on chainId 8453");
@@ -721,7 +721,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 /// @notice The one script whose entire product is a FAKE compliance oracle.
 ///
 /// It shipped with no chain guard of any kind — not even the `block.chainid != 1` denylist
-/// the other scripts had — so `forge script DeployMockSanctionsList --rpc-url <base>` put a
+/// the other scripts had — so `forge script DeployMockSanctionsList --rpc-url <production-rpc>` put a
 /// writable sanctions oracle on a production chain. Combined with
 /// {DeployGuards.requireProdContract}, which can only assert `code.length != 0`, that mock
 /// then SATISFIED the production `SANCTIONS_LIST` requirement: a live route straight around
@@ -748,9 +748,9 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
         }
     }
 
-    /// Base Sepolia (84532) is NOT on the dev allowlist — only Anvil and Ethereum Sepolia
-    /// are. A near-miss chain id must not slip through.
-    function test_run_refusedOnBaseSepolia() public {
+    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil and Ethereum
+    /// Sepolia are. A near-miss chain id must not slip through.
+    function test_run_refusedOnAnUnlistedTestnet() public {
         vm.chainId(84532);
         _expectRunRevert(address(new DeployMockSanctionsList()), "is dev-only and is NOT production-safe on chainId 84532");
     }
@@ -786,7 +786,7 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
 /// @notice The last ungated deploy script in the repo (GYL-1135 follow-up).
 ///
 /// It shipped with no chain guard of any kind — not even the `block.chainid != 1` denylist
-/// the other scripts had — so `forge script DeployMockUSDC --rpc-url <base>` deployed a
+/// the other scripts had — so `forge script DeployMockUSDC --rpc-url <production-rpc>` deployed a
 /// fake USDC on a production chain and minted 100,000 of it to three hardcoded Anvil
 /// accounts, including `0x7099…79C8` whose private key is printed in the Anvil banner.
 /// The mock token itself is worthless, but a "USDC" contract at a plausible address that
@@ -814,9 +814,9 @@ contract DeployMockUSDCTest is ScriptRevertAsserts {
         }
     }
 
-    /// Base Sepolia (84532) is NOT on the dev allowlist — only Anvil and Ethereum Sepolia
-    /// are. A near-miss chain id must not slip through.
-    function test_run_refusedOnBaseSepolia() public {
+    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil and Ethereum
+    /// Sepolia are. A near-miss chain id must not slip through.
+    function test_run_refusedOnAnUnlistedTestnet() public {
         vm.chainId(84532);
         _expectRunRevert(address(new DeployMockUSDC()), "is dev-only and is NOT production-safe on chainId 84532");
     }

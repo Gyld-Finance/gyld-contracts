@@ -11,9 +11,6 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
     "forge-std/=lib/forge-std/src/",
-    "euler-price-oracle/=lib/euler-price-oracle/src/",
-    "solady/=lib/euler-price-oracle/lib/solady/src/",
-    "evc/=lib/euler-price-oracle/lib/ethereum-vault-connector/src/",
 ]
 
 [etherscan]

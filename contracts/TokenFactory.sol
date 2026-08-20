@@ -233,7 +233,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
 
     /// CREATE2 salt for a bond series: keccak256(isin || chainId).
     /// Including chainId prevents the same ISIN from producing the same address
-    /// on two different chains (e.g. Ethereum mainnet vs Base).
+    /// on two different chains (e.g. Ethereum mainnet vs an L2).
     function _bondSalt(string memory isin_) internal view returns (bytes32) {
         return keccak256(abi.encodePacked(isin_, block.chainid));
     }
