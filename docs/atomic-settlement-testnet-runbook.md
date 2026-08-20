@@ -47,7 +47,7 @@ anything in section 4; `broadcast/` is history, not an address book.
 |---|---|---|---|---|
 | Local Anvil | 31337 | Full stack incl. `GyldAtomicSwap` (`DeployAtomicSettlement`, `AtomicSettlementFlow`, `DeployAtomicSettlementE2E`, `DeployDevNet`, `DeployMockUSDC`) | — (ephemeral; gone on Anvil restart) | `broadcast/DeployAtomicSettlement.s.sol/31337` et al. |
 | Sepolia | 11155111 | **`GyldAtomicSwap` — LIVE** (proxy + implementation, 2026-07-31, commit `46050ea`, Blockscout-verified, settling Circle Sepolia USDC; addresses in `DEPLOYMENTS.md`), plus the older token stack from `DeployDevNet.s.sol` (May 2026 run): TimelockController, IssuanceManager proxy, TokenFactory, MockSanctionsList, three bond series (CAT / C / KO) — token-stack addresses below | — | `broadcast/DeployDevNet.s.sol/11155111`; swap addresses per `DEPLOYMENTS.md` |
-| Base **MAINNET** | 8453 | Euler/Morpho listing experiment: `DeployBaseTest.s.sol` + `DeployEulerStep1..6.s.sol` | **`GyldAtomicSwap` — not deployed** | `broadcast/DeployBaseTest.s.sol/8453`, `broadcast/DeployEulerStep*/8453` |
+| Base **MAINNET** | 8453 | Euler/Morpho listing experiment — retired. Its scripts (`DeployBaseTest.s.sol`, `DeployEulerStep1..6.s.sol`) are deleted from the tree; the deployment itself remains live on-chain and untracked | **`GyldAtomicSwap` — not deployed** | `broadcast/DeployBaseTest.s.sol/8453`, `broadcast/DeployEulerStep*/8453` (history only) |
 
 > **Warning — 8453 is Base MAINNET, not a testnet.** The script was named
 > `DeployBaseTest.s.sol` and that name had already misled people; it hardcoded

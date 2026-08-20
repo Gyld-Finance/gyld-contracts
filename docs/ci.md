@@ -199,9 +199,11 @@ Production contracts (`contracts/*.sol`) at the first measurement:
 | **7 production contracts** | **95.34% (450/472)** | **95.79% (592/618)** | **96.43% (108/112)** | **100% (105/105)** |
 
 The repo-wide `Total` that `--report summary` prints is **65.08%**. Ignore it:
-it is dominated by `DeployEulerStep*` and `AtomicSettlementFlow` scripts that
-are broadcast-only and have no test harness, so it measures how many deploy
-scripts have tests, not how well the contracts are tested.
+it is dominated by broadcast-only scripts such as `AtomicSettlementFlow` that
+have no test harness, so it measures how many deploy scripts have tests, not
+how well the contracts are tested. (It was more dominated still when the
+`DeployEulerStep*` family was in the tree; those were removed with the Base
+demo, so the figure quoted above predates their removal.)
 
 Two honest caveats, in order of importance:
 
@@ -312,9 +314,9 @@ CI log if you need the exact case.
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.
 - ~~**Broadcast-without-guard job**~~ — **adopted**, and it starts green. The
-  earlier objection was that 8 of 14 broadcasting scripts (the
-  `DeployEulerStep*` family) pin their chain with a bare
-  `require(block.chainid == 8453)` and never reference `DeployGuards`, so a
+  earlier objection was that 8 of the then-14 broadcasting scripts (six of
+  them the since-removed `DeployEulerStep*` family) pinned their chain with a
+  bare `require(block.chainid == 8453)` and never referenced `DeployGuards`, so a
   check for a `DeployGuards` *call* would start red. The fix was to check for
   a **chain guard**, not for the library: a positive `block.chainid ==` pin is
   a fail-closed allowlist of exactly one chain and counts. Both forms are

@@ -221,7 +221,6 @@ Date (2028-07-09), after which these files convert to `GPL-2.0-or-later`.
 
 Files under `contracts/test/` and `contracts/script/` are **not** uniformly MIT, as
 an earlier version of this README stated: 22 are `UNLICENSED` (the test suites and
-most deploy scripts), 7 are `MIT` (the five test doubles plus the two mock deploy
-scripts), and 6 are `GPL-2.0-or-later` (`DeployEulerStep1..6.s.sol`, which link
-Euler's GPL price-oracle library). Per-file breakdown:
+most deploy scripts) and 7 are `MIT` (the five test doubles plus the two mock deploy
+scripts). Per-file breakdown:
 [`docs/ARCHITECTURE.md` §4.2](docs/ARCHITECTURE.md).

@@ -239,7 +239,6 @@ MIT, contrary to what the README and two earlier docs claimed:
 |---|---|---|
 | `UNLICENSED` | 22 | Every `*.t.sol` suite, `ScriptRevertAsserts.sol`, `DeployDevNet`, `DeployTimelock`, `DeployNAVFeed`, `DeployAtomicSettlement`, `DeployAtomicSettlementE2E`, `AtomicSettlementFlow`, `script/lib/DeployGuards.sol` |
 | `MIT` | 7 | The five test doubles (`MockSanctionsList`, `MockUSDC`, `MockUSDCPermit`, `MockNavForwarder`, `MockReentrantToken`) plus `DeployMockSanctionsList.s.sol` and `DeployMockUSDC.s.sol` |
-| `GPL-2.0-or-later` | 6 | `DeployEulerStep1..6.s.sol` — they link Euler's GPL-licensed price-oracle library |
 
 ### 4.3 Test doubles (never deployed on production)
 
@@ -1937,10 +1936,10 @@ timelock and off the deployer, that the timelock is sane, and — on production 
 | `DeployMockUSDC.s.sol` | Dev USDC | **Hardened** — `requireProdSafe`, added in the branch tip commit; it previously had **no** guard |
 | `DeployAtomicSettlementE2E.s.sol` | Self-contained Anvil fixtures for the Rust e2e run | Bare `require(block.chainid == 31337)` — an allowlist, but not via the library |
 | `AtomicSettlementFlow.s.sol` | Repeatable live-Anvil settlement flow | Does not reference `DeployGuards` |
-| `DeployEulerStep1..6.s.sol` | The six-step Euler V2 deployment | Bare `require(block.chainid == 8453)` — an allowlist pinning one chain, but not via the library |
 
-**8 of the 14 broadcasting scripts do not reference `DeployGuards`**: the six Euler
-steps plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. All eight pin a
+**2 of the 8 broadcasting scripts do not reference `DeployGuards`**:
+`AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. (It was 8 of 14 until the six
+Euler steps were removed with the Base demo.) Both pin a
 single chain with a bare equality `require`, which is an allowlist and therefore not
 the bug class the incident came from — but they do not get the env-var,
 not-the-deployer, min-delay or post-deploy-assertion coverage. Extending the
@@ -2780,8 +2779,9 @@ Carried forward honestly. Ordered by severity.
 
 ### Medium
 
-6. **8 of 14 broadcasting scripts do not use `DeployGuards`** — the six Euler steps
-   plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. All eight pin a single
+6. **2 of 8 broadcasting scripts do not use `DeployGuards`** — `AtomicSettlementFlow`
+   and `DeployAtomicSettlementE2E` (was 8 of 14 before the six Euler steps were removed
+   with the Base demo). Both pin a single
    chain with a bare equality `require`, so they are not the denylist bug class, but they
    lack env-var, not-the-deployer, min-delay and post-deploy-assertion coverage. A CI job
    asserting that every `vm.startBroadcast` script calls `DeployGuards` would start red
@@ -2876,7 +2876,7 @@ bytecode, so the corrections are recorded rather than silently dropped.
 | "Test and deployment-script files under `contracts/test/` and `contracts/script/` remain **MIT**" | `README.md`, `contracts.md` | **False.** 22 are `UNLICENSED`, 7 are MIT, 6 are `GPL-2.0-or-later`. Full breakdown in [§4.2](#42-licensing). |
 | "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `c1f240f`): **535 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
 | "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml:29` | Stale. Now 535. The workflow comment was corrected to 535 in the same pass. |
-| "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | **8 of 14.** Six reference `DeployGuards`; the eight that do not are the six Euler steps plus `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
+| "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | Was **8 of 14** when written; **2 of 8** since the six Euler steps were removed with the Base demo. The two that do not reference `DeployGuards` are `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
 | Fireblocks ERC20F / DenyList contracts "remain in the repo for reference only" at `contracts/erc20f/` | `blockchain-status.md` | **The directory does not exist** in this tree. |
 | "`docs/contracts.md` \| Deployed addresses (**Hoodi testnet + mainnet**)" | `README.md` docs table | **False.** That file listed Ethereum Sepolia and local Anvil. No Hoodi addresses appear anywhere in `docs/`, and the Hoodi deployment described in the run-books never happened. |
 | Deployment run-books targeting **Hoodi (chain 560048)** as the public testnet | `atomic-settlement.md`, and `blockchain-status.md` env defaults (`PRIVKEY_CHAIN_ID` default 560048) | Superseded. `DeployGuards.isDevChain()` allowlists **only** Anvil 31337 and Ethereum Sepolia 11155111. Hoodi would be classified as production and take the strict path. The atomic swap's integrator instance went to Sepolia. |
