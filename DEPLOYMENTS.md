@@ -75,6 +75,66 @@ Two generations coexist. **Do not mix them.**
 | GyldAtomicSwap (implementation) | `0x287edc0d5F6d3D07beBD0390509C88Fc50a8f79b` | 46050ea | — | Yes (Blockscout) | live (test) |
 | GyldAtomicSwap (ERC1967 proxy, CREATE2) | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` | 46050ea | DEFAULT_ADMIN_ROLE = deployer EOA (all init roles set to deployer) | Yes (Blockscout) | live (test) — settlement asset is Circle Sepolia USDC `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
 
+#### Upgrade hazard — the `GyldAtomicSwap` proxy is **not** a like-for-like upgrade onto `main`
+
+The live implementation `0x287edc0d5F6d3D07beBD0390509C88Fc50a8f79b` was built from
+`46050ea`, which is **not an ancestor of `main`** (reachable only via the annotated
+tag `deployed/sepolia-bsc-gen2-46050ea`). Current source differs by 199 insertions /
+58 deletions (`git diff 46050ea origin/main -- contracts/GyldAtomicSwap.sol`). Storage
+is safe; the ABI and the semantics are not. Line numbers below are
+`contracts/GyldAtomicSwap.sol` at each revision (`main` side pinned at `08f575f`).
+
+**1. Storage layout — a pure no-op, not even an append.** The ERC-7201
+`GyldAtomicSwapStorage` struct has the identical eleven fields, in identical order and
+of identical types, at both revisions; only the comments differ. No storage hazard in
+either direction, rollback included. Note `ci/storage-layouts/` did not exist at
+`46050ea`, so there is no JSON baseline to diff against — compare the struct source.
+
+**2. ABI regression — four symbols removed.** Exhaustive: diffing the declared
+`function` / `error` / `public constant` names between the two revisions shows only
+these four disappearing (additions are `InvalidQuoteTtl`, `MAX_QUOTE_TTL_CEILING`,
+`MAX_QUOTE_DEVIATION_BPS_CEILING` and the private `_effectiveMaxQuoteTtl`).
+
+| Symbol | Live (`46050ea`) | On `main` (`08f575f`) | Consequence of upgrading |
+|---|---|---|---|
+| `seriesCount() → uint256` | L354–356 | **removed** | any integrator enumerating registered series breaks — the call hits no function and reverts. The `seriesList` array itself survives in storage; only the accessors go. |
+| `seriesAt(uint256) → address` | L361–363 | **removed** | as above |
+| `error CannotRenouncePauserRole()` | declared L194, thrown L715 | **removed** | `renounceRole(PAUSER_ROLE, self)` is no longer blocked and succeeds |
+| `error CannotRenounceTreasurerRole()` | declared L195, thrown L716 | **removed** | `renounceRole(TREASURER_ROLE, self)` is no longer blocked and succeeds |
+
+`main`'s `renounceRole` override still blocks `DEFAULT_ADMIN_ROLE` only (L856–857).
+
+**3. Silent behavioural drift on identical selectors.** These four keep their selector,
+their signature and their return type, so a probe for a missing function finds a working
+function and concludes nothing changed. What changed is what they do.
+
+| Selector | Live (`46050ea`) | On `main` (`08f575f`) | Consequence of upgrading |
+|---|---|---|---|
+| `DEFAULT_MAX_QUOTE_TTL()` | `1 hours` = **3600** (L137) | `15 minutes` = **900** (L163) | the advertised default silently quarters |
+| `maxQuoteTtl()` | raw storage read (L349–350) | read through the zero-fallback `_effectiveMaxQuoteTtl` (L469; L287–289: `ttl == 0 ? DEFAULT_MAX_QUOTE_TTL : ttl`) | same signature, different meaning when the slot is unset — see note 4 for why the slot is **not** unset here |
+| `setMaxQuoteTtl(uint64)` | **completely unbounded** — any `uint64` is accepted and stored (L629–630) | reverts `InvalidQuoteTtl` above `MAX_QUOTE_TTL_CEILING = 1 hours` = 3600 (L764–765; constant L249) | admin calls that succeed today start reverting |
+| `setMaxQuoteDeviationBps(uint16)` | bounded only by `BPS_DENOMINATOR = 10_000`, i.e. a ±100 % band (L601–602; constant L130) | bounded by `MAX_QUOTE_DEVIATION_BPS_CEILING = 1000`, i.e. 10 % (L717–718; constant L209) | any currently-set band above 1000 bps becomes unsettable; the stored value is **not** clamped by the upgrade |
+
+**4. Migration hazard — the TTL slot is seeded, so `main`'s zero-fallback never fires
+for this proxy.** `initialize` at `46050ea` executes `$.maxQuoteTtl =
+DEFAULT_MAX_QUOTE_TTL` (L291), and that constant is `1 hours` there (L137), so the live
+slot reads **3600, not 0**. On upgrade the proxy therefore keeps enforcing a **1-hour**
+quote TTL: legal (it is exactly `MAX_QUOTE_TTL_CEILING`), but **4× laxer than the
+15 minutes a fresh deploy gets**, and `maxQuoteTtl()` will keep returning `3600` with
+nothing to indicate the divergence. There is no reinitializer or migration hook that
+corrects it.
+
+> **Remedy.** Whoever performs the upgrade must follow it with an explicit
+> `setMaxQuoteTtl(900)` (`DEFAULT_ADMIN_ROLE`) — batched with the upgrade, not left as a
+> follow-up — or consciously accept the 1-hour cap and record that decision.
+
+**5. No upgrade script exists.** `git grep -n upgradeToAndCall 08f575f -- contracts/script/`
+returns nothing; every occurrence in the repo is in `contracts/test/` (plus docs). Any
+upgrade is a hand-rolled `cast send`. It needs no timelock: `_authorizeUpgrade` is
+`DEFAULT_ADMIN_ROLE`-gated and on this proxy that role sits directly on the deployer EOA
+`0xcEae…FEAd` (see the table above), not on the `0xf803…ef72` timelock that guards
+GTB8056 — so there is no delay window and no second signer.
+
 ---
 
 ## BSC testnet (chainId 97)

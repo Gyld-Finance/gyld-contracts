@@ -1988,6 +1988,9 @@ refactor to them is tracked in [§18](#18-known-gaps-and-open-decisions).
 
 ## 14. Deployed addresses
 
+`DEPLOYMENTS.md` at the repo root is the authoritative on-chain address register,
+including per-instance upgrade hazards; the tables below are the narrative summary.
+
 Deployer for all Sepolia work below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
 
 ### 14.1 Ethereum Sepolia (11155111)
@@ -2023,10 +2026,16 @@ Verified on-chain 2026-07-31: inventory seeded via `subscribe` (100 bonds + 2 US
 a signed BUY quote executed (2 USDC → 0.02 bonds, `quoteId 1` burned).
 
 > **Caveats.** Dev-mode wiring — the deployer EOA holds all roles, no timelock
-> handover. Deployed from **pre-GYL-1134/1135** scripts, so it lacks the NAV-age
-> ceiling and the fail-closed deploy guards; redeploy or upgrade if this instance is
-> kept. The `GTB8056` token implementation is an **evaluation build carrying the
-> since-dropped ERC-8056 display extension** — do not reuse that proxy for a new
+> handover. Deployed from **pre-GYL-1134/1135** scripts, so it lacks the fail-closed
+> deploy guards. It does **not** lack the NAV-age ceiling: `MAX_NAV_AGE_CEILING =
+> 72 hours` is present in the deployed contract (`46050ea`,
+> `contracts/GyldAtomicSwap.sol` L150) and enforced in both `initialize` (L274) and
+> `setMaxNavAgeSecs` (L618) — the gap is in the deploy scripts, not the contract.
+> Upgrading this instance onto `main` is **not** a like-for-like swap: two getters are
+> gone, four same-selector knobs changed behaviour, and the seeded quote-TTL slot needs
+> an explicit remedy. See the upgrade-hazard subsection under Sepolia generation 2 in
+> `DEPLOYMENTS.md`. The `GTB8056` token implementation is an **evaluation build carrying
+> the since-dropped ERC-8056 display extension** — do not reuse that proxy for a new
 > series.
 
 ### 14.2 Orphaned ERC-8056 evaluation artefacts — do not reuse

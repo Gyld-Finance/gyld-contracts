@@ -151,7 +151,22 @@ contract GyldAtomicSwap is
     ///      through a timelocked setMaxQuoteTtl. Reading through the fallback makes the
     ///      unset slot mean "use the audited default" instead of "reject everything",
     ///      so a fresh deploy and an upgraded proxy behave identically with no migration
-    ///      step to forget. See GyldAtomicSwap.upgrade.t.sol.
+    ///      step to forget. Pinned by the "Upgrade safety for the appended maxQuoteTtl
+    ///      slot (F-4)" tests in contracts/test/GyldAtomicSwap.t.sol.
+    ///
+    ///      ACCURACY NOTE — the KNOWN LIVE PROXY DOES NOT TAKE THIS FALLBACK. The
+    ///      zero-slot scenario above is real and the fallback is the correct design for
+    ///      it, but it does not describe the deployment we actually have. The Sepolia
+    ///      proxy 0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8 was deployed from commit
+    ///      46050ea, which ALREADY carried `maxQuoteTtl` in this ERC-7201 struct (same
+    ///      position, B+8) and DID seed it in `initialize` — that revision's
+    ///      DEFAULT_MAX_QUOTE_TTL was 1 hour. Its slot therefore reads 3600, not 0. On
+    ///      upgrade onto this implementation it never reaches `_effectiveMaxQuoteTtl`'s
+    ///      zero branch; it enforces a 1-hour cap. That is legal — exactly
+    ///      MAX_QUOTE_TTL_CEILING — but 4x laxer than the 15 minutes a fresh deploy gets,
+    ///      and NOTHING narrows it automatically: only an explicit, timelocked
+    ///      setMaxQuoteTtl(15 minutes). What that proxy predates is the BOUNDS
+    ///      (MAX_QUOTE_TTL_CEILING / InvalidQuoteTtl), not the slot.
     ///
     ///      15 minutes comfortably covers the quote service's issue-to-submit window
     ///      (spec S-4: expiry must be short-lived, near-term); the service itself issues
@@ -246,6 +261,12 @@ contract GyldAtomicSwap is
     ///      constant). Soft-pausing via the TTL was never usable anyway: setting it needs
     ///      the 48 h timelock, whereas `pause()` is a hot key and one block.
     ///      Enforced in setMaxQuoteTtl; initialize no longer writes the field at all.
+    ///
+    ///      Operational note: the known live Sepolia proxy predates these BOUNDS but not
+    ///      the slot — an older revision seeded `maxQuoteTtl` to 1 hour, which is exactly
+    ///      this ceiling. So it upgrades to a 1-hour effective cap rather than to the
+    ///      15-minute shipped default, and reaching the default takes a deliberate
+    ///      setMaxQuoteTtl(15 minutes) call. See DEFAULT_MAX_QUOTE_TTL.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 1 hours;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
@@ -371,6 +392,9 @@ contract GyldAtomicSwap is
     ///         maxQuoteTtl is deliberately NOT seeded — it is read through a fallback to
     ///         DEFAULT_MAX_QUOTE_TTL (15 min, F-4), so a fresh deploy and a proxy upgraded
     ///         across the field's addition enforce the same cap with no migration step.
+    ///         This applies to proxies whose slot was never written. A proxy that WAS
+    ///         seeded by an older revision keeps that seeded value — see the accuracy
+    ///         note on DEFAULT_MAX_QUOTE_TTL for the live Sepolia case.
     function initialize(
         address defaultAdmin,
         address pauser,
