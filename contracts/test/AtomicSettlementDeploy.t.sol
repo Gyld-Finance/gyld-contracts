@@ -9,6 +9,7 @@ import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
+import {NAVFeedForwarder} from "../NAVFeedForwarder.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {MockUSDCPermit} from "./MockUSDCPermit.sol";
 
@@ -397,5 +398,72 @@ contract AtomicSettlementDeployTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 0, "sanctioned taker received tokens");
+    }
+
+    // ── NAV staleness through the REAL feed → forwarder → swap chain ──────────
+
+    /// Every other StaleNav assertion in this repo drives MockNavForwarder.setUpdatedAt(),
+    /// which proves the swap's arithmetic but NOT that a real KaleidoscopeNAVFeed's
+    /// `updatedAt` actually reaches that guard. This suite is the only one wiring the real
+    /// feed → NAVFeedForwarder → swap triple, and it had no staleness coverage at all —
+    /// so an upstream that stopped forwarding `updatedAt` faithfully (returning
+    /// block.timestamp, or the round id, or zeroing it) would have gone unnoticed here.
+    ///
+    /// Reaching StaleNav legitimately takes care, because the swap checks quote expiry
+    /// BEFORE it reads the feed: `QuoteExpired` fires in executeSwap, `StaleNav` only
+    /// later inside `_checkQuoteBand`. Warping past the NAV window with a quote already
+    /// in hand therefore always yields QuoteExpired first, and no single quote can span
+    /// the gap anyway — MAX_NAV_AGE is 1 day while the TTL cap is 15 minutes.
+    ///
+    /// So: let real time pass WITHOUT the feed owner pushing a new NAV, then sign a FRESH
+    /// short-dated quote at the new timestamp. Both halves are real — a perfectly valid,
+    /// unexpired quote against a NAV nobody refreshed — which is exactly the production
+    /// failure mode (a dead NAV keeper) this guard exists for.
+    function test_executeSwap_realFeedNavStale_revertsStaleNav() public {
+        _seedInventoryAndLiquidity();
+
+        // setUp pushed the only NAV; nothing has refreshed it. Take the timestamp from the
+        // REAL forwarder rather than from block.timestamp: solc treats TIMESTAMP as
+        // invariant within a call frame and cheerfully re-materialises it after a
+        // vm.warp, so a cached `block.timestamp` local silently becomes the warped value.
+        (,,, uint256 navUpdatedAt,) = NAVFeedForwarder(forwarder).latestRoundData();
+        assertEq(navUpdatedAt, block.timestamp, "forwarder must surface the real feed's push time");
+
+        // Age the chain one second past maxNavAgeSecs with NO new NAV publication.
+        vm.warp(navUpdatedAt + MAX_NAV_AGE + 1);
+
+        // The forwarder still reports the ORIGINAL push time — that faithful propagation
+        // of the upstream's `updatedAt` is precisely what the mock-driven tests cannot prove.
+        (,,, uint256 staleUpdatedAt,) = NAVFeedForwarder(forwarder).latestRoundData();
+        assertEq(staleUpdatedAt, navUpdatedAt, "warping must not move the real feed's updatedAt");
+        assertEq(navFeed.stalenessSeconds(), MAX_NAV_AGE + 1, "feed should now be one second over the limit");
+
+        // A brand-new quote signed at the CURRENT timestamp: unexpired, inside the TTL
+        // cap, priced exactly at NAV. The only thing wrong with it is the feed's age.
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(42);
+        assertLt(block.timestamp, m.expiry, "quote must be live, or QuoteExpired would mask StaleNav");
+        assertLe(m.expiry - block.timestamp, swap.maxQuoteTtl(), "quote must sit inside the TTL cap");
+        bytes memory sig = _sign(m);
+
+        vm.prank(taker);
+        usdc.approve(address(swap), m.maxAmountIn);
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), staleUpdatedAt));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+
+        assertEq(token.balanceOf(taker), 0, "swap settled against a stale real NAV");
+        assertFalse(swap.isQuoteUsed(42), "a reverted swap must not burn the quoteId");
+
+        // Fail-closed, not fail-forever: the feed owner republishing NAV restores service
+        // on the very same wiring, which pins that the revert really was the age check.
+        vm.prank(navFeedOwner);
+        navFeed.updateAnswer(NAV);
+
+        GyldAtomicSwap.SwapMessage memory fresh = _buyQuote(43);
+        bytes memory freshSig = _sign(fresh);
+        vm.prank(taker);
+        swap.executeSwap(fresh, freshSig, _noPermit(), fresh.maxAmountIn);
+        assertEq(token.balanceOf(taker), 10e18, "a refreshed real NAV must let the same wiring settle");
     }
 }
