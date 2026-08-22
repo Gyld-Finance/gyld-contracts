@@ -117,11 +117,12 @@ contract DeployGuardsTest is Test {
 /// @title DeployScriptsTest
 /// @notice Executes the deploy scripts themselves — nothing in the suite did before.
 ///
-/// Every scenario below is calibrated against THE CONFIGURATION THAT IS LIVE ON A
-/// PRODUCTION L2 TODAY (GYL-1135): a TimelockController with `delay = 0` whose sole proposer is
-/// the deployer EOA, and `IssuanceManager.initialize(deployer, deployer, deployer)` with
-/// no hand-over at all. Each `_reject…` scenario feeds the scripts one slice of that
-/// configuration and asserts they now refuse to deploy it.
+/// Every scenario below is calibrated against THE CONFIGURATION A PRODUCTION-L2 DEMO
+/// STACK WAS ONCE DEPLOYED WITH (GYL-1135): a TimelockController with `delay = 0` whose
+/// sole proposer is the deployer EOA, and `IssuanceManager.initialize(deployer, deployer,
+/// deployer)` with no hand-over at all. That stack has since been retired and is not
+/// tracked (DEPLOYMENTS.md is the register). Each `_reject…` scenario feeds the scripts
+/// one slice of that configuration and asserts they now refuse to deploy it.
 ///
 /// ── Why this is ONE test function ─────────────────────────────────────────────
 /// `forge test` (1.5.x) executes the test functions of a suite IN PARALLEL, while
@@ -235,8 +236,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     }
 
     /// Catches: `TIMELOCK_DELAY_SECONDS=0` on a production chain — the single value that
-    /// turned the live production timelock into a rubber stamp, and what `.env.example` shipped
-    /// on line 2. The old guard (`block.chainid == 31337 ? 0 : 172800`) had no floor at all.
+    /// turned the incident stack's timelock into a rubber stamp, and what `.env.example`
+    /// shipped on line 2. The old guard (`block.chainid == 31337 ? 0 : 172800`) had no
+    /// floor at all.
     function reject_devNet_zeroTimelockDelayOnProdL2() external {
         vm.chainId(PROD_L2);
         _devNetProdEnv();
@@ -513,7 +515,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// the timelock really does hold DEFAULT_ADMIN and the deployer really was revoked —
     /// but the timelock has `delay = 0` and the deployer is its proposer, so the deployer
     /// can still execute anything instantly. Role-level assertions all pass here; only
-    /// {DeployGuards.assertTimelockSane} catches it. This is the live incident timelock.
+    /// {DeployGuards.assertTimelockSane} catches it. This is the incident timelock.
     function reject_atomic_cosmeticZeroDelayTimelock() external {
         vm.chainId(PROD_L2);
         _atomicProdEnv();

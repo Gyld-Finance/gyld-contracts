@@ -15,8 +15,8 @@ import {MockNavForwarder} from "./MockNavForwarder.sol";
 // ─────────────────────────────────────────────────────────────────────────────
 // Fuzz + invariant coverage for GyldAtomicSwap.
 //
-// The audit-prep checklist (lib/gyld-contracts/docs/ARCHITECTURE.md) flags
-// the absence of a stateful invariant suite over executeSwap as outstanding.
+// The audit-prep checklist (docs/ARCHITECTURE.md) flags the absence of a
+// stateful invariant suite over executeSwap as outstanding.
 // These tests prove the two load-bearing conservation properties that make the
 // self-custodial swap safe:
 //

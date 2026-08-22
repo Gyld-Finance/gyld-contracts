@@ -1,8 +1,14 @@
 # Continuous Integration
 
-GitHub Actions, defined in `.github/workflows/ci.yml`. Runs on every push, every
-pull request, and on manual dispatch. No job uses a secret, an RPC URL, or a
-private key — the workflow is structurally unable to broadcast anything: there
+GitHub Actions, defined in `.github/workflows/ci.yml`. Runs on every pull
+request, on every push to `main`, and on manual dispatch. `push` is filtered to
+`main` deliberately: an unfiltered `push` fires alongside `pull_request` for
+every commit on a same-repo PR branch, and because the concurrency group keys on
+`github.event_name` the two runs do not cancel each other — every such commit
+paid for two full builds. A PR branch is now covered exactly once, by
+`pull_request`.
+
+No job uses a secret, an RPC URL, or a private key — the workflow is structurally unable to broadcast anything: there
 is no key material on the runner, the test suite contains no fork cheatcodes,
 and `GITHUB_TOKEN` is `contents: read`. If a future job needs a secret, put it
 in a separate workflow so this one stays trustless.
@@ -11,20 +17,20 @@ in a separate workflow so this one stays trustless.
 
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
-| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`, 535 tests across 20 suites) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
+| `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`; 536 tests across 20 suites as of 2026-08-22, confirmed with `forge test --list`) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
 | `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — a production L2 satisfies `!= 1`, so a zero-delay timelock and a bare-EOA admin sail onto a live chain unopposed. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
 | `test` (step) | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff — and NEITHER reached `main`. This check does not replace that review; it **forces** it, by turning a subtle Solidity diff into an explicit `ci/storage-layouts/` diff a reviewer cannot skim past, and giving an auditor a concrete artifact to read before an upgrade. The audit remains the thing that decides whether a layout change is safe. See "Storage layout" below |
 
-## Why full fuzz intensity on every push
+## Why full fuzz intensity on every run
 
 Measured on a cold build (Apple Silicon, forge 1.5.1): `via_ir` compile 35 s,
 full-intensity `forge test` **16 s** wall (48 s CPU). Even at the usual 2–3×
 slowdown of a GitHub-hosted runner plus recursive submodule checkout, the whole
 job lands well under ~5 minutes cold and less warm (build artifacts are
 cached). Reducing fuzz runs would save seconds and cost coverage, so nothing is
-dialled down and there is no separate nightly: every push gets the same
+dialled down and there is no separate nightly: every run gets the same
 scrutiny. If suite runtime ever grows past ~10 minutes, split intensity then —
-reduced per-push via `FOUNDRY_FUZZ_RUNS` / `FOUNDRY_INVARIANT_RUNS` env
+reduced per-run via `FOUNDRY_FUZZ_RUNS` / `FOUNDRY_INVARIANT_RUNS` env
 overrides, full on a schedule.
 
 ## Storage layout
@@ -291,8 +297,9 @@ CI log if you need the exact case.
   (e.g. `contracts/NAVFeedForwarder.sol`), so the check would start red and get
   ignored. Adopt after a dedicated `forge fmt` commit, not before.
 - **`forge build --deny-warnings`** — two live solc warnings (state mutability,
-  `contracts/test/GyldAtomicSwap.halmos.t.sol:235` and
-  `contracts/test/GyldAtomicSwap.spec.t.sol:599`) plus ~40 `forge lint` notes
+  restrictable to `view` at `contracts/test/GyldAtomicSwap.halmos.t.sol:235` and
+  to `pure` at `contracts/test/GyldAtomicSwap.spec.t.sol:608`) plus ~45
+  `forge lint` notes
   (`erc20-unchecked-transfer`, `unsafe-typecast`). Same rule: fix first, then
   enforce, otherwise the job starts red.
 - **`openzeppelin-foundry-upgrades` (`Upgrades.validateUpgrade`)** — considered

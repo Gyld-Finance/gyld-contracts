@@ -70,28 +70,34 @@ renounceable, and what a compromise of each buys — is
 
 ## Deployment flow (per bond series)
 
-```
-1. Deploy SanctionsOracleMirror     (once per chain)
-2. Deploy IssuanceManager           (once, shared across all series)
-3. Deploy GyldBondToken implementation + TokenFactory
-4. Grant REGISTRAR_ROLE on IssuanceManager → TokenFactory
-5. Deploy TimelockController (delay >= 48 h) and hand over:
-     IssuanceManager DEFAULT_ADMIN_ROLE → timelock  (deployer revoked)
-     TokenFactory ownership             → timelock  (2-step; timelock must accept)
-6. Via the timelock: TokenFactory.deployToken(name, symbol, isin, maturity,
-                                             operator, issuanceManager, navFeedOwner)
-     ├─ GyldBondToken proxy      (CREATE2 from keccak256("token" ++ keccak256(isin ++ chainId)))
-     ├─ KaleidoscopeNAVFeed      (owner = navFeedOwner / KMS signer)
-     ├─ NAVFeedForwarder         (owner = factory.owner() = timelock)
-     ├─ wires the token's roles, self-revoking its own
-     └─ registers the token in IssuanceManager
-7. Push the first NAV, then point Morpho Blue / Euler / Aave at NAVFeedForwarder
-```
+The full 13-step sequence — every constructor argument, every role grant, and the
+atomic-settlement tail — is
+[`docs/ARCHITECTURE.md` §13.6](docs/ARCHITECTURE.md#136-per-series-deployment-sequence),
+and is maintained there only. In outline: deploy `SanctionsOracleMirror` (once per
+chain), then the shared `IssuanceManager`, then the `GyldBondToken` implementation
+and `TokenFactory`; grant the factory `REGISTRAR_ROLE`; deploy a
+`TimelockController` (delay >= 48 h) and hand it both the `IssuanceManager` admin
+role and factory ownership. Then, per series, a single timelocked
+`TokenFactory.deployToken(...)` deploys the
+`(GyldBondToken proxy, KaleidoscopeNAVFeed, NAVFeedForwarder)` triple atomically,
+wires the token's roles while self-revoking its own, and registers the token with
+the `IssuanceManager`. Finally push the first NAV and point DeFi markets at the
+**forwarder** address — never at `KaleidoscopeNAVFeed` directly.
 
-**Ordering matters:** factory ownership must move to the timelock *before*
-`deployToken`, because `_wireRoles` grants `DEFAULT_ADMIN_ROLE` on each token to
-`owner()` as it is at that moment. Deploy first and the deployer EOA becomes the
-token admin permanently.
+**Four ordering constraints bite if violated:**
+
+- The factory must hold `REGISTRAR_ROLE` on the `IssuanceManager` **before**
+  `deployToken`. The preflight reverts `MissingRegistrarRole` rather than wasting
+  four deployments.
+- Factory ownership must move to the timelock **before** `deployToken`, because
+  `_wireRoles` grants `DEFAULT_ADMIN_ROLE` on each token to `owner()` *as it is at
+  that moment*. Deploy first and the deployer EOA becomes the token admin
+  permanently.
+- A NAV must be pushed **before** the series is registered with the swap or with
+  any DeFi market. `executeSwap` fails closed on a non-positive or stale NAV, and
+  on a fresh feed `latestAnswer()` reverts `NoPriceSet` — it does not return 0.
+- `ALLOWLIST_ADMIN_ROLE` must be granted **before** the deployer's
+  `DEFAULT_ADMIN_ROLE` is revoked, or granting it later needs a timelock proposal.
 
 Token addresses are deterministic — `TokenFactory.predictTokenAddress()` returns the
 proxy address before deployment. The CREATE2 salt is derived from the ISIN **and**
@@ -133,7 +139,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 535 tests, 20 suites; fuzz runs = 10000
+forge test                  # 536 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage
 
@@ -153,12 +159,12 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 535 tests across 20 suites, all at full `foundry.toml` intensity.
+`forge test` — 536 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|
 | `GyldAtomicSwap.t.sol` | Quote execution both directions, expiry, epoch, replay, signer, taker binding, allowlist, permit, pause, withdrawal |
-| `GyldAtomicSwap.spec.t.sol` | The numbered invariant / finding catalogue (I-1…I-24, F-1…F-7) |
+| `GyldAtomicSwap.spec.t.sol` | The executable form of the numbered invariant / finding catalogue. [`docs/ARCHITECTURE.md` §16.2](docs/ARCHITECTURE.md#162-the-gyldatomicswap-invariant-catalogue) is the catalogue itself, and records per id which are pinned here and which are gaps |
 | `GyldAtomicSwap.invariants.t.sol` | Stateful: never-mints, single-use quotes, fair-price rounding |
 | `GyldAtomicSwap.halmos.t.sol` | Halmos symbolic verification of I-1, I-2, I-3, I-10, I-11 (`check_` prefix; `forge test` skips these) |
 | `GyldBondToken.t.sol` | Transfer, sanctions, pause, permit, role management, storage slot-pinning, UUPS upgrade, IERC-1643 document management |
@@ -181,7 +187,7 @@ at the root.
 | Document | Contents |
 |---|---|
 | [`DEPLOYMENTS.md`](DEPLOYMENTS.md) | **The authoritative on-chain address register.** The only place an address is canonical; if a contract is not listed there, do not send funds to it, approve it or wire it into a config. |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **The authoritative reference.** Every contract, the complete role and permission matrix, custody and loss ceilings, value accrual, both settlement flows, compliance, oracle design, deployment model, deployed addresses, Morpho / Euler / Aave / ERC-4626 integration parameters, the verification surface, the decision record, known gaps, and a log of documentation claims found false against the code. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **The authoritative reference.** Every contract, the complete role and permission matrix, custody and loss ceilings, value accrual, both settlement flows, compliance, oracle design, deployment model, DeFi integration rules (oracle shape, staleness behaviour, ERC-4626), the verification surface, the decision record, known gaps, and a log of documentation claims found false against the code. |
 | [`docs/ci.md`](docs/ci.md) | What CI runs and why, what was considered and rejected, how to reproduce a failure locally. Referenced directly by `.github/workflows/ci.yml`. |
 | [`docs/atomic-settlement-testnet-runbook.md`](docs/atomic-settlement-testnet-runbook.md) | Deployment runbook and readiness assessment for taking the `GyldAtomicSwap` stack to a public testnet, including the fresh-deploy checklist. |
 | [`docs/decisions/erc8056-dropped-on-evm.md`](docs/decisions/erc8056-dropped-on-evm.md) | Standing ADR: why ERC-8056 (Scaled UI Amount) was dropped on EVM. Kept dated and separate so the decision is not re-litigated. |

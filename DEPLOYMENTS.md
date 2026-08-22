@@ -75,6 +75,22 @@ Two generations coexist. **Do not mix them.**
 | GyldAtomicSwap (implementation) | `0x287edc0d5F6d3D07beBD0390509C88Fc50a8f79b` | 46050ea | — | Yes (Blockscout) | live (test) |
 | GyldAtomicSwap (ERC1967 proxy, CREATE2) | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` | 46050ea | DEFAULT_ADMIN_ROLE = deployer EOA (all init roles set to deployer) | Yes (Blockscout) | live (test) — settlement asset is Circle Sepolia USDC `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
 
+#### These testnet instances are not current source, and are not tracked as such
+
+They were built from commits that predate the GYL-1134/1135 hardening, so they
+behave differently from `main`. **How they differ is deliberately not enumerated
+anywhere in this repository.** They are demonstrations, **nothing is live on
+mainnet**, production will be a fresh deployment, and current source is the
+reference for anything new. Read `contracts/` for what a new deployment does; do
+not reason about it from one of these instances, and do not reason about one of
+these instances from `contracts/`.
+
+> **Deploy fresh. Do not upgrade one of these into service.** An upgrade is not
+> like-for-like: it changes the ABI, and storage values seeded by the older
+> initializer survive it, so the upgraded proxy can silently keep a laxer limit than
+> a fresh deployment would get. There is no upgrade script in this repo, and
+> `_authorizeUpgrade` on these proxies is gated on a deployer EOA with no timelock.
+
 ---
 
 ## BSC testnet (chainId 97)
@@ -103,13 +119,12 @@ GYL-1201; the record is kept as history, reachable via tag
   mattered: `feat/GYL-1135-hardening` was deleted when PR #2 merged, so branch
   deletion is routine here. The tag message carries the address list and the
   do-not-upgrade caveats.
-- Bytecode check confirming the gap: the current working tree builds a
-  GyldBondToken runtime of 13,202 bytes (ERC-1643 added ~1.9 KB in `c1f240f`);
-  the live Sepolia/BSC implementations are 13,184 bytes.
-  Current source still does **not** reproduce any deployed implementation — but
-  read that conclusion carefully now: the margin against the live 13,184 is
-  **18 bytes**, not two kilobytes. Size is no longer evidence either way here;
-  only a bytecode comparison settles it.
+- **Do not identify a deployed implementation by bytecode size.** The current
+  working tree builds a GyldBondToken runtime of 13,202 bytes; the deployed
+  Sepolia/BSC implementations are 13,184. An 18-byte margin is not evidence of
+  anything either way. The **source commit** column above, backed by the tag, is
+  how a deployed implementation is identified here — not a size comparison, and
+  not a reading of current `contracts/`.
 
 ## Known hazards, in one place
 
