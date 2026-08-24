@@ -162,7 +162,7 @@ contract GyldAtomicSwapSpecTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(token),
             price: 1e28,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -180,7 +180,7 @@ contract GyldAtomicSwapSpecTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(usdc),
             price: 100e6,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -1126,10 +1126,10 @@ contract GyldAtomicSwapSpecTest is Test {
     /// The ceiling itself is accepted — the bound is inclusive. The ceiling sits ABOVE
     /// DEFAULT_MAX_QUOTE_TTL, so the knob is genuinely two-way: the TTL can be tuned
     /// operationally in either direction without an upgrade, while the catastrophic
-    /// setting (anything past one NAV publication epoch) stays unreachable.
+    /// setting (anything past the 10-minute incident headroom) stays unreachable.
     function test_setMaxQuoteTtl_ceilingExactlyIsAccepted() public {
         uint64 ceiling = swap.MAX_QUOTE_TTL_CEILING();
-        assertEq(ceiling, 1 hours, "ceiling must match one NAV publication epoch");
+        assertEq(ceiling, 10 minutes, "ceiling must be the 10-minute incident headroom");
         assertGt(ceiling, swap.DEFAULT_MAX_QUOTE_TTL(), "the default must leave room to tune upward");
 
         vm.prank(admin);
@@ -1207,7 +1207,7 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, tenYears));
         swap.setMaxQuoteTtl(tenYears);
 
-        // Attempt 3: a merely "operationally convenient" 1 day — still 24x the audited cap.
+        // Attempt 3: a merely "operationally convenient" 1 day — still 144x the ceiling.
         vm.prank(rogueAdmin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(1 days)));
         swap.setMaxQuoteTtl(1 days);
@@ -1218,7 +1218,7 @@ contract GyldAtomicSwapSpecTest is Test {
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
         assertLe(swap.maxQuoteTtl(), ceiling);
 
-        // The widest the admin CAN go is 1 hour — apply it, to prove expiry still bites
+        // The widest the admin CAN go is 10 minutes — apply it, to prove expiry still bites
         // even at maximum permitted laxity.
         vm.prank(rogueAdmin);
         swap.setMaxQuoteTtl(ceiling);
@@ -1278,7 +1278,7 @@ contract GyldAtomicSwapSpecTest is Test {
             maxAmountIn: 1_000e6,
             tokenOut: address(evil),
             price: 1e28,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         // The re-entrant call dies on the guard (the FIRST modifier), so the message and
@@ -1578,7 +1578,7 @@ contract GyldAtomicSwapSpecTest is Test {
             maxAmountIn: 1_000e6,
             tokenOut: address(token),
             price: 1e28,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         bytes memory sig = _signFor(s, m, SIGNER_PK);
@@ -1662,7 +1662,7 @@ contract GyldAtomicSwapSpecTest is Test {
     function test_executeSwap_quoteExpiryTtlBound_inclusiveEdge() public {
         _approveTaker();
         uint64 ttl = swap.maxQuoteTtl();
-        assertEq(ttl, 15 minutes, "spec: the effective cap is the DEFAULT_MAX_QUOTE_TTL fallback");
+        assertEq(ttl, 90 seconds, "spec: the effective cap is the DEFAULT_MAX_QUOTE_TTL fallback");
 
         GyldAtomicSwap.SwapMessage memory atEdge = _buyQuote(24, 1_000e6);
         atEdge.expiry = uint64(block.timestamp + ttl);
@@ -1690,18 +1690,18 @@ contract GyldAtomicSwapSpecTest is Test {
         _approveTaker();
         vm.prank(outsider);
         vm.expectRevert();
-        swap.setMaxQuoteTtl(5 minutes);
+        swap.setMaxQuoteTtl(30 seconds);
 
         vm.prank(admin);
-        swap.setMaxQuoteTtl(5 minutes);
-        assertEq(swap.maxQuoteTtl(), 5 minutes);
+        swap.setMaxQuoteTtl(30 seconds);
+        assertEq(swap.maxQuoteTtl(), 30 seconds);
 
-        GyldAtomicSwap.SwapMessage memory m = _buyQuote(26, 1_000e6); // expiry = +15 min
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(26, 1_000e6); // expiry = +60 s, i.e. beyond the 30 s cap just set
         bytes memory sig = _sign(m);
         vm.prank(taker);
         vm.expectRevert(
             abi.encodeWithSelector(
-                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 5 minutes)
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 30 seconds)
             )
         );
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);

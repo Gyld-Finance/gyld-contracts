@@ -176,7 +176,8 @@ contract AtomicSettlementFlow is Script {
             maxAmountIn: 1_000e6, // pays up to 1,000 USDC
             tokenOut: address(token),
             price: 10e18 * 1e18 / 1_000e6, // 10 bond tokens per 1,000 USDC (exactly at NAV)
-            expiry: uint64(block.timestamp + 15 minutes),
+            // Inside GyldAtomicSwap.DEFAULT_MAX_QUOTE_TTL (90s), with slack to spare.
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         bytes memory buySig = _sign(swap, SIGNER_PK, buy);
@@ -209,7 +210,8 @@ contract AtomicSettlementFlow is Script {
             maxAmountIn: 10e18, // pays back up to 10 bond tokens
             tokenOut: address(usdc),
             price: 1_000e6 * 1e18 / 10e18, // 1,000 USDC per 10 bond tokens (exactly at NAV)
-            expiry: uint64(block.timestamp + 15 minutes),
+            // Inside GyldAtomicSwap.DEFAULT_MAX_QUOTE_TTL (90s), with slack to spare.
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         bytes memory redeemSig = _sign(swap, SIGNER_PK, redeem);

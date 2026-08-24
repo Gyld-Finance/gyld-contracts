@@ -149,7 +149,7 @@ contract GyldAtomicSwapTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(token),
             price: 1e28, // amountOut per 1e18 tokenIn: 10e18 tokens / 1_000e6 USDC * 1e18
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -172,7 +172,7 @@ contract GyldAtomicSwapTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(usdc),
             price: 100e6, // amountOut per 1e18 tokenIn: 1_000e6 USDC / 10e18 tokens * 1e18
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -637,7 +637,7 @@ contract GyldAtomicSwapTest is Test {
             maxAmountIn: 1_019e6,
             tokenOut: address(token),
             price: price,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         bytes memory sig = _sign(m, SIGNER_PK);
@@ -658,7 +658,7 @@ contract GyldAtomicSwapTest is Test {
             maxAmountIn: 1_021e6,
             tokenOut: address(token),
             price: price,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         uint256 amountOut = _impliedAmountOut(m, m.maxAmountIn);
@@ -1025,8 +1025,8 @@ contract GyldAtomicSwapTest is Test {
     /// GYL-1135: setMaxQuoteTtl previously had no validation at all.
     function test_setMaxQuoteTtl_aboveCeiling_reverts() public {
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(1 hours + 1)));
-        swap.setMaxQuoteTtl(1 hours + 1);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, uint64(10 minutes + 1)));
+        swap.setMaxQuoteTtl(10 minutes + 1);
 
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteTtl.selector, type(uint64).max));
@@ -1047,7 +1047,7 @@ contract GyldAtomicSwapTest is Test {
     /// "Upgrade safety for the appended maxQuoteTtl slot (F-4)" section at the bottom of
     /// this file. The getter reports the effective value.
     function test_initialize_leavesTtlSlotUnsetAndFallsBackToDefault() public view {
-        assertEq(swap.maxQuoteTtl(), 15 minutes);
+        assertEq(swap.maxQuoteTtl(), 90 seconds);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
     }
 
@@ -1059,19 +1059,19 @@ contract GyldAtomicSwapTest is Test {
 
     function test_setMaxQuoteTtl_updatesAndEmits() public {
         vm.expectEmit(false, false, false, true, address(swap));
-        emit MaxQuoteTtlUpdated(5 minutes);
+        emit MaxQuoteTtlUpdated(30 seconds);
         vm.prank(admin);
-        swap.setMaxQuoteTtl(5 minutes);
-        assertEq(swap.maxQuoteTtl(), 5 minutes);
+        swap.setMaxQuoteTtl(30 seconds);
+        assertEq(swap.maxQuoteTtl(), 30 seconds);
 
-        // A 10-minute quote was legal under the 15-minute default but is now too far out.
+        // A 60-second quote was legal under the 90-second default but is now too far out.
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(72);
-        m.expiry = uint64(block.timestamp + 10 minutes);
+        m.expiry = uint64(block.timestamp + 60 seconds);
         bytes memory sig = _sign(m, SIGNER_PK);
         vm.prank(taker);
         vm.expectRevert(
             abi.encodeWithSelector(
-                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 5 minutes)
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, m.expiry, uint64(block.timestamp + 30 seconds)
             )
         );
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
@@ -1083,16 +1083,17 @@ contract GyldAtomicSwapTest is Test {
     /// zero-seconds, every real quote reverts QuoteExpiryTooFar.
     function test_setMaxQuoteTtl_zeroResetsToDefaultRatherThanBricking() public {
         vm.prank(admin);
-        swap.setMaxQuoteTtl(5 minutes);
-        assertEq(swap.maxQuoteTtl(), 5 minutes);
+        swap.setMaxQuoteTtl(30 seconds);
+        assertEq(swap.maxQuoteTtl(), 30 seconds);
 
         vm.prank(admin);
         swap.setMaxQuoteTtl(0);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL(), "zero must fall back, not disable");
 
-        // And a normal quote still settles at the restored default.
+        // And a normal quote still settles at the restored default — one that the 30s
+        // cap set a moment ago would have rejected, so this proves the reset took effect.
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(73);
-        m.expiry = uint64(block.timestamp + 10 minutes);
+        m.expiry = uint64(block.timestamp + 60 seconds);
         bytes memory sig = _sign(m, SIGNER_PK);
         vm.prank(taker);
         usdc.approve(address(swap), 1_000e6);
@@ -1182,7 +1183,7 @@ contract GyldAtomicSwapTest is Test {
             maxAmountIn: 1_000e6,
             tokenOut: address(evil),
             price: 1e28, // 10e18 EVIL per 1_000e6 USDC
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
         bytes memory sig = _sign(m, SIGNER_PK);
@@ -1411,7 +1412,7 @@ contract GyldAtomicSwapTest is Test {
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
 
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(901);
-        m.expiry = uint64(block.timestamp + 10 minutes);
+        m.expiry = uint64(block.timestamp + 60 seconds);
         bytes memory sig = _sign(m, SIGNER_PK);
         vm.prank(taker);
         usdc.approve(address(swap), 2_000e6);
@@ -1421,12 +1422,12 @@ contract GyldAtomicSwapTest is Test {
 
         // The cap is still enforced at the fallback value, not disabled.
         GyldAtomicSwap.SwapMessage memory tooFar = _buyQuote(902);
-        tooFar.expiry = uint64(block.timestamp + 15 minutes + 1);
+        tooFar.expiry = uint64(block.timestamp + 90 seconds + 1);
         bytes memory farSig = _sign(tooFar, SIGNER_PK);
         vm.prank(taker);
         vm.expectRevert(
             abi.encodeWithSelector(
-                GyldAtomicSwap.QuoteExpiryTooFar.selector, tooFar.expiry, uint64(block.timestamp + 15 minutes)
+                GyldAtomicSwap.QuoteExpiryTooFar.selector, tooFar.expiry, uint64(block.timestamp + 90 seconds)
             )
         );
         swap.executeSwap(tooFar, farSig, _noPermit(), tooFar.maxAmountIn);
@@ -1457,7 +1458,7 @@ contract GyldAtomicSwapTest is Test {
         // And the TTL guard is live at the fallback rather than bricked at zero.
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
         GyldAtomicSwap.SwapMessage memory after_ = _buyQuote(904);
-        after_.expiry = uint64(block.timestamp + 10 minutes);
+        after_.expiry = uint64(block.timestamp + 60 seconds);
         bytes memory afterSig = _sign(after_, SIGNER_PK);
         vm.prank(taker);
         swap.executeSwap(after_, afterSig, _noPermit(), after_.maxAmountIn);
