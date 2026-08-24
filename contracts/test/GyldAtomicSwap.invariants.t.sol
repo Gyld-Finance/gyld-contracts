@@ -117,7 +117,7 @@ contract SwapFuzzTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(token),
             price: 1e28, // 10e18 tokens per 1_000e6 USDC at NAV
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -134,7 +134,7 @@ contract SwapFuzzTest is Test {
             maxAmountIn: maxAmountIn,
             tokenOut: address(usdc),
             price: 100e6, // 1_000e6 USDC per 10e18 tokens at NAV
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -313,7 +313,7 @@ contract SwapHandler is CommonBase, StdCheats, StdUtils {
             maxAmountIn: maxAmountIn,
             tokenOut: address(token),
             price: 1e28,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
 
@@ -338,7 +338,7 @@ contract SwapHandler is CommonBase, StdCheats, StdUtils {
             maxAmountIn: maxAmountIn,
             tokenOut: address(usdc),
             price: 100e6,
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
 

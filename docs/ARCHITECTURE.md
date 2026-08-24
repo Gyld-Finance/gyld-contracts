@@ -827,8 +827,8 @@ struct PermitData { uint256 value; uint256 deadline; uint8 v; bytes32 r; bytes32
 | `SWAP_MESSAGE_TYPEHASH` | `0x87423ed2b6ce38b5c2943920bccdd1f9e50d2e0493f61560b2302e7508b52f0b` |
 | `MIN_DRAW_BPS` | 100 → a **1 % dust floor** on `requestedAmountIn` relative to `maxAmountIn` |
 | `BPS_DENOMINATOR` | 10_000 |
-| `DEFAULT_MAX_QUOTE_TTL` | **15 minutes** — the *fallback* for `maxQuoteTtl`, **not** a seed. `initialize` deliberately leaves the slot unset; `_effectiveMaxQuoteTtl` returns this constant whenever the slot reads zero, which is what keeps a proxy upgraded across the field's addition working (see below) |
-| `MAX_QUOTE_TTL_CEILING` | **1 hour** — structural upper bound on `maxQuoteTtl`, anchored to one NAV publication epoch (`KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL`) |
+| `DEFAULT_MAX_QUOTE_TTL` | **90 seconds** — the *fallback* for `maxQuoteTtl`, **not** a seed. `initialize` deliberately leaves the slot unset; `_effectiveMaxQuoteTtl` returns this constant whenever the slot reads zero, which is what keeps a proxy upgraded across the field's addition working (see below) |
+| `MAX_QUOTE_TTL_CEILING` | **10 minutes** — structural upper bound on `maxQuoteTtl`. It is deliberately far above the 90-second default: the ceiling is the headroom an admin can reach through a timelocked `setMaxQuoteTtl` during an incident, and because it is a `constant`, widening it later would need a new implementation and a proxy upgrade |
 | `MAX_NAV_AGE_CEILING` | **72 hours** — structural upper bound on `maxNavAgeSecs` |
 
 The typehash was verified by recomputation:
@@ -969,7 +969,7 @@ anyway: setting it requires the 48 h timelock, whereas `pause()` is a hot key
 > three admin-tunable bounds are structurally capped: `MAX_NAV_AGE_CEILING` (**72 h**,
 > `InvalidNavAge`), `MAX_QUOTE_DEVIATION_BPS_CEILING` (**1000 bps = 10 %**,
 > `InvalidDeviationBps`, enforced in both `initialize` and
-> `setMaxQuoteDeviationBps`) and `MAX_QUOTE_TTL_CEILING` (**1 h**,
+> `setMaxQuoteDeviationBps`) and `MAX_QUOTE_TTL_CEILING` (**10 min**,
 > `InvalidQuoteTtl`, enforced in `setMaxQuoteTtl`; zero stays legal and still means
 > *unset* → fall back to `DEFAULT_MAX_QUOTE_TTL`). Before that, the deviation band
 > was bounded only by `BPS_DENOMINATOR` — a ±100 % band, which admits any price from
@@ -1404,7 +1404,7 @@ BUY, worked end to end
 | **Taker allowlist** (`allowed[msg.sender]`, `ALLOWLIST_ADMIN_ROLE`) | An un-onboarded address executing at all, even with a validly signed quote. |
 | **Single-use `quoteId`** (BitInvalidator, consumed *before* any transfer) | Replay, including replay on a different leg inside the expiry window. 256 quotes per storage slot. |
 | **Quote expiry** | Sitting on a favourable price while NAV moves. The TTL policy itself (~60 s class) is off-chain; the chain checks the timestamp. |
-| **TTL bound** (`expiry <= now + maxQuoteTtl`, default **15 min**) | A long-dated quote from a buggy or compromised signer. Such a quote is an **American option**: the taker holds a frozen price and picks the moment within its life when that price is most favourable to them, so the leak costs close to the full `maxQuoteDeviationBps` width rather than a fraction of it. Note this guard does **not** protect the NAV band — `_checkQuoteBand` re-reads the feed live on every execution — and it is **not** the only containment faster than the timelock: `pause()` (`PAUSER_ROLE`) and `setAllowed(taker,false)` (`ALLOWLIST_ADMIN_ROLE`) both act in one block on hot keys, and quotes are taker-bound. What the TTL bounds is the window before anyone *notices* (F-4). |
+| **TTL bound** (`expiry <= now + maxQuoteTtl`, default **90 s**) | A long-dated quote from a buggy or compromised signer. Such a quote is an **American option**: the taker holds a frozen price and picks the moment within its life when that price is most favourable to them, so the leak costs close to the full `maxQuoteDeviationBps` width rather than a fraction of it. Note this guard does **not** protect the NAV band — `_checkQuoteBand` re-reads the feed live on every execution — and it is **not** the only containment faster than the timelock: `pause()` (`PAUSER_ROLE`) and `setAllowed(taker,false)` (`ALLOWLIST_ADMIN_ROLE`) both act in one block on hot keys, and quotes are taker-bound. What the TTL bounds is the window before anyone *notices* (F-4). |
 | **`quoteEpoch` mass-kill** (`bumpQuoteEpoch`, admin) | Signer-key compromise: one transaction invalidates every outstanding quote (the 1inch epoch pattern). |
 | **NAV band** (`maxQuoteDeviationBps`) | A fully compromised quote signer. Even a valid signature moves price at most ±2 % off on-chain NAV per trade, and the feed is written by a *different* key under a ±10 %/hour cap — one stolen key cannot both move the reference and exploit the band. `setMaxQuoteDeviationBps(0)` is a documented on-chain soft-pause. |
 | **`StaleNav`, ceilinged at 72 h** | Pricing against a NAV nobody refreshed. The only staleness defence in the path, since the feed never reverts. |
@@ -2194,7 +2194,7 @@ Remediated findings:
 |---|---|---|
 | **F-1** (was O-4) | The `/1e20` decimal ladder was an operational convention only | `initialize` probes USDC `decimals() == 6`; `registerSeries` probes forwarder `== 8` and bond token `== 18` |
 | **F-3** | The usage bitmap is not epoch-scoped, so id reuse after a bump would silently break | Documented invariant I-5 + test; the quote service must use one monotonic counter |
-| **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **15 min**, ceiling 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
+| **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **90 s**, ceiling 10 min) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
 | **F-6** | A future-dated `updatedAt` satisfies `now > updatedAt + maxAge` forever | Explicit `updatedAt > block.timestamp` → `StaleNav`; plus the forwarder's configuration-time probe |
 | **F-7** | A sole `PAUSER`/`TREASURER` holder could renounce, removing the halt and the paused-state evacuation path | **Rejected, not implemented.** The guard was inert (the admin administers both roles and re-grants in one tx; `renounceRole` is self-only; both roles are M-of-N in production) and mildly harmful — it blocked a holder with a known-compromised key from shedding it immediately. See §Non-renounceable roles. |
 

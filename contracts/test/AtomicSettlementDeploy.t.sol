@@ -161,7 +161,7 @@ contract AtomicSettlementDeployTest is Test {
             maxAmountIn: 1_000e6,
             tokenOut: address(token),
             price: 10e18 * 1e18 / 1_000e6, // 10e18 tokenOut per 1_000e6 tokenIn
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -175,7 +175,7 @@ contract AtomicSettlementDeployTest is Test {
             maxAmountIn: 10e18,
             tokenOut: address(usdc),
             price: 1_000e6 * 1e18 / 10e18, // 1_000e6 tokenOut per 10e18 tokenIn
-            expiry: uint64(block.timestamp + 15 minutes),
+            expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
@@ -413,7 +413,7 @@ contract AtomicSettlementDeployTest is Test {
     /// BEFORE it reads the feed: `QuoteExpired` fires in executeSwap, `StaleNav` only
     /// later inside `_checkQuoteBand`. Warping past the NAV window with a quote already
     /// in hand therefore always yields QuoteExpired first, and no single quote can span
-    /// the gap anyway — MAX_NAV_AGE is 1 day while the TTL cap is 15 minutes.
+    /// the gap anyway — MAX_NAV_AGE is 1 day while the TTL cap is 90 seconds.
     ///
     /// So: let real time pass WITHOUT the feed owner pushing a new NAV, then sign a FRESH
     /// short-dated quote at the new timestamp. Both halves are real — a perfectly valid,

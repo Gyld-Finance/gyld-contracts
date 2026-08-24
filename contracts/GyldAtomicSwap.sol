@@ -156,20 +156,38 @@ contract GyldAtomicSwap is
     ///
     ///      SCOPE — the fallback only covers a slot that was NEVER WRITTEN. A proxy whose
     ///      older initializer DID seed this field keeps that seeded value: the fallback
-    ///      never fires, and nothing narrows it to 15 minutes except an explicit,
+    ///      never fires, and nothing narrows it to 90 seconds except an explicit,
     ///      timelocked setMaxQuoteTtl. That is a general property of append-only fields
     ///      with an initializer seed, and it is one of the reasons a pre-existing proxy
     ///      is not upgraded into service here — a fresh deployment gets this default,
     ///      an upgraded one may not. See DEPLOYMENTS.md.
     ///
-    ///      15 minutes comfortably covers the quote service's issue-to-submit window
-    ///      (spec S-4: expiry must be short-lived, near-term); the service itself issues
-    ///      in a ~60s TTL class. Note the cap is measured against the EXECUTING block,
-    ///      not against signing time, so a cap below the issued TTL would not shorten a
-    ///      quote's life — it would forbid prompt execution and force the taker to wait
-    ///      until the quote was nearly expired. The cap must therefore always exceed the
-    ///      longest TTL the service issues.
-    uint64 public constant DEFAULT_MAX_QUOTE_TTL = 15 minutes;
+    ///      90 seconds is the tightest cap that still covers the quote service's whole
+    ///      issue-to-submit window (spec S-4: expiry must be short-lived, near-term).
+    ///      That window is an operational sequence, not a number picked for roundness:
+    ///      the service issues the quote (a ~60s TTL class today), the user approves it
+    ///      in their wallet, the signed transaction is broadcast, and a proposer includes
+    ///      it. At ~12s per Ethereum block, 90 seconds is roughly SEVEN BLOCKS — issuance
+    ///      and human approval plus a few blocks of inclusion slack. It is enough for a
+    ///      prompt submission on a normal chain and deliberately not enough for idling.
+    ///
+    ///      The reason to keep it that tight is the free option described above: the
+    ///      option's value grows with its life, so every second of TTL is time the taker
+    ///      gets to watch the market before choosing whether to exercise. This default
+    ///      was 15 minutes; 90 seconds cuts the free-option window by an order of
+    ///      magnitude. What it costs is slack — a taker who leaves a wallet prompt
+    ///      unattended, or submits underpriced into a congested block, will see the quote
+    ///      rejected and must ask the service for a fresh one at the then-current price.
+    ///      That is the intended outcome: re-quote rather than honour stale paper.
+    ///
+    ///      Note the cap is measured against the EXECUTING block, not against signing
+    ///      time, so a cap below the issued TTL would not shorten a quote's life — it
+    ///      would forbid prompt execution and force the taker to wait until the quote was
+    ///      nearly expired. The cap must therefore always exceed the longest TTL the
+    ///      service issues: at 90s it clears today's ~60s class by 30 seconds, and a
+    ///      service change that issues longer-dated quotes must be re-checked against
+    ///      this number BEFORE it ships.
+    uint64 public constant DEFAULT_MAX_QUOTE_TTL = 90 seconds;
 
     /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
     ///      `setMaxNavAgeSecs` only rejected zero — and `uint32` tops out at ~136 years,
@@ -237,18 +255,37 @@ contract GyldAtomicSwap is
     ///      before anyone notices, which is the case the two hot keys do not cover: they
     ///      require someone to already know.
     ///
-    ///      1 hour is anchored to KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL — one NAV
-    ///      publication epoch. A quote must not outlive the NAV round it was priced
-    ///      against. The shipped default is DEFAULT_MAX_QUOTE_TTL (15 min), so the knob
-    ///      has room to be tuned operationally in both directions without an upgrade,
-    ///      while the catastrophic setting (`uint64` reaches ~584 billion years, which
-    ///      would restore unbounded quote life) stays unreachable.
+    ///      10 minutes is sized off the operational window, not off the NAV publication
+    ///      epoch. This ceiling was previously 1 hour, anchored to
+    ///      KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL on the argument that a quote must not
+    ///      outlive the NAV round it was priced against. That bound is real, but it is
+    ///      far looser than anything this contract needs — `_checkQuoteBand` re-reads the
+    ///      feed LIVE on every execution, so NAV freshness is already enforced
+    ///      independently of quote life. The binding constraint is the free-option window
+    ///      (see DEFAULT_MAX_QUOTE_TTL), and in normal operation the thing that actually
+    ///      binds is the 90s DEFAULT — not this ceiling. What this ceiling is for is the
+    ///      abnormal case: it is the escape hatch that lets an admin widen the window
+    ///      through a timelocked setMaxQuoteTtl when the chain itself is misbehaving
+    ///      (sustained congestion, a fee spike, an L1 reorg storm) and honest takers
+    ///      genuinely cannot get included inside 90 seconds. 10 minutes is deliberately
+    ///      generous for that job and still an order of magnitude below the old hour: the
+    ///      catastrophic setting (`uint64` reaches ~584 billion years, which would restore
+    ///      unbounded quote life) stays unreachable, as does any hour-scale setting.
+    ///
+    ///      THE TRADE-OFF, STATED PLAINLY: this is a `constant`, not a storage field.
+    ///      Anything up to 10 minutes is reachable through a timelocked setMaxQuoteTtl,
+    ///      but RAISING THE CEILING ITSELF REQUIRES A NEW IMPLEMENTATION AND A PROXY
+    ///      UPGRADE — an engineering and governance cycle, not the 48 h timelock. The
+    ///      moment that need is discovered is the moment an upgrade is hardest to run
+    ///      calmly, which is exactly why the ceiling is set with room to spare rather
+    ///      than shrink-wrapped around the default. The accepted cost is that 10 minutes
+    ///      is the permanent hard bound on the option window until someone ships code.
     ///
     ///      What breaks at the ceiling: any taker workflow needing a quote to stay live
-    ///      longer than an hour (e.g. collecting multisig signatures over an afternoon)
-    ///      cannot be served by extending the TTL. The correct fix is for the quote
-    ///      service to re-issue a fresh quote at the current price, not for the chain to
-    ///      honour older paper.
+    ///      longer than ten minutes (collecting multisig signatures over an afternoon, or
+    ///      a wallet prompt left unattended) cannot be served by extending the TTL. The
+    ///      correct fix is for the quote service to re-issue a fresh quote at the current
+    ///      price, not for the chain to honour older paper.
     ///
     ///      Zero is permitted but no longer means "pin expiry to the current block" — it
     ///      is the UNSET sentinel and falls back to DEFAULT_MAX_QUOTE_TTL (see that
@@ -260,7 +297,7 @@ contract GyldAtomicSwap is
     ///      initializer already wrote to the slot — see the scope note on
     ///      DEFAULT_MAX_QUOTE_TTL, and DEPLOYMENTS.md on why a pre-existing proxy is not
     ///      upgraded into service.
-    uint64 public constant MAX_QUOTE_TTL_CEILING = 1 hours;
+    uint64 public constant MAX_QUOTE_TTL_CEILING = 10 minutes;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -383,7 +420,7 @@ contract GyldAtomicSwap is
     ///         and must be set post-deploy by the admin via setWithdrawalWallet.
     ///         withdraw() reverts ZeroAddress until then (fail-closed).
     ///         maxQuoteTtl is deliberately NOT seeded — it is read through a fallback to
-    ///         DEFAULT_MAX_QUOTE_TTL (15 min, F-4), so a fresh deploy and a proxy upgraded
+    ///         DEFAULT_MAX_QUOTE_TTL (90 s, F-4), so a fresh deploy and a proxy upgraded
     ///         across the field's addition enforce the same cap with no migration step.
     ///         This covers proxies whose slot was never written. A proxy that WAS seeded
     ///         by an older initializer keeps that seeded value — see the scope note on
@@ -759,25 +796,27 @@ contract GyldAtomicSwap is
     /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. executeSwap rejects quotes expiring
     ///         further than this far in the future (F-4), so a buggy or compromised
     ///         signer cannot issue long-dated quotes. Capped at MAX_QUOTE_TTL_CEILING
-    ///         (1 hour) — the setter previously had NO validation at all, and `uint64`
+    ///         (10 minutes) — the setter previously had NO validation at all, and `uint64`
     ///         reaches ~584 billion years, so one admin call could defeat quote expiry
     ///         outright and leave a leaked signed quote executable forever.
     ///
     ///         PASSING ZERO DOES NOT PAUSE ANYTHING. Zero is the unset sentinel and
-    ///         resets the cap to DEFAULT_MAX_QUOTE_TTL (15 min) — the fallback that keeps
+    ///         resets the cap to DEFAULT_MAX_QUOTE_TTL (90 s) — the fallback that keeps
     ///         an upgraded proxy working. To halt swaps use `pause()`, which is a hot key
     ///         (PAUSER_ROLE) and lands in one block, rather than this setter, which in
     ///         production waits on the 48 h timelock.
     ///
-    ///         The knob is genuinely two-way between 1 second and the 1 h ceiling, so the
-    ///         TTL can be tuned operationally without an upgrade while the catastrophic
-    ///         setting stays unreachable. Note the cap is compared against the EXECUTING
-    ///         block, not signing time: setting it below the TTL the quote service issues
-    ///         does not shorten quote life, it forbids prompt execution until the quote
-    ///         is nearly expired. Keep this above the service's longest issued TTL
-    ///         (~60s class today). See the constant for the full rationale.
-    /// @param newTtl Max quote lifetime in seconds (e.g. 900 = 15 min). 0 resets to the
-    ///               default; otherwise 0 < newTtl <= 1 h.
+    ///         The knob is genuinely two-way between 1 second and the 10-minute
+    ///         ceiling, so the TTL can be widened during a congestion incident — or
+    ///         tightened further — without an upgrade. Beyond 10 minutes there is no
+    ///         admin call: the ceiling is a `constant` and moving it needs new code.
+    ///         Note the cap is compared against the EXECUTING block, not signing time:
+    ///         setting it below the TTL the quote service issues does not shorten quote
+    ///         life, it forbids prompt execution until the quote is nearly expired. Keep
+    ///         this above the service's longest issued TTL (~60s class today). See the
+    ///         constant for the full rationale.
+    /// @param newTtl Max quote lifetime in seconds (e.g. 90 = the shipped default).
+    ///               0 resets to the default; otherwise 0 < newTtl <= 600 (10 min).
     function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newTtl > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(newTtl);
         _getStorage().maxQuoteTtl = newTtl;
