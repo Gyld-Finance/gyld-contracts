@@ -6,8 +6,7 @@ and what does not.
 
 Verified against the Solidity on `main` @ `20f2211` (536 tests,
 20 suites, all passing). Every claim here was checked against the source at the
-time of writing; claims carried forward from older docs and found **false** are
-recorded in [§19 Corrections](#19-corrections--claims-that-were-false).
+time of writing.
 
 | | |
 |---|---|
@@ -16,30 +15,6 @@ recorded in [§19 Corrections](#19-corrections--claims-that-were-false).
 | Libraries | OpenZeppelin `contracts` + `contracts-upgradeable` **v5.3.0** |
 | Chains exercised | Ethereum Sepolia (11155111), local Anvil (31337) — demonstrations only. **Nothing is deployed on mainnet**; see [§14](#14-deployed-addresses) |
 | Licence | 8 BUSL-1.1 files (the 7 core contracts + `IERC1643`) → GPL-2.0-or-later on 2028-07-09; see [§4.2](#42-licensing) |
-
-### If you arrived here from a stale reference
-
-This document replaced ten earlier files. Older branches and external links still
-name some of them; this is where their content went. (Nothing under `contracts/`,
-`.github/` or `ci/` names any of them any more — that was checked by grepping every
-removed filename across the tree.)
-
-| Old path | Now |
-|---|---|
-| `docs/contracts.md` | [§5 Contract reference](#5-contract-reference), [§14 Deployed addresses](#14-deployed-addresses) |
-| `docs/atomic-settlement.md` | [§5.7](#57-gyldatomicswap), [§7](#7-custody-model-and-loss-ceilings), [§9.1](#91-atomic-path--gyldatomicswapexecuteswap), [§19.4–19.5](#194-architecture-claims-overtaken-by-gyl-548) |
-| `docs/atomic-swap-spec.md` | **Never existed in this repo.** Its invariant catalogue is reconstructed at [§16.2](#162-the-gyldatomicswap-invariant-catalogue); I-6, I-7 and F-2 are unrecoverable, and I-24 is a genuine coverage gap rather than a lost one |
-| `docs/atomic-settlement-testnet-runbook.md` | **Still present and maintained** — [`atomic-settlement-testnet-runbook.md`](atomic-settlement-testnet-runbook.md). Sepolia is the supported testnet; see [§13](#13-deployment-model) |
-| `docs/blockchain-status.md` | [§11 Oracle design](#11-oracle-design), [§16 Verification surface](#16-verification-surface), [§18 Known gaps](#18-known-gaps-and-open-decisions) |
-| `docs/architecture.md` (Kaleidoscope backend) | [§2 Scope boundary](#2-scope-boundary--contracts-vs-kaleidoscope-backend) keeps only the off-chain context a contract reader needs; the rest belongs in the `kaleidoscope` repo |
-| `docs/morpho-integration.md`, `docs/euler-integration.md`, `docs/aave-v3-listing.md`, `docs/erc4626-compatibility.md` | [§15 DeFi integrations](#15-defi-integrations), reduced to what still constrains a live contract. The workstream is retired; its deploy recipes, protocol addresses, market IDs, LLTV/IRM parameters and governance procedure were deleted rather than carried forward, and live in git history |
-| `docs/decisions/gyld-bond-token-design.md` | [§8](#8-value-accrual--nav-not-balances), [§9.2](#92-deferred-path--issuancemanager), [§11](#11-oracle-design), [§12.2](#122-which-contracts-are-upgradeable-and-why), [§17 Decision record](#17-decision-record) |
-| `docs/decisions/sanctions-oracle-mirror.md` | [§5.6](#56-sanctionsoraclemirror), [§10](#10-compliance-model), [§17.3](#173-superseded--recorded-so-it-is-not-re-litigated) |
-| `docs/decisions/deferred-integrations.md` | [§17.2 Deferred](#172-deferred) |
-
-Still separate, deliberately: [`ci.md`](ci.md) (referenced by the CI workflow) and
-[`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md) (a
-dated ADR that exists to stop one question being re-litigated).
 
 ---
 
@@ -63,7 +38,6 @@ dated ADR that exists to stop one question being re-litigated).
 16. [Verification surface](#16-verification-surface)
 17. [Decision record](#17-decision-record)
 18. [Known gaps and open decisions](#18-known-gaps-and-open-decisions)
-19. [Corrections — claims that were false](#19-corrections--claims-that-were-false)
 
 ---
 
@@ -250,7 +224,7 @@ MIT, contrary to what the README and two earlier docs claimed:
 | Contract | Purpose | Production guard |
 |---|---|---|
 | `MockSanctionsList` | Writable stand-in for the sanctions oracle so the dev gateway's `mock_sanction_address` endpoint can flip an address. Writes are gated on an `owner` set at construction — the deploying key, and no other address. | `DeployMockSanctionsList.s.sol` calls `DeployGuards.requireProdSafe`, so it only runs on 31337 / 11155111. Separately, `DeployDevNet` compares the configured `SANCTIONS_LIST`'s **`EXTCODEHASH`** against the mock's runtime bytecode and refuses a match on production (`requireProdNotMock`). |
-| `MockUSDC` | 6-decimal ERC-20 with **no** `permit`. | `DeployMockUSDC.s.sol` calls `requireProdSafe` — added in the branch tip commit; it previously had no guard at all. |
+| `MockUSDC` | 6-decimal ERC-20 with **no** `permit`. | `DeployMockUSDC.s.sol` calls `requireProdSafe`. |
 | `MockUSDCPermit` | 6-decimal ERC-20 **with** EIP-2612, for the permit path. Real USDC's permit is non-standard (domain version `"2"`), which is why the swap's permit leg is optional and wrapped in `try/catch`. | Test-only; no script deploys it. |
 | `MockNavForwarder` | Settable 8-decimal NAV forwarder. The real feed's 1 h interval and ±10 % band are too rigid to drive the band / `InvalidNav` / `StaleNav` tests. | Test-only. |
 | `MockReentrantToken` | Token whose transfer hook re-enters the swap, for the reentrancy-exclusion tests (`I-17`). | Test-only. |
@@ -469,6 +443,16 @@ mapping(address => address) public forwarderOf;  // token → its NAVFeedForward
 mapping(bytes32 => bool)    private _deployedIsins;
 ```
 
+> **`bondTokenLogic` is `immutable`, so a `GyldBondToken` upgrade reaches existing
+> proxies only.** The address is fixed at construction and baked into the CREATE2
+> init code of every proxy the factory deploys (`TokenFactory.sol:37`, `:260`).
+> Upgrading the implementation lifts the series that already exist; the factory keeps
+> minting **new** series against the **old** logic until a new factory is deployed and
+> the `REGISTRAR_ROLE` / ownership wiring is repointed at it. Any implementation
+> upgrade is therefore a two-part rollout. This is live today: `GyldBondToken` gained
+> IERC-1643 documents in `c1f240f`, so upgrading live proxies without shipping a new
+> factory would leave newly-deployed series with no document register.
+
 The constructor takes `owner_` **explicitly** rather than using
 `Ownable(msg.sender)`. This matters: the bootstrap contracts are deployed through
 the canonical CREATE2 proxy at `0x4e59b44847b379578588920cA78FbF26c0B4956C`, so
@@ -507,15 +491,14 @@ deployToken(name, symbol, isin, maturityTimestamp, operator, issuanceManager, na
   └─ IssuanceManager(issuanceManager).registerToken(token)
 ```
 
-Two properties worth stating explicitly because they were both mis-documented:
+Two properties worth stating explicitly:
 
 - **The factory self-revokes only what it holds *on the token*.** `_wireRoles`
   drops `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE` from the factory on each token it
   creates. It does **not** touch `REGISTRAR_ROLE` on the `IssuanceManager` —
   there is no `revokeRole` for it anywhere in this contract or in
   `DeployDevNet.s.sol`. The factory keeps `REGISTRAR_ROLE` **permanently**. See
-  [§6.3](#63-what-a-single-key-compromise-buys) for what that means and
-  [§19](#19-corrections--claims-that-were-false) for the false claim it replaces.
+  [§6.3](#63-what-a-single-key-compromise-buys) for what that means.
 - **The forwarder's owner is `factory.owner()`**, i.e. the TimelockController —
   not the NAV feed's KMS signer. The KMS signer writes prices to the *feed* and
   has no control over which upstream the *forwarder* points at. Repointing the
@@ -619,8 +602,7 @@ guard do not have it and still depend on the runbook rule. The feed is not
 upgradeable and its reads never revert on staleness, so an owner-less feed would
 serve its last answer forever with no recovery path — and if an
 `_emergencyUpdater` were set at the time, that address would keep unbounded price
-authority with nobody able to clear it. §17.2 previously carried "Never call
-`renounceOwnership()`" as a written rule; the contract now enforces it.
+authority with nobody able to clear it.
 `EmergencyAnswerUpdated` is a deliberately different event from `AnswerUpdated`
 so monitoring can page on any use — every use should trigger an immediate ops
 review.
@@ -636,9 +618,8 @@ review.
 | `stalenessSeconds()` | never — returns `type(uint256).max` if never set |
 
 There is **no `PriceStale` error and no `_requireFresh()` function**, and there
-never has been. A declared-but-never-thrown `PriceStale` used to sit in the error
-list and led two design docs to describe a revert path that does not exist; it
-was deleted under GYL-1135 so the source no longer implies it.
+never has been. A declared-but-never-thrown `PriceStale` was deleted under
+GYL-1135 so the source does not imply a revert path that is not there.
 
 Historical rounds are not stored. DeFi protocols use `latestRoundData()`
 exclusively; `getRoundData` exists solely to satisfy the interface. A future
@@ -719,13 +700,7 @@ future timestamps after installation. Consumer-side age checks remain mandatory.
 
 The platform sanctions oracle on **every** production EVM chain, Ethereum
 mainnet included (GYL-1051). Plain `AccessControl`, immutable, no proxy, no
-pause.
-
-This reverses the contract's own original premise. It was built for chains where
-Chainalysis had never deployed (Mantle, most L2s), as a "deployment gap
-adapter" that would be retired once a vendor oracle appeared. That framing is
-dead: the mirror is now the primary oracle everywhere, and a vendor oracle is
-consumed *through* it rather than instead of it.
+pause. A vendor oracle is consumed *through* it rather than instead of it.
 
 #### Read interface
 
@@ -755,10 +730,9 @@ Three properties:
   `InvalidForwardingOracle`, which propagates up through
   `GyldBondToken._requireAccess` and reverts the transfer.
 
-`name()` returns **`"Gyld sanctions oracle"`** — not `"Chainalysis sanctions
-oracle"`, which is what the superseded ADR claimed for "tooling compatibility".
-There is also **no `isSanctionedVerbose(address)`** function, which that same ADR
-listed. Interface compatibility with the Chainalysis oracle is limited to
+`name()` returns **`"Gyld sanctions oracle"`**, not `"Chainalysis sanctions
+oracle"`. There is also **no `isSanctionedVerbose(address)`** function.
+Interface compatibility with the Chainalysis oracle is limited to
 `isSanctioned(address)` and the two `SanctionedAddressesAdded` /
 `SanctionedAddressesRemoved` event shapes — which is all `GyldBondToken` and
 standard tooling actually use.
@@ -1214,7 +1188,7 @@ production. This is the table to read first if you are auditing the system.
 | `emergencyUpdater` | Push any positive NAV, bypassing both caps | Would mass-liquidate Morpho borrowers. Contract-enforced to be a different key from the feed owner, so a KMS compromise alone cannot reach it. Every use emits the distinct `EmergencyAnswerUpdated`. |
 | `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV ±10 % per hour | Rate-limited; a 25 % total move takes 3 hours of chained updates, which is enough time to detect, pause the token and rotate the key. |
 | `SANCTIONS_UPDATER_ROLE` (keeper) | Sanction arbitrary addresses (griefing) or un-sanction a designated one (evasion) | Cannot grant itself admin. Compliance multisig revokes and re-grants in one transaction. |
-| `TokenFactory` (holds `REGISTRAR_ROLE` forever) | If the factory were ever upgraded — it cannot be, it is immutable — or if its `owner` (the timelock) were compromised, `deployToken` could register a token | The factory has no `registerToken` passthrough, so the only reachable effect is registering a token it deploys itself. The residual `REGISTRAR_ROLE` is a **documentation defect, not an exploitable one** — but the README's claim that it self-revokes was false and should not be relied on in a threat model. |
+| `TokenFactory` (holds `REGISTRAR_ROLE` forever) | If the factory were ever upgraded — it cannot be, it is immutable — or if its `owner` (the timelock) were compromised, `deployToken` could register a token | The factory has no `registerToken` passthrough, so the only reachable effect is registering a token it deploys itself. The residual `REGISTRAR_ROLE` is a **documentation defect, not an exploitable one** — but do not build a threat model that assumes the factory holds no permissions post-deploy. |
 
 ---
 
@@ -1566,8 +1540,7 @@ too.
 
 A sanctioned address is **frozen in place**. Every transfer to or from it reverts
 automatically. There is no `forceTransfer`, no `recoverTokens`, no clawback and no
-admin function that can move another holder's balance. The `forced_transfer` path
-that once existed in the Rust adapter was removed.
+admin function that can move another holder's balance.
 
 Operationally this means:
 
@@ -1937,7 +1910,7 @@ timelock and off the deployer, that the timelock is sane, and — on production 
 | `DeployNAVFeed.s.sol` | Standalone feed + forwarder | **Hardened.** `FORWARDER_OWNER` must be a contract on production |
 | `DeployAtomicSettlement.s.sol` | Swap impl + proxy, AP whitelist, `registerSeries`, withdrawal wallet, allowlist grants, timelock handover | **Hardened.** Full in-band assertions. Ordering of the `ALLOWLIST_ADMIN_ROLE` grant is load-bearing — it must precede both `setAllowed` and the `DEFAULT_ADMIN` revoke, or recovery needs a 48 h proposal |
 | `DeployMockSanctionsList.s.sol` | Dev sanctions stub | **Hardened** — `requireProdSafe` |
-| `DeployMockUSDC.s.sol` | Dev USDC | **Hardened** — `requireProdSafe`, added in the branch tip commit; it previously had **no** guard |
+| `DeployMockUSDC.s.sol` | Dev USDC | **Hardened** — `requireProdSafe` |
 | `DeployAtomicSettlementE2E.s.sol` | Self-contained Anvil fixtures for the Rust e2e run | Bare `require(block.chainid == 31337)` — an allowlist, but not via the library |
 | `AtomicSettlementFlow.s.sol` | Repeatable live-Anvil settlement flow | Does not reference `DeployGuards` |
 
@@ -2054,14 +2027,9 @@ What belongs here is what the register's rows mean for the design, not the rows:
 ## 15. DeFi integrations
 
 This section is deliberately short. The Morpho, Euler and Aave *workstreams* are
-retired — the Euler deploy scripts (`DeployEulerStep1..6.s.sol`) were deleted in
-`08f575f`, and Aave never got past research ([§17.2](#172-deferred)). What survives
-here is only what still constrains a **live contract**: how each protocol consumes
-the oracle, and what the forwarder's shape forces on the integrator. The procedural
-material — another organisation's PR and submission process, the step-by-step Euler
-deploy recipe, Aave's governance timeline and the risk parameters we would have
-proposed — is gone, and is not worth reconstructing from git history unless the
-workstream restarts.
+retired; Aave never got past research ([§17.2](#172-deferred)). What survives here
+is only what still constrains a **live contract**: how each protocol consumes the
+oracle, and what the forwarder's shape forces on the integrator.
 
 ### 15.1 The rule: every protocol points at the forwarder
 
@@ -2144,10 +2112,7 @@ and the two upstream properties a vault builder must document are in
   addresses go through the sanctions oracle on every collateral deposit and
   withdrawal — as `to`, as `from`, and as the `transferFrom` spender. A protocol
   address that ever appears on the mirrored list stops being usable as a venue for
-  the token, with no contract change involved. *(This was observed passing on the
-  retired integration chains; those contracts are not in
-  [`DEPLOYMENTS.md`](../DEPLOYMENTS.md) and the observation is no longer
-  reproducible — treat it as history, not as evidence.)*
+  the token, with no contract change involved.
 - **Market parameters are immutable once set.** On Morpho, `createMarket()` fixes
   oracle, IRM and LLTV forever; a new market is the only way to change any of them.
   Euler's IRM is likewise immutable after deployment. Getting the oracle wrapper
@@ -2194,10 +2159,8 @@ runs `test*`) while Halmos runs them.
 
 ### 16.2 The `GyldAtomicSwap` invariant catalogue
 
-Test names reference these identifiers. The normative specification document that
-originally defined them (`docs/atomic-swap-spec.md`) is **not present in this
-repository**; the catalogue is reconstructed here from the test suite so the
-references resolve to something.
+Test names reference these identifiers. The catalogue is reconstructed from the
+test suite, so every reference resolves to something checkable.
 
 | ID | Invariant | Where pinned |
 |---|---|---|
@@ -2207,7 +2170,6 @@ references resolve to something.
 | **I-3** | Draw range — the 1 % dust floor is **inclusive**: `requestedAmountIn == minAllowed` succeeds | `test_executeSwap_exactlyMinDrawFloor_succeeds`; Halmos |
 | **I-4** | `quoteEpoch` is strictly monotonic and moves only by +1 per bump | `test_bumpQuoteEpoch_strictlyMonotonic` |
 | **I-5** | An epoch bump does **not** free `quoteId`s — the usage bitmap is not epoch-scoped, so a consumed id stays consumed forever (finding F-3: the quote service must never reuse an id, even after a mass invalidation) | `test_consumedQuoteId_survivesEpochBump` |
-| I-6, I-7 | **Not recoverable** — no test or source reference survives, and the spec document that defined them is absent | — |
 | **I-8** | `DEFAULT_ADMIN_ROLE` is non-renounceable for **every** holder, not just the first | `test_renounceRole_defaultAdmin_revertsForEveryHolder` |
 | **I-9** | Atomic consumption — a swap that reverts *later* (e.g. at the inventory check) leaves the `quoteId` unconsumed and re-executable | `test_failedSwap_doesNotConsumeQuoteId` |
 | **I-10** | Conservation / never-mints — bond `totalSupply` never changes across any BUY/REDEEM sequence; only pre-minted inventory moves | `invariant_bond_totalSupply_never_changes`; `testFuzz_executeSwap_redeem_conservesBothPools`; Halmos |
@@ -2231,7 +2193,6 @@ Remediated findings:
 | ID | Finding | Remediation |
 |---|---|---|
 | **F-1** (was O-4) | The `/1e20` decimal ladder was an operational convention only | `initialize` probes USDC `decimals() == 6`; `registerSeries` probes forwarder `== 8` and bond token `== 18` |
-| F-2 | **Not recoverable** — no surviving reference | — |
 | **F-3** | The usage bitmap is not epoch-scoped, so id reuse after a bump would silently break | Documented invariant I-5 + test; the quote service must use one monotonic counter |
 | **F-4** | A signer could issue long-dated quotes, exercisable as a free option until noticed | `maxQuoteTtl` (fallback **15 min**, ceiling 1 h) + `QuoteExpiryTooFar`; `setMaxQuoteTtl` for adjustment. Read via `_effectiveMaxQuoteTtl` so an unset slot means "use the default", **not** "reject everything" — see the upgrade-safety tests |
 | **F-6** | A future-dated `updatedAt` satisfies `now > updatedAt + maxAge` forever | Explicit `updatedAt > block.timestamp` → `StaleNav`; plus the forwarder's configuration-time probe |
@@ -2319,6 +2280,34 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | Fireblocks ERC20F / DenyList contracts under `contracts/erc20f/` | **The directory does not exist in this tree.** All tokens use `GyldBondToken` + the platform sanctions oracle | GYL-250. |
 | Guard `navFeedOf[predicted] == address(0)` against duplicate ISINs | `mapping(bytes32 => bool) _deployedIsins` keyed on `_bondSalt(isin)` | The old guard only caught exact-duplicate calls; a same-ISIN call with a different name bypassed it and would deploy a second token for one real bond (GYL-300). |
 | `TokenFactory` `DEFAULT_ADMIN_ROLE` needs a manual cleanup step | `_wireRoles` self-revokes it (and `PAUSER_ROLE`) on every token | GYL-262. Note this does **not** extend to `REGISTRAR_ROLE` on the `IssuanceManager`, which the factory keeps permanently. |
+
+### 17.4 Prior-art lineage
+
+The design choices in `GyldAtomicSwap` trace to specific, verified sources. Links
+were confirmed resolving 2026-06-11; the Backed deployment was re-verified
+2026-07-31.
+
+| Design choice | Source |
+|---|---|
+| `executeSwap(SwapMessage, signature, permit)` shape: signed quote + single-use `quoteId` + two-leg transfer + optional EIP-2612 permit | Backed Finance `AtomicSwapUpgradeable` — verified on-chain source, impls `0x202BDae6EA5CB576c916cF2D2A83d5a21ea2624D` and `0x3AdF98F5eF70E08af964f33D109Ac032b3d31b24` behind proxy `0x837E5a6E45F5F16C7306B591994DBD2AdF09A932`. Their contract is a **pure conduit holding no balance** — the only transfer site is `safeTransferFrom(from, to, amount)`, `address(this)` appears solely as the permit spender, and the proxy holds 0 USDC / 0 ETH. Both legs settle against the deployer EOA, which is also `owner()`. Allowances are asymmetric: issuer→proxy bounded (~194,120 USDC), taker→proxy `uint256.max`. We keep taker binding, epoch mass-cancel and the NAV band as real differentiators; we hold inventory in the swap itself, which is neither their design nor our original one. |
+| Mandatory `taker` binding; quote-struct field choices | 0x v4 `OtcOrdersFeature` / `NativeOrdersFeature` |
+| Pool-held inventory filled against signed quotes; **every approval target must be small, verified, and in audit scope** | Hashflow Router/Pool + CertiK's post-mortem of the June-2023 $640 K exploit (arbitrary `transferFrom` in an unaudited peripheral holding approvals) |
+| BitInvalidator bitmap (256 ids/slot) + epoch mass-cancel | 1inch `BitInvalidatorLib`, `SeriesEpochManager` |
+| Decimal-scaling layer; asymmetric pause split; rate-limit caps (off-chain V1, on-chain V1.1 candidate) | Ondo OUSG `ousgInstantManager` + `InstantMintTimeBasedRateLimiter`; Code4rena report (H-01: a buffer-minimum revert broke redemptions — which is why no such revert exists here) |
+| Instant-vs-queued redemption split; NAV-feed-driven valuation | OpenEden TBILL `OpenEdenVaultV5` |
+| Singleton + UUPS + ERC-7201 + timelock admin + non-renounceable admin + probe-before-store; tokens-to-`IssuanceManager` as a burn commitment | House style: `IssuanceManager`, `GyldBondToken`, `NAVFeedForwarder`, and the existing two-step redemption |
+| Repricing / NAV-in-oracle value display | USYC, Spiko, Midas, OpenEden, Superstate — see [§8.4](#84-peer-comparison) |
+
+**Taker binding is a real differentiator, and the evidence for that is empirical.**
+Backed Finance's production swap — the direct structural twin of this design — does
+**not** enforce `msg.sender == taker`, and we deliberately do. Their Team Omega
+audit (finding A1, medium) recommended exactly `msg.sender ==
+incomingTransfer.from` and the report marks it "[resolved]", but the live proxy
+`0x837E5a6E45F5F16C7306B591994DBD2AdF09A932` does not implement it: its
+`executeSwap` checks expiry, quote reuse, signature and an address allowlist, and
+never reads `msg.sender`. Proved by replaying a real signed swap from `0x…dEaD` —
+not a counterparty, not allowlisted — at the prior block: it succeeded. **Do not
+trust an audit's "[resolved]" label as evidence about a deployment.**
 
 ---
 
@@ -2416,108 +2405,11 @@ Carried forward honestly. Ordered by severity.
     | `GyldAtomicSwap.sol:132` — `docs/ARCHITECTURE.md "Proposed amendment"` (the `MIN_DRAW_BPS` dust floor) | a string that appears **nowhere** in `docs/` | [§5.7 The signed quote](#the-signed-quote) — the 1 % floor, and invariant I-3 |
 
     The invariant catalogue itself is reconstructed in
-    [§16.2](#162-the-gyldatomicswap-invariant-catalogue); I-6, I-7 and F-2 remain
-    unrecoverable. The fix is a one-pass renumber of those comments against this
-    document's headings — cheap, and it is the only thing standing between a reader
-    and the invariant they were pointed at.
+    [§16.2](#162-the-gyldatomicswap-invariant-catalogue). The fix is a one-pass
+    renumber of those comments against this document's headings — cheap, and it is
+    the only thing standing between a reader and the invariant they were pointed at.
 18. **A relayer path for `permit()`** — implemented in the token but no relayer exposed.
     Pending a product decision.
-
----
-
-## 19. Corrections — claims that were false
-
-Every claim below was found in `docs/` or `README.md`, checked against the Solidity,
-and found **wrong**. This repository has a history of documentation contradicting
-bytecode, so the corrections are recorded rather than silently dropped.
-
-### 19.1 Security properties that did not exist
-
-| Claimed | Where | Truth |
-|---|---|---|
-| "`REGISTRAR_ROLE` → TokenFactory (**self-revokes post-deployment**)" and "TokenFactory holds `DEFAULT_ADMIN_ROLE` and `REGISTRAR_ROLE` only during deployment and **self-revokes both** before returning. It holds **no permanent permissions** post-deploy." | `README.md` | **False, and it was a stated security property.** `TokenFactory._wireRoles` revokes only `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, and only **on the token**. `REGISTRAR_ROLE` lives on the `IssuanceManager`; the string `REGISTRAR` appears in `TokenFactory.sol` exactly twice, both in the `MissingRegistrarRole` preflight — there is no `revokeRole` for it anywhere in the contract, and `DeployDevNet.s.sol` grants it (line 302) and never revokes it. On any stack deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The factory also never holds `DEFAULT_ADMIN_ROLE` on the `IssuanceManager` at all. |
-| "`MAX_STALENESS` \| **36 hours** \| `latestRoundData()` / `latestAnswer()` **revert** if price is older" | `blockchain-status.md`, `decisions/gyld-bond-token-design.md` §4 | **Both halves false, and always were.** The constant is **96 hours** and gates only `isFresh()`. No read function has ever reverted on staleness. The only revert on a read is `NoPriceSet`, before the first push. Already annotated as superseded in those files; the underlying diagram at `blockchain-status.md:220` still said "36-hr staleness cap", contradicting its own correction 40 lines below. |
-| "Both check staleness via **`_requireFresh()`** before returning." | `decisions/gyld-bond-token-design.md` §4 | **False.** No such function has ever existed in `KaleidoscopeNAVFeed.sol`. A `PriceStale` error was declared and never thrown; it was deleted under GYL-1135 so the source no longer implies a revert path that is not there. |
-| "`MAX_PRICE_DEVIATION_BPS` has no emergency override — this is intentional." | `decisions/gyld-bond-token-design.md` §4 | **Reversed.** `emergencyUpdateAnswer(int256)` ships and bypasses both the deviation cap and the interval gate, gated on a separate `emergencyUpdater` key. |
-| Staleness tradeoff table: our model is the reverting column; "Risk during freeze: **None**", "Who bears risk: **Nobody** — positions frozen but intact" | `blockchain-status.md` (pre-correction) | **False on two counts.** The bytecode implements the non-reverting column, and even for a reverting feed "nobody" is wrong on its own terms: a market that cannot liquidate has not eliminated risk, it has deferred and concentrated it. Already annotated in that file. |
-
-### 19.2 Interface claims that do not match the code
-
-| Claimed | Where | Truth |
-|---|---|---|
-| `SanctionsOracleMirror.name()` returns **`"Chainalysis sanctions oracle"`** — "for tooling compatibility" | `decisions/sanctions-oracle-mirror.md` §3 | **False.** It returns **`"Gyld sanctions oracle"`**. |
-| `SanctionsOracleMirror` exposes **`isSanctionedVerbose(address)`** — "emits per-address event; nonpayable to match the real oracle" | `decisions/sanctions-oracle-mirror.md` §3 | **False — the function does not exist.** Chainalysis compatibility is limited to `isSanctioned(address)` plus the two event shapes. |
-| "The admin **cannot** write to the sanctions list directly (only `SANCTIONS_UPDATER_ROLE` can). This prevents the compliance team from ... blocking addresses outside the OFAC/SDN feed." | `decisions/sanctions-oracle-mirror.md` §5 | **Misleading.** True one call deep only. `DEFAULT_ADMIN_ROLE` is the admin of `SANCTIONS_UPDATER_ROLE` and can grant it to itself, then write. The separation is procedural — visible in the role-grant log — not cryptographic. |
-| `transferFrom` implementation shown with `_requireAccess(from)` and `_requireAccess(to)` **inline**, and `_requireAccess` shown using `require(!sl.isSanctioned(account), "GyldBondToken: account sanctioned")` | `decisions/gyld-bond-token-design.md` §1 | **Not the code.** `from`/`to` are screened in `_update`, not in `transferFrom`; only the spender is screened there. And `_requireAccess` reverts with the **custom error** `AccountSanctioned(address)`, not a string. Functionally equivalent, but a reader matching the snippet against the source will not find it. |
-| `require(_getStorage().whitelisted[beneficiary], "IssuanceManager: beneficiary not whitelisted")` | `decisions/gyld-bond-token-design.md` §6 | **Not the code.** The contract reverts `NotWhitelisted(address)`. Same for `UnregisteredToken`, `ZeroAmount` — the whole contract uses custom errors. Similarly `"TokenFactory: ISIN already deployed"` is really `IsinAlreadyDeployed(string)`, `"IssuanceManager: not a valid token contract"` is `NotValidTokenContract(address)`, and `"NAVFeedForwarder: invalid oracle"` is `InvalidOracle(address)`. |
-| `ISSUER_ROLE` — used throughout the redemption threat-model discussion ("A compromised ISSUER_ROLE key can call `redeem(...)`", "ISSUER_ROLE is a Fordefi MPC wallet") | `decisions/gyld-bond-token-design.md` §6 | **No such role exists.** `IssuanceManager` has `SUBSCRIBER_ROLE` (mint) and `REDEEMER_ROLE` (burn), deliberately split so one key cannot do both. The doc's threat model was written against a single collapsed role that the contract does not have. |
-| "`emit TokenDeployed(token, navFeed, issuanceMgr)`" | `contracts.md` | **False** — the event has **four** parameters: `TokenDeployed(token, navFeed, forwarder, issuanceManager)`. |
-| "Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed)` **pair**" | `contracts.md` (twice) | **Incomplete** — it deploys a **triple** including the `NAVFeedForwarder`, which the same document's own architecture diagram shows. |
-| "`NAVFeedForwarder` implements `AggregatorV3Interface` **which exposes `latestAnswer()`**" | `aave-v3-listing.md` §2 | **False.** `latestAnswer()` is **not** part of `AggregatorV3Interface` — it is the older `AggregatorInterface`. Both the feed and the forwarder implement it as an additional function specifically for Aave V3. |
-| "if no price has been pushed, `latestAnswer()` **returns 0**" | `aave-v3-listing.md` §2 | **False** — it **reverts `NoPriceSet`**. The operational advice ("always push a price before registering the oracle") is right; the failure mode described is not. An integrator expecting a `0` sentinel would mis-handle the revert. |
-
-### 19.3 Stale counts and inventories
-
-| Claimed | Where | Truth |
-|---|---|---|
-| "OZ **v4** upgradeable ... and OZ **v4** non-upgradeable are Forge submodules" | `blockchain-status.md` | **False.** Both are **v5.3.0**, and the code depends on v5 semantics throughout — `_update` as the single balance-change funnel, `renounceRole(role, callerConfirmation)`, the removal of `_afterTokenTransfer`. |
-| "All **six** contracts use `pragma solidity =0.8.28`" | `blockchain-status.md` | There are **seven** core contracts (the atomic swap was added after that sentence was written). The pin itself is correct on all seven. |
-| Contract table listing all seven core contracts as "Platform (**MIT**)" | `blockchain-status.md` | **False** — they are **BUSL-1.1**. `contracts.md` had this right. |
-| "Test and deployment-script files under `contracts/test/` and `contracts/script/` remain **MIT**" | `README.md`, `contracts.md` | **False.** 22 are `UNLICENSED` and 7 are MIT. Full breakdown in [§4.2](#42-licensing). (An earlier version of this row also claimed 6 `GPL-2.0-or-later` files; an SPDX scan of `contracts/` finds **zero** — the GPL files were the `DeployEulerStep*` scripts, deleted in `08f575f`.) |
-| "**261** Forge tests pass"; "**252** tests across 10 suites"; per-suite table totalling ~190 across 7 suites | `blockchain-status.md` (both figures, in the same document); `contracts.md` | **All stale.** Actual (on `main` @ `c1f240f`): **535 tests across 20 suites.** `blockchain-status.md` contradicted itself by 9 tests internally. |
-| "**471** tests" | `ci.md` (corrected in this pass) and `.github/workflows/ci.yml` | Stale — the count was 535 at the time. `ci.md` now carries a dated figure it re-checks against `forge test --list`; the workflow comment stopped naming a count at all, which is the only form that cannot go stale. |
-| "**10 of 14** broadcasting scripts ... don't reference the library" | `ci.md` (corrected in this pass) | Was **8 of 14** when written; it is now **2 of 8**. The two that do not reference `DeployGuards` are `AtomicSettlementFlow` and `DeployAtomicSettlementE2E`. |
-| Fireblocks ERC20F / DenyList contracts "remain in the repo for reference only" at `contracts/erc20f/` | `blockchain-status.md` | **The directory does not exist** in this tree. |
-| "`docs/contracts.md` \| Deployed addresses (**Hoodi testnet + mainnet**)" | `README.md` docs table | **False.** That file listed Ethereum Sepolia and local Anvil. No Hoodi addresses appear anywhere in `docs/`, and the Hoodi deployment described in the run-books never happened. |
-| Deployment run-books targeting **Hoodi (chain 560048)** as the public testnet | `atomic-settlement.md`, and `blockchain-status.md` env defaults (`PRIVKEY_CHAIN_ID` default 560048) | Superseded. `DeployGuards.isDevChain()` allowlists **only** Anvil 31337 and Ethereum Sepolia 11155111. Hoodi would be classified as production and take the strict path. The atomic swap's integrator instance went to Sepolia. |
-
-### 19.4 Architecture claims overtaken by GYL-548
-
-`docs/atomic-settlement.md` carried a prominent SUPERSEDED banner and was accurate
-when written, but described a design that no longer exists: `GyldSettlementVault`,
-LP-funded liquidity with `gyldLP` shares and a virtual offset, receivable
-accounting inside `totalAssets`, `SWAP_ROLE`, `LP_ROLE`, `drawForReplenishment` /
-`settleReplenishment` / `forwardForBurn` / `repayUsdc`, the v1 `SwapMessage`
-(`amountIn`/`amountOut`), EIP-712 domain version `"1"`, typehash
-`0xb61ceb75...`, and the vault's ERC-7201 slot `0x151c9d64...`. None of it is in
-this tree. Its still-live content — the security-mechanism table, the prior-art
-lineage, the NAV-band worked example, the operational levers — has been absorbed
-into [§5.7](#57-gyldatomicswap), [§7](#7-custody-model-and-loss-ceilings) and
-[§9.1](#91-atomic-path--gyldatomicswapexecuteswap).
-
-One claim from that document deserves preserving verbatim because it is a lesson
-about evidence rather than about this codebase:
-
-> **Taker binding.** Backed Finance's production swap — the direct structural twin
-> of this design — does **not** enforce `msg.sender == taker`, and we deliberately
-> do. Re-verified on mainnet 2026-07-31 and the claim **stands**. Their Team Omega
-> audit (finding A1, medium) recommended exactly
-> `msg.sender == incomingTransfer.from` and the report marks it "[resolved]" — but
-> the live proxy `0x837E5a6E45F5F16C7306B591994DBD2AdF09A932` does not implement
-> it. Its `executeSwap` checks expiry, quote reuse, signature and an address
-> allowlist; it never reads `msg.sender`. Proved empirically by replaying a real
-> signed swap from `0x…dEaD` — not a counterparty, not allowlisted — at the prior
-> block: it succeeded. Their line-204 doc comment claims the binding exists; the
-> code does not.
->
-> **Do not trust an audit's "[resolved]" label as evidence about a deployment.**
-
-### 19.5 Prior-art lineage (preserved)
-
-The design choices in `GyldAtomicSwap` trace to specific, verified sources. Links
-were confirmed resolving 2026-06-11; the Backed deployment was re-verified
-2026-07-31.
-
-| Design choice | Source |
-|---|---|
-| `executeSwap(SwapMessage, signature, permit)` shape: signed quote + single-use `quoteId` + two-leg transfer + optional EIP-2612 permit | Backed Finance `AtomicSwapUpgradeable` — verified on-chain source, impls `0x202BDae6EA5CB576c916cF2D2A83d5a21ea2624D` and `0x3AdF98F5eF70E08af964f33D109Ac032b3d31b24` behind proxy `0x837E5a6E45F5F16C7306B591994DBD2AdF09A932`. Their contract is a **pure conduit holding no balance** — the only transfer site is `safeTransferFrom(from, to, amount)`, `address(this)` appears solely as the permit spender, and the proxy holds 0 USDC / 0 ETH. Both legs settle against the deployer EOA, which is also `owner()`. Allowances are asymmetric: issuer→proxy bounded (~194,120 USDC), taker→proxy `uint256.max`. We keep taker binding, epoch mass-cancel and the NAV band as real differentiators; we hold inventory in the swap itself, which is neither their design nor our original one. |
-| Mandatory `taker` binding; quote-struct field choices | 0x v4 `OtcOrdersFeature` / `NativeOrdersFeature` |
-| Pool-held inventory filled against signed quotes; **every approval target must be small, verified, and in audit scope** | Hashflow Router/Pool + CertiK's post-mortem of the June-2023 $640 K exploit (arbitrary `transferFrom` in an unaudited peripheral holding approvals) |
-| BitInvalidator bitmap (256 ids/slot) + epoch mass-cancel | 1inch `BitInvalidatorLib`, `SeriesEpochManager` |
-| Decimal-scaling layer; asymmetric pause split; rate-limit caps (off-chain V1, on-chain V1.1 candidate) | Ondo OUSG `ousgInstantManager` + `InstantMintTimeBasedRateLimiter`; Code4rena report (H-01: a buffer-minimum revert broke redemptions — which is why no such revert exists here) |
-| Instant-vs-queued redemption split; NAV-feed-driven valuation | OpenEden TBILL `OpenEdenVaultV5` |
-| Singleton + UUPS + ERC-7201 + timelock admin + non-renounceable admin + probe-before-store; tokens-to-`IssuanceManager` as a burn commitment | House style: `IssuanceManager`, `GyldBondToken`, `NAVFeedForwarder`, and the existing two-step redemption |
-| Repricing / NAV-in-oracle value display | USYC, Spiko, Midas, OpenEden, Superstate — see [§8.4](#84-peer-comparison) |
 
 ---
 

@@ -51,10 +51,8 @@ a feature.
 
 On the BSC testnet demo token, **MetaMask displayed 1,000.00 where BscScan
 displayed 1,040.00** — same wallet, same contract, same block (multiplier
-1.04×). An Anvil rehearsal (verification notes, 2026-07-31, since deleted with
-the rest of the demo tooling) showed the identical divergence at 1.05×, and the
-(now-deleted) BNB runbook predicted it: MetaMask renders the raw `balanceOf`,
-full stop.
+1.04×). An Anvil rehearsal reproduced the identical divergence at 1.05×. The
+cause is not subtle: MetaMask renders the raw `balanceOf`, full stop.
 
 That is the standard producing the exact harm it exists to prevent: two
 different numbers for one balance, both apparently authoritative. A display
@@ -104,11 +102,9 @@ name (roadmap D-5).
 **Consequence: the NAV feed becomes more load-bearing.** It is now the *only*
 on-chain value-display channel, not one of two. This raises the priority of
 the known stale-feed and NAV-keeper gaps tracked in **GYL-1134** — the feed
-never reverts on staleness, and Morpho does no age check of its own. When this
-decision was taken the concrete case was a live feed that had gone unpushed
-since 2026-05-19; that stack has since been retired (see the note in §7), but
-neither gap in the contracts was closed by its removal. Dropping ERC-8056 does
-not create that problem, but it removes any excuse for deferring it.
+never reverts on staleness, and Morpho does no age check of its own. Dropping
+ERC-8056 does not create that problem, but it removes any excuse for deferring
+it.
 
 ## 7. Orphaned testnet artifacts — record for the trail
 
@@ -120,12 +116,9 @@ Two throwaway tokens were deployed with the extension during evaluation.
 | Ethereum Sepolia (11155111) | `GTB8056` (ISIN `TEST8056A00001`) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` |
 | BSC testnet (97) | `GBSCD` | `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` |
 
-> **Note, 2026-08-20.** When this decision was taken (2026-08-03) a mainnet token
-> stack existed on a further chain. It **predated the extension** and never
-> carried it, so no mainnet cleanup was required then or now. That stack was
-> retired in `1e9ffa8` and is no longer tracked anywhere in this repository;
-> [`DEPLOYMENTS.md`](../../DEPLOYMENTS.md) is the authoritative register of what
-> is deployed today, and it is the only place to read an address from.
+> [`DEPLOYMENTS.md`](../../DEPLOYMENTS.md) is the authoritative register of what is
+> deployed today, and the only place to read an address from. Nothing is live on
+> mainnet, and no mainnet token stack ever carried the extension.
 
 ## 8. Consequences for developers
 

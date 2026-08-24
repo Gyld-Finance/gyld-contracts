@@ -18,7 +18,7 @@ in a separate workflow so this one stays trustless.
 | Job | What it does | What it protects against |
 |-----|--------------|---------------------------|
 | `test` | `forge build` + `forge test` at **full** `foundry.toml` intensity (fuzz `runs = 10000`, invariant `runs = 1000, depth = 50`; 536 tests across 20 suites as of 2026-08-22, confirmed with `forge test --list`) | Regressions in contracts, scripts and invariants landing on `main` unnoticed |
-| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — a production L2 satisfies `!= 1`, so a zero-delay timelock and a bare-EOA admin sail onto a live chain unopposed. Guards must be allowlists (`DeployGuards.isDevChain()`). Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
+| `chain-guard` | `python3 ci/check_chain_guards.py` — comment-aware scan of `contracts/script/`. Fails on (a) any `block.chainid !=` comparison and (b) any script carrying **no** chain guard at all | The GYL-1135 bug class: denylist "mainnet protection" (`require(block.chainid != 1, ...)`) that every L2 walks straight past — a production L2 satisfies `!= 1`, so a zero-delay timelock and a bare-EOA admin sail onto a live chain unopposed. Guards must be allowlists — either a `DeployGuards` call (`isDevChain()` / `requireProdSafe()`) or a positive `block.chainid == <id>` pin, which is a fail-closed allowlist of exactly one chain and is why `AtomicSettlementFlow` and `DeployAtomicSettlementE2E` pass without using the library. Check (b) closes the checker's own blind spot: a *missing* guard is invisible to a scan that only inspects guards that were written, which is how the ungated `DeployMockUSDC.s.sol` survived the first pass |
 | `test` (step) | `python3 ci/check_storage_layout.py` — regenerates the ERC-7201 struct layout of the three UUPS contracts and diffs it against the baselines in `ci/storage-layouts/`. Blocking | The GYL-1208 bug class: a namespaced storage field that moves, resizes, reorders or disappears between implementations, which silently re-points storage on an already-deployed proxy. Both known instances (`GyldAtomicSwap.maxQuoteTtl` reading 0 on an upgraded proxy; `GyldBondToken`'s removed ERC-8056 extension leaving live bytes at B+3..B+5) were caught by a human reading the diff — and NEITHER reached `main`. This check does not replace that review; it **forces** it, by turning a subtle Solidity diff into an explicit `ci/storage-layouts/` diff a reviewer cannot skim past, and giving an auditor a concrete artifact to read before an upgrade. The audit remains the thing that decides whether a layout change is safe. See "Storage layout" below |
 
 ## Why full fuzz intensity on every run
@@ -207,9 +207,7 @@ Production contracts (`contracts/*.sol`) at the first measurement:
 The repo-wide `Total` that `--report summary` prints is **65.08%**. Ignore it:
 it is dominated by broadcast-only scripts such as `AtomicSettlementFlow` that
 have no test harness, so it measures how many deploy scripts have tests, not
-how well the contracts are tested. (It was more dominated still when the
-`DeployEulerStep*` family was in the tree; those have since been removed, so the
-figure quoted above predates their removal.)
+how well the contracts are tested.
 
 Two honest caveats, in order of importance:
 
@@ -250,13 +248,6 @@ Exactly two genuine gaps, both narrow, and neither on the hot path:
   permanently rather than failing loud on one series.
 - **`GyldBondToken.sol:218`** — `mint(to, 0)` → `ZeroAmount`. `burn(x, 0)` and
   `mint(address(0), …)` are both tested; this one is a symmetry gap.
-
-*(An earlier revision of this note flagged a constant-vs-constant comparison in
-`initialize` as structurally dead. That guard has since been removed: `initialize`
-no longer seeds `maxQuoteTtl` at all — the field is read through
-`_effectiveMaxQuoteTtl`, which falls back to `DEFAULT_MAX_QUOTE_TTL` on an unset
-slot, so there is no seeded value left to validate. See the constant's docstring
-for why the fallback shape is load-bearing on an upgraded proxy.)*
 
 **The reassuring part:** `executeSwap` (lines 497-568) and `_checkQuoteBand`
 (599-628) — the value-moving hot path — contain **zero** uncovered lines and
@@ -320,19 +311,6 @@ CI log if you need the exact case.
 - **Gas snapshots** — no `.gas-snapshot` baseline exists, most hot paths are
   fuzz tests (nondeterministic gas), and `via_ir` makes diffs churn on
   unrelated edits. A snapshot job that flakes teaches people to ignore CI.
-- ~~**Broadcast-without-guard job**~~ — **adopted**, and it starts green. The
-  earlier objection was that 8 of the then-14 broadcasting scripts (six of
-  them the since-removed `DeployEulerStep*` family) pinned their chain with a
-  bare `require(block.chainid == <one production chain id>)` and never
-  referenced `DeployGuards`, so a check for a `DeployGuards` *call* would start
-  red. The fix was to check for
-  a **chain guard**, not for the library: a positive `block.chainid ==` pin is
-  a fail-closed allowlist of exactly one chain and counts. Both forms are
-  accepted, so no script needed rewriting and the job is green at adoption.
-  This matters because the `chain-guard` denylist scan is structurally blind
-  to a script with no guard at all — which is how the ungated
-  `DeployMockUSDC.s.sol` survived the first pass of GYL-1135.
-
 - **A coverage threshold / `--fail-under` gate** — rejected, and so, for now, is
   any `coverage` job at all: the measurement stays local. A minimum picked from
   the first-ever measurement is an arbitrary number that then gets defended as if

@@ -57,10 +57,10 @@ afterwards.
 > **It does not revoke `REGISTRAR_ROLE`.** That role lives on the `IssuanceManager`,
 > and the factory keeps it permanently — there is no `revokeRole` for it in the
 > contract or in any deploy script, and on any stack deployed by the factory
-> `hasRole(REGISTRAR_ROLE, factory) == true`. An earlier version of this README
-> claimed the factory "self-revokes both" and holds "no permanent permissions
-> post-deploy"; that was false and should not be relied on in a threat model. See
-> [`docs/ARCHITECTURE.md` §5.3 and §19.1](docs/ARCHITECTURE.md).
+> `hasRole(REGISTRAR_ROLE, factory) == true`. Do not build a threat model that
+> assumes the factory holds no permissions post-deploy. See
+> [`docs/ARCHITECTURE.md` §5.3](docs/ARCHITECTURE.md#53-tokenfactory) and
+> [§18](docs/ARCHITECTURE.md#18-known-gaps-and-open-decisions).
 
 The complete matrix — every role, what it gates, who should hold it, whether it is
 renounceable, and what a compromise of each buys — is
@@ -187,7 +187,7 @@ at the root.
 | Document | Contents |
 |---|---|
 | [`DEPLOYMENTS.md`](DEPLOYMENTS.md) | **The authoritative on-chain address register.** The only place an address is canonical; if a contract is not listed there, do not send funds to it, approve it or wire it into a config. |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **The authoritative reference.** Every contract, the complete role and permission matrix, custody and loss ceilings, value accrual, both settlement flows, compliance, oracle design, deployment model, DeFi integration rules (oracle shape, staleness behaviour, ERC-4626), the verification surface, the decision record, known gaps, and a log of documentation claims found false against the code. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **The authoritative reference.** Every contract, the complete role and permission matrix, custody and loss ceilings, value accrual, both settlement flows, compliance, oracle design, deployment model, DeFi integration rules (oracle shape, staleness behaviour, ERC-4626), the verification surface, the decision record, and known gaps. |
 | [`docs/ci.md`](docs/ci.md) | What CI runs and why, what was considered and rejected, how to reproduce a failure locally. Referenced directly by `.github/workflows/ci.yml`. |
 | [`docs/atomic-settlement-testnet-runbook.md`](docs/atomic-settlement-testnet-runbook.md) | Deployment runbook and readiness assessment for taking the `GyldAtomicSwap` stack to a public testnet, including the fresh-deploy checklist. |
 | [`docs/decisions/erc8056-dropped-on-evm.md`](docs/decisions/erc8056-dropped-on-evm.md) | Standing ADR: why ERC-8056 (Scaled UI Amount) was dropped on EVM. Kept dated and separate so the decision is not re-litigated. |
@@ -223,8 +223,7 @@ Core protocol contracts (`GyldAtomicSwap`, `GyldBondToken`, `IssuanceManager`,
 production use requires a commercial license from Gyld Finance until the Change
 Date (2028-07-09), after which these files convert to `GPL-2.0-or-later`.
 
-Files under `contracts/test/` and `contracts/script/` are **not** uniformly MIT, as
-an earlier version of this README stated: 22 are `UNLICENSED` (the test suites and
-most deploy scripts) and 7 are `MIT` (the five test doubles plus the two mock deploy
-scripts). Per-file breakdown:
-[`docs/ARCHITECTURE.md` §4.2](docs/ARCHITECTURE.md).
+Files under `contracts/test/` and `contracts/script/` are **not** uniformly MIT:
+22 are `UNLICENSED` (the test suites and most deploy scripts) and 7 are `MIT` (the
+five test doubles plus the two mock deploy scripts). Per-file breakdown:
+[`docs/ARCHITECTURE.md` §4.2](docs/ARCHITECTURE.md#42-licensing).

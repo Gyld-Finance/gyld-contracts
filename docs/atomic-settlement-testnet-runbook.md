@@ -16,11 +16,9 @@ checked by hand. That is what section 8 is for: it verifies with independent
 **Architecture note — read this before anything else.** `GyldAtomicSwap` is
 self-custodial: it holds its own inventory (USDC + bond tokens) and settles
 platform-signed EIP-712 quotes against that inventory (`contracts/GyldAtomicSwap.sol`,
-contract NatSpec lines 20–28). The former `GyldSettlementVault`, `GyldDvpEscrow`, and
-`DeployDvpEscrow.s.sol` were **deleted** in GYL-548 (commit `5c1a1f4`). There is no
-vault to deploy, and no `SWAP_ROLE` handover to a vault. Any older doc or memory that
-mentions a vault describes the dead architecture. Contracts are **BUSL-1.1** licensed
-(commit `15bbdfa`).
+contract NatSpec lines 20–28). There is no vault to deploy and no `SWAP_ROLE`
+handover — nothing in this runbook deploys or configures a settlement vault.
+Contracts are **BUSL-1.1** licensed.
 
 ---
 
@@ -54,8 +52,7 @@ ever been broadcast to local Anvil.
 | Sepolia | 11155111 | A `GyldAtomicSwap` proxy + implementation, and an older `DeployDevNet.s.sol` token stack (TimelockController, IssuanceManager proxy, TokenFactory, MockSanctionsList, three bond series). Addresses, source commits and per-row do-not-reuse status: `DEPLOYMENTS.md` | `broadcast/DeployDevNet.s.sol/11155111`; swap addresses per `DEPLOYMENTS.md` |
 
 > **Warning — confirm the chain id before you broadcast.** A script's name is not
-> evidence of which chain it targets: a script with "test" in its name has misled
-> people into believing it pointed at a testnet when it did not. Run
+> evidence of which chain it targets — "test" in a filename proves nothing. Run
 > `cast chain-id --rpc-url $RPC` and confirm the answer is the testnet you intend
 > before any `--broadcast` — anything sent to a production chain spends real funds
 > and cannot be undone. Note also that only the chain ids on
@@ -301,7 +298,7 @@ cast call $EVM_ISSUANCE_MANAGER "whitelisted(address)(bool)" $SWAP --rpc-url $RP
 # expected: true          (swap is a whitelisted AP / mint recipient)
 ```
 
-### Step 3 — seed the swap's own inventory (no vault exists — this is new)
+### Step 3 — seed the swap's own inventory (no vault exists)
 
 The swap is self-custodial: `executeSwap` reverts `InsufficientInventory` /
 `InsufficientUsdcLiquidity` unless the outgoing leg is already sitting in the
@@ -452,11 +449,11 @@ $TREASURER_KEY` → funds land at `withdrawalWallet()`, nowhere else.
    verify the deployer was revoked (step 2 checks). TODO(ops): prove the proposer key
    of the step-0 timelock is operable before relying on it — an inert timelock bricks
    unpause, upgrades, and series registry.
-3. **[HIGH] Self-custodial inventory risk.** The old vault design is gone: the swap
-   contract itself is the honeypot. Operationally this changes three things vs the
-   vault era: (a) inventory sizing is now a live ops duty — swaps fail
-   `InsufficientInventory`/`InsufficientUsdcLiquidity` when the pot runs dry, so
-   someone must monitor balances and re-seed via `subscribe`/USDC transfer;
+3. **[HIGH] Self-custodial inventory risk.** The swap contract itself is the
+   honeypot. Three operational consequences: (a) inventory sizing is a live ops
+   duty — swaps fail `InsufficientInventory`/`InsufficientUsdcLiquidity` when the
+   pot runs dry, so someone must monitor balances and re-seed via
+   `subscribe`/USDC transfer;
    (b) the blast radius of an upgrade-key or signer compromise is the full held
    balance, so testnet should rehearse with small, capped inventory; (c) evacuation
    is `TREASURER_ROLE.withdraw()` to the admin-fixed `withdrawalWallet` — that wallet
@@ -592,7 +589,7 @@ for role in $(cast keccak "PROPOSER_ROLE") $(cast keccak "CANCELLER_ROLE") \
   cast call $TIMELOCK "hasRole(bytes32,address)(bool)" $role $DEPLOYER --rpc-url $RPC;
 done
 # expected: false for every one. A deployer holding PROPOSER on a timelock it also
-# executes against is the F1 cosmetic-handover case.
+# executes against is a cosmetic handover: it gates nothing.
 
 cast call $TIMELOCK "hasRole(bytes32,address)(bool)" $(cast keccak "EXECUTOR_ROLE") \
   0x0000000000000000000000000000000000000000 --rpc-url $RPC
@@ -639,7 +636,7 @@ cast codehash <that_address> --rpc-url $RPC
 cast call $EVM_ISSUANCE_MANAGER "whitelisted(address)(bool)" \
   0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url $RPC
 # expected: false. That is Anvil account[1]; its private key is in the Anvil banner.
-# DeployDevNet used to whitelist it as an AP on EVERY chain.
+# A `true` means a dev-only AP whitelist entry reached a real chain.
 
 cast call $USDC_ADDRESS "decimals()(uint8)" --rpc-url $RPC
 cast codehash $USDC_ADDRESS --rpc-url $RPC
