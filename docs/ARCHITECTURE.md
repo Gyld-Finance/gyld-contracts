@@ -532,7 +532,7 @@ is attempted — so the failure surfaces as `IsinAlreadyDeployed` rather than an
 opaque EVM revert after a 48 h timelock delay.
 
 The `MissingRegistrarRole` preflight exists for the same reason: without it, the
-call would spend gas on four deployments and only fail at the final
+call would spend gas on three deployments and only fail at the final
 `registerToken`.
 
 ---
@@ -1958,7 +1958,7 @@ refactor to them is tracked in [§18](#18-known-gaps-and-open-decisions).
 **Ordering constraints that will bite if violated:**
 
 - The factory must hold `REGISTRAR_ROLE` **before** `deployToken` — the preflight
-  reverts `MissingRegistrarRole` rather than wasting four deployments.
+  reverts `MissingRegistrarRole` rather than wasting three deployments.
 - Factory ownership must move to the timelock **before** `deployToken`, because
   `_wireRoles` grants `DEFAULT_ADMIN_ROLE` on each token to `owner()` **as it is at
   that moment**. Deploy first and the deployer EOA becomes the token admin.

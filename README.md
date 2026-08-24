@@ -23,32 +23,54 @@ Solidity `0.8.28`, compiled with Foundry, on OpenZeppelin v5.3.0.
 | `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval, plus a separate-key emergency override. |
 | `NAVFeedForwarder` | None (`Ownable2Step`) | Permanent, stable oracle address that forwards reads to a swappable upstream. DeFi protocols point here — **never** at `KaleidoscopeNAVFeed` directly. |
 | `SanctionsOracleMirror` | None | The platform sanctions oracle on **every** production EVM chain, Ethereum mainnet included (GYL-1051). A keeper bot syncs OFAC deltas into its local list; an optional gas-capped, fail-closed `forwardingOracle` can chain to a vendor oracle. |
-| `GyldAtomicSwap` | UUPS | Self-custodial atomic USDC⇄bond settlement against platform-signed EIP-712 quotes. **Holds its own inventory** — there is no vault. Taker binding, taker allowlist, single-use quotes, NAV sanity band. |
+| `GyldAtomicSwap` | UUPS | Self-custodial atomic USDC⇄bond settlement against platform-signed EIP-712 quotes. **Holds its own inventory** — there is no vault, and it grants no standing outbound allowance. Taker binding, taker allowlist, single-use quotes, NAV sanity band. Net inventory leaves only via `withdraw()`, and only to the admin-fixed `withdrawalWallet`. |
+| `IERC1643` | n/a — interface, no bytecode | `contracts/interfaces/IERC1643.sol`. Vendored (OpenZeppelin v5 ships no ERC-1643) and implemented by `GyldBondToken`. Its `Document` struct is the value type of the token's `documents` mapping, so member order **is** the physical storage layout on every deployed proxy. |
 
 ---
 
 ## Role architecture
 
+`DEFAULT_ADMIN_ROLE` exists on all four `AccessControl` contracts and grants /
+revokes every other role on its own contract. On the three UUPS contracts it also
+authorises the upgrade; on the immutable `SanctionsOracleMirror` there is nothing to
+upgrade and it gates `setForwardingOracle` instead. In production it is a
+`TimelockController` (48 h minimum).
+
 ```
-DEFAULT_ADMIN_ROLE   →  TimelockController (48 h minimum in production)
-                          ├─ grants / revokes all other roles
-                          └─ authorises UUPS upgrades
+GyldBondToken
+  MINTER_ROLE          →  IssuanceManager (exclusively — never an EOA)
+  BURNER_ROLE          →  IssuanceManager (exclusively)
+  PAUSER_ROLE          →  Ops multisig hot wallet — pause() AND unpause()
+  DOCUMENT_ROLE        →  Ops multisig (IERC-1643 set/remove — operational, no delay)
 
-MINTER_ROLE          →  IssuanceManager (exclusively — never an EOA)
-BURNER_ROLE          →  IssuanceManager (exclusively)
-PAUSER_ROLE          →  Ops multisig hot wallet (no delay — emergency pause)
-DOCUMENT_ROLE        →  Ops multisig (IERC-1643 document set/remove — operational, no delay; GLD-264)
+IssuanceManager
+  WHITELIST_ADMIN_ROLE →  Compliance ops multisig
+  SUBSCRIBER_ROLE      →  MPC wallet A  (subscribe / mint path only)
+  REDEEMER_ROLE        →  MPC wallet B  (redeem / burn path only)
+  REGISTRAR_ROLE       →  TokenFactory
 
-WHITELIST_ADMIN_ROLE →  Compliance ops multisig
-SUBSCRIBER_ROLE      →  MPC wallet A  (subscribe / mint path only)
-REDEEMER_ROLE        →  MPC wallet B  (redeem / burn path only — must differ from A)
-REGISTRAR_ROLE       →  TokenFactory
+GyldAtomicSwap
+  QUOTE_SIGNER_ROLE    →  Quote-service KMS key(s). Passive — the role registry IS
+                          the signer set, checked via hasRole against the recovered
+                          EIP-712 signer, so a revoke kills every in-flight quote
+  ALLOWLIST_ADMIN_ROLE →  KYC/compliance hot key; setAllowed() and nothing else
+  TREASURER_ROLE       →  Ops MPC wallet; withdraw() to the fixed withdrawalWallet.
+                          Deliberately live while paused (incident evacuation)
+  PAUSER_ROLE          →  Ops multisig; pause() ONLY — resuming needs the admin
+
+SanctionsOracleMirror
+  SANCTIONS_UPDATER_ROLE →  Keeper bot (add / remove sanctioned addresses)
 
 KaleidoscopeNAVFeed.owner       →  KMS signer (pushes NAV)
 KaleidoscopeNAVFeed.emergencyUpdater → Ops Safe; contract-enforced ≠ owner()
 NAVFeedForwarder.owner          →  TimelockController (oracle provider swaps)
 TokenFactory.owner              →  TimelockController
 ```
+
+`SUBSCRIBER_ROLE` and `REDEEMER_ROLE` should be distinct keys, and the production
+deploy path enforces it (`DeployGuards.requireDistinct`) — but `IssuanceManager`
+itself does not: `initialize` only rejects `address(0)`. Granting both to one
+address post-deploy is possible and would not revert.
 
 `TokenFactory._wireRoles` self-revokes `DEFAULT_ADMIN_ROLE` and `PAUSER_ROLE` from
 the factory **on each token it deploys**, so it holds no permissions on any token
@@ -64,7 +86,7 @@ afterwards.
 
 The complete matrix — every role, what it gates, who should hold it, whether it is
 renounceable, and what a compromise of each buys — is
-[`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md).
+[`docs/ARCHITECTURE.md` §6](docs/ARCHITECTURE.md#6-role-and-permission-matrix).
 
 ---
 
@@ -87,8 +109,8 @@ the `IssuanceManager`. Finally push the first NAV and point DeFi markets at the
 **Four ordering constraints bite if violated:**
 
 - The factory must hold `REGISTRAR_ROLE` on the `IssuanceManager` **before**
-  `deployToken`. The preflight reverts `MissingRegistrarRole` rather than wasting
-  four deployments.
+  `deployToken`. The preflight reverts `MissingRegistrarRole` before any of the
+  three deployments.
 - Factory ownership must move to the timelock **before** `deployToken`, because
   `_wireRoles` grants `DEFAULT_ADMIN_ROLE` on each token to `owner()` *as it is at
   that moment*. Deploy first and the deployer EOA becomes the token admin
@@ -109,7 +131,8 @@ deployment of the same ISIN regardless of name, symbol or maturity.
 not exist yet, takes the strict path: required env vars, no privileged address equal
 to the deployer, a 48 h minimum timelock delay, and in-band post-deploy topology
 assertions that abort the deployment on a mismatch. See
-[`docs/ARCHITECTURE.md` §13](docs/ARCHITECTURE.md) and `.env.example`.
+[`docs/ARCHITECTURE.md` §13](docs/ARCHITECTURE.md#13-deployment-model) and
+`.env.example`.
 
 ---
 
@@ -132,6 +155,10 @@ assertions that abort the deployment on a mismatch. See
   the oracle can be replaced but never removed.
 - **No forced transfer and no recovery function.** A sanctioned address is frozen in
   place; nothing can move its tokens. Legal escalation is off-chain.
+- **`GyldAtomicSwap` makes no sanctions call of its own.** It does not need one:
+  every swap has exactly one `GyldBondToken` leg, so the token's own screen fires on
+  the taker and on the swap contract as spender. The taker allowlist
+  (`ALLOWLIST_ADMIN_ROLE`) is a separate, additive gate, not a substitute.
 
 ---
 
@@ -141,7 +168,13 @@ assertions that abort the deployment on a mismatch. See
 forge build                 # compile (via_ir, optimizer_runs = 200)
 forge test                  # 536 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
-forge coverage
+forge coverage --ir-minimum # plain `forge coverage` is stack-too-deep: it disables
+                            # via_ir, which this source needs
+
+# The two CI guards, both runnable offline (see docs/ci.md)
+python3 ci/check_storage_layout.py   # ERC-7201 layout unchanged on the 3 upgradeables
+python3 ci/check_chain_guards.py     # every script under contracts/script/ has an
+                                     # allowlist (not denylist) chain guard
 
 # Local devnet (Anvil)
 anvil &
@@ -201,24 +234,30 @@ at the root.
 - OpenZeppelin contracts-upgradeable **v5.3.0**, ERC-7201 namespaced storage on all
   three upgradeable contracts (slots recomputed and pinned by test)
 - UUPS upgrades require a `TimelockController` in production (48 h minimum)
-- `DEFAULT_ADMIN_ROLE` is non-renounceable on every contract that has it; on
-  `GyldAtomicSwap`, `PAUSER_ROLE` and `TREASURER_ROLE` stay renounceable
-  deliberately (see `docs/ARCHITECTURE.md` §6.1). `KaleidoscopeNAVFeed` has no
-  roles — its `renounceOwnership()` reverts instead, on newly deployed feeds
+- `DEFAULT_ADMIN_ROLE` is non-renounceable on all four `AccessControl` contracts
+  (`renounceRole` reverts `CannotRenounceAdminRole`). Every *other* role stays
+  renounceable, deliberately — the admin administers them all, so a renounce costs
+  one re-grant, and a holder who knows their key is compromised can shed it without
+  waiting on a timelock. The three `Ownable2Step` contracts — `TokenFactory`,
+  `NAVFeedForwarder`, `KaleidoscopeNAVFeed` — have no roles at all; each one's
+  `renounceOwnership()` reverts `CannotRenounceOwnership`. Rotation is
+  `transferOwnership` + `acceptOwnership`. See
+  [`docs/ARCHITECTURE.md` §6.1](docs/ARCHITECTURE.md#61-the-complete-matrix)
 - CI is structurally unable to broadcast: no secrets, no RPC URL, no key material,
   no fork cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`
 
 Known gaps are tracked honestly in
-[`docs/ARCHITECTURE.md` §18](docs/ARCHITECTURE.md) — including the residual
-`REGISTRAR_ROLE` above.
+[`docs/ARCHITECTURE.md` §18](docs/ARCHITECTURE.md#18-known-gaps-and-open-decisions)
+— including the residual `REGISTRAR_ROLE` above.
 
 ---
 
 ## License
 
-Core protocol contracts (`GyldAtomicSwap`, `GyldBondToken`, `IssuanceManager`,
+The seven core contracts (`GyldAtomicSwap`, `GyldBondToken`, `IssuanceManager`,
 `TokenFactory`, `NAVFeedForwarder`, `SanctionsOracleMirror`,
-`KaleidoscopeNAVFeed`) are licensed under [Business Source License 1.1](LICENSE)
+`KaleidoscopeNAVFeed`) and the `IERC1643` interface — eight files by SPDX scan —
+are licensed under [Business Source License 1.1](LICENSE)
 (`BUSL-1.1`). Source is available for review, testing and non-production use;
 production use requires a commercial license from Gyld Finance until the Change
 Date (2028-07-09), after which these files convert to `GPL-2.0-or-later`.
