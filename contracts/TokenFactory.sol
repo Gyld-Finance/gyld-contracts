@@ -158,7 +158,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (_deployedIsins[isinKey]) revert IsinAlreadyDeployed(isin);
 
         // Preflight: verify factory holds REGISTRAR_ROLE on the IssuanceManager
-        // before spending gas on four contract deployments. Without this check,
+        // before spending gas on three contract deployments. Without this check,
         // the call would succeed through all deployments and fail silently (or
         // revert expensively) at the registerToken() step.
         if (!IssuanceManager(issuanceManager).hasRole(

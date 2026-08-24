@@ -383,14 +383,26 @@ contract GyldAtomicSwapTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
+    /// Tampering with a signed field changes the EIP-712 digest, so ecrecover returns a
+    /// DIFFERENT address (not zero, not a failure) — which holds no role → the exact
+    /// InvalidQuoteSigner(recovered). Asserted by selector AND argument: a bare
+    /// expectRevert() here would pass just as happily on QuotePriceOutOfBand or an ECDSA
+    /// length/malleability revert, neither of which proves that `price` is signature-bound.
     function test_executeSwap_tamperedMessage_reverts() public {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(9);
-        bytes memory sig = _sign(m, SIGNER_PK);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, swap.hashSwapMessage(m));
+        bytes memory sig = abi.encodePacked(r, s, v); // same bytes _sign(m, SIGNER_PK) yields
 
         m.price = 100e28; // taker tries to get 10x the tokens on a real signature
 
+        // Recompute what the contract will recover from the TAMPERED digest.
+        address recovered = ecrecover(swap.hashSwapMessage(m), v, r, s);
+        assertTrue(recovered != address(0), "tampered digest must still recover an address");
+        assertTrue(recovered != signer, "tampering must move the recovered signer off the real one");
+        assertFalse(swap.hasRole(swap.QUOTE_SIGNER_ROLE(), recovered), "recovered address must hold no role");
+
         vm.prank(taker);
-        vm.expectRevert(); // recovered signer is garbage → InvalidQuoteSigner
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidQuoteSigner.selector, recovered));
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
@@ -1031,8 +1043,9 @@ contract GyldAtomicSwapTest is Test {
 
     /// initialize deliberately does NOT seed maxQuoteTtl (F-4): the storage slot stays
     /// zero and the effective cap comes from the DEFAULT_MAX_QUOTE_TTL fallback. That is
-    /// what keeps a proxy upgraded across the field's addition working — see
-    /// GyldAtomicSwap.upgrade.t.sol. The getter reports the effective value.
+    /// what keeps a proxy upgraded across the field's addition working — see the
+    /// "Upgrade safety for the appended maxQuoteTtl slot (F-4)" section at the bottom of
+    /// this file. The getter reports the effective value.
     function test_initialize_leavesTtlSlotUnsetAndFallsBackToDefault() public view {
         assertEq(swap.maxQuoteTtl(), 15 minutes);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
@@ -1360,10 +1373,11 @@ contract GyldAtomicSwapTest is Test {
 
     // ── Upgrade safety for the appended maxQuoteTtl slot (F-4) ────────────────
     //
-    // maxQuoteTtl is an APPEND-ONLY ERC-7201 field added after the first deployments
-    // (there is a live pre-F-4 proxy on Sepolia). A proxy upgraded onto this
-    // implementation never re-runs `initialize`, so that slot has never been written and
-    // reads ZERO. An earlier revision of this change seeded the field in `initialize`
+    // maxQuoteTtl is an APPEND-ONLY ERC-7201 field. A proxy deployed from an
+    // implementation that PREDATES the slot never had it written — it never re-runs
+    // `initialize` on upgrade either — so that slot reads ZERO, and the
+    // `_effectiveMaxQuoteTtl` fallback is what covers that proxy. The tests below pin
+    // exactly that state. An earlier revision of this change seeded the field in `initialize`
     // and read it raw in executeSwap, which meant the upgraded proxy enforced
     // `expiry <= block.timestamp + 0` — directly contradicting the `block.timestamp >
     // m.expiry` check one line above it. Every quote a real service can issue reverted
@@ -1374,6 +1388,15 @@ contract GyldAtomicSwapTest is Test {
     // The fix is that the field is read through `_effectiveMaxQuoteTtl`, which treats an
     // unset slot as "use DEFAULT_MAX_QUOTE_TTL". These tests pin that, because the
     // scenario had NO coverage before — every other test deploys fresh.
+    //
+    // What the ZERO-slot state is NOT: every upgrade. The fallback only covers a slot
+    // that was never written. A proxy whose older initializer DID seed the field keeps
+    // that seeded value straight through the upgrade — the fallback never fires, and
+    // only an explicit timelocked setMaxQuoteTtl narrows it. test_upgrade_preservesAdminSetTtl
+    // below pins that second shape: a non-zero slot survives upgrade untouched.
+    // It is one of the reasons a pre-existing proxy is not upgraded into service here
+    // (DEPLOYMENTS.md); a fresh deployment gets DEFAULT_MAX_QUOTE_TTL, an upgraded one
+    // gets whatever its own initializer wrote.
 
     /// Zeroing the slot IS the un-migrated-upgrade state, so write it directly and prove
     /// a normal quote still settles. This assertion is what the seed-based design failed.

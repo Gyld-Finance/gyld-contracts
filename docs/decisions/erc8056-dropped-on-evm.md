@@ -2,7 +2,7 @@
 
 **Status:** Adopted  
 **Date:** 2026-08-03  
-**Applies to:** `contracts/GyldBondToken.sol` (extension removed), `docs/**`, `tools/**`  
+**Applies to:** `contracts/GyldBondToken.sol` (extension removed), `docs/**`  
 **Linear:** GYL-1201 (supersedes the GYL-956 display-multiplier addendum to the
 token-design ADR, now folded into
 [`../ARCHITECTURE.md`](../ARCHITECTURE.md) §8 and §17.3; resolves roadmap
@@ -51,10 +51,8 @@ a feature.
 
 On the BSC testnet demo token, **MetaMask displayed 1,000.00 where BscScan
 displayed 1,040.00** — same wallet, same contract, same block (multiplier
-1.04×). An Anvil rehearsal (verification notes, 2026-07-31, since deleted with
-the rest of the demo tooling) showed the identical divergence at 1.05×, and the
-(now-deleted) BNB runbook predicted it: MetaMask renders the raw `balanceOf`,
-full stop.
+1.04×). An Anvil rehearsal reproduced the identical divergence at 1.05×. The
+cause is not subtle: MetaMask renders the raw `balanceOf`, full stop.
 
 That is the standard producing the exact harm it exists to prevent: two
 different numbers for one balance, both apparently authoritative. A display
@@ -104,9 +102,9 @@ name (roadmap D-5).
 **Consequence: the NAV feed becomes more load-bearing.** It is now the *only*
 on-chain value-display channel, not one of two. This raises the priority of
 the known stale-feed and NAV-keeper gaps tracked in **GYL-1134** — the feed
-never reverts on staleness, Morpho does no age check of its own, and the Base
-mainnet feed has been stale since 2026-05-19. Dropping ERC-8056 does not
-create that problem, but it removes any excuse for deferring it.
+never reverts on staleness, and Morpho does no age check of its own. Dropping
+ERC-8056 does not create that problem, but it removes any excuse for deferring
+it.
 
 ## 7. Orphaned testnet artifacts — record for the trail
 
@@ -118,8 +116,9 @@ Two throwaway tokens were deployed with the extension during evaluation.
 | Ethereum Sepolia (11155111) | `GTB8056` (ISIN `TEST8056A00001`) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` |
 | BSC testnet (97) | `GBSCD` | `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` |
 
-The live Base mainnet token stack **predates the extension** and never carried
-it — no mainnet cleanup is required.
+> [`DEPLOYMENTS.md`](../../DEPLOYMENTS.md) is the authoritative register of what is
+> deployed today, and the only place to read an address from. Nothing is live on
+> mainnet, and no mainnet token stack ever carried the extension.
 
 ## 8. Consequences for developers
 

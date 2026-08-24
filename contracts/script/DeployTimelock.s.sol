@@ -18,8 +18,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   - IssuanceManager UUPS upgrades (via DEFAULT_ADMIN_ROLE holder)
 ///
 /// Delay: 48 hours minimum. On any production chain a shorter delay is rejected before
-/// gas is spent — `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the live stack ended
-/// up with a timelock that gates nothing (GYL-1135).
+/// gas is spent — `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the
+/// since-retired demo stack ended up with a timelock that gates nothing (GYL-1135).
 ///
 /// ── Environment variables ──────────────────────────────────────────────────
 /// Required on EVERY chain:

@@ -151,7 +151,16 @@ contract GyldAtomicSwap is
     ///      through a timelocked setMaxQuoteTtl. Reading through the fallback makes the
     ///      unset slot mean "use the audited default" instead of "reject everything",
     ///      so a fresh deploy and an upgraded proxy behave identically with no migration
-    ///      step to forget. See GyldAtomicSwap.upgrade.t.sol.
+    ///      step to forget. Pinned by the "Upgrade safety for the appended maxQuoteTtl
+    ///      slot (F-4)" tests in contracts/test/GyldAtomicSwap.t.sol.
+    ///
+    ///      SCOPE — the fallback only covers a slot that was NEVER WRITTEN. A proxy whose
+    ///      older initializer DID seed this field keeps that seeded value: the fallback
+    ///      never fires, and nothing narrows it to 15 minutes except an explicit,
+    ///      timelocked setMaxQuoteTtl. That is a general property of append-only fields
+    ///      with an initializer seed, and it is one of the reasons a pre-existing proxy
+    ///      is not upgraded into service here — a fresh deployment gets this default,
+    ///      an upgraded one may not. See DEPLOYMENTS.md.
     ///
     ///      15 minutes comfortably covers the quote service's issue-to-submit window
     ///      (spec S-4: expiry must be short-lived, near-term); the service itself issues
@@ -246,6 +255,11 @@ contract GyldAtomicSwap is
     ///      constant). Soft-pausing via the TTL was never usable anyway: setting it needs
     ///      the 48 h timelock, whereas `pause()` is a hot key and one block.
     ///      Enforced in setMaxQuoteTtl; initialize no longer writes the field at all.
+    ///
+    ///      This ceiling bounds the SETTER. It does not retro-narrow a value some earlier
+    ///      initializer already wrote to the slot — see the scope note on
+    ///      DEFAULT_MAX_QUOTE_TTL, and DEPLOYMENTS.md on why a pre-existing proxy is not
+    ///      upgraded into service.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 1 hours;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
@@ -371,6 +385,9 @@ contract GyldAtomicSwap is
     ///         maxQuoteTtl is deliberately NOT seeded — it is read through a fallback to
     ///         DEFAULT_MAX_QUOTE_TTL (15 min, F-4), so a fresh deploy and a proxy upgraded
     ///         across the field's addition enforce the same cap with no migration step.
+    ///         This covers proxies whose slot was never written. A proxy that WAS seeded
+    ///         by an older initializer keeps that seeded value — see the scope note on
+    ///         DEFAULT_MAX_QUOTE_TTL.
     function initialize(
         address defaultAdmin,
         address pauser,
