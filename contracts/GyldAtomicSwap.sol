@@ -133,60 +133,12 @@ contract GyldAtomicSwap is
     uint256 public constant MIN_DRAW_BPS = 100; // 1%
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
-    /// @dev Default cap on quote lifetime (finding F-4): executeSwap rejects quotes
-    ///      expiring further than this far in the future, so a buggy or compromised
-    ///      signer cannot issue long-dated quotes. A long-dated quote is an AMERICAN
-    ///      OPTION — the taker holds a frozen price and picks the moment within its life
-    ///      when that price is most favourable to them, so the loss is not a random draw
-    ///      inside maxQuoteDeviationBps but reliably close to its full width.
-    ///
-    ///      This is a FALLBACK, not a seed. It is NOT written into storage by initialize;
-    ///      `_effectiveMaxQuoteTtl` returns it whenever the storage slot reads zero. That
-    ///      shape is deliberate and load-bearing: `maxQuoteTtl` is an APPEND-ONLY ERC-7201
-    ///      field added after the first deployments, so on a proxy upgraded from an
-    ///      implementation that predates the slot it reads 0 — and a seed-based design
-    ///      would then enforce `expiry <= block.timestamp + 0`, which contradicts the
-    ///      `block.timestamp > m.expiry` check one line above and rejects EVERY quote a
-    ///      real service can issue. That is a total executeSwap outage recoverable only
-    ///      through a timelocked setMaxQuoteTtl. Reading through the fallback makes the
-    ///      unset slot mean "use the audited default" instead of "reject everything",
-    ///      so a fresh deploy and an upgraded proxy behave identically with no migration
-    ///      step to forget. Pinned by the "Upgrade safety for the appended maxQuoteTtl
-    ///      slot (F-4)" tests in contracts/test/GyldAtomicSwap.t.sol.
-    ///
-    ///      SCOPE — the fallback only covers a slot that was NEVER WRITTEN. A proxy whose
-    ///      older initializer DID seed this field keeps that seeded value: the fallback
-    ///      never fires, and nothing narrows it to 90 seconds except an explicit,
-    ///      timelocked setMaxQuoteTtl. That is a general property of append-only fields
-    ///      with an initializer seed, and it is one of the reasons a pre-existing proxy
-    ///      is not upgraded into service here — a fresh deployment gets this default,
-    ///      an upgraded one may not. See DEPLOYMENTS.md.
-    ///
-    ///      90 seconds is the tightest cap that still covers the quote service's whole
-    ///      issue-to-submit window (spec S-4: expiry must be short-lived, near-term).
-    ///      That window is an operational sequence, not a number picked for roundness:
-    ///      the service issues the quote (a ~60s TTL class today), the user approves it
-    ///      in their wallet, the signed transaction is broadcast, and a proposer includes
-    ///      it. At ~12s per Ethereum block, 90 seconds is roughly SEVEN BLOCKS — issuance
-    ///      and human approval plus a few blocks of inclusion slack. It is enough for a
-    ///      prompt submission on a normal chain and deliberately not enough for idling.
-    ///
-    ///      The reason to keep it that tight is the free option described above: the
-    ///      option's value grows with its life, so every second of TTL is time the taker
-    ///      gets to watch the market before choosing whether to exercise. This default
-    ///      was 15 minutes; 90 seconds cuts the free-option window by an order of
-    ///      magnitude. What it costs is slack — a taker who leaves a wallet prompt
-    ///      unattended, or submits underpriced into a congested block, will see the quote
-    ///      rejected and must ask the service for a fresh one at the then-current price.
-    ///      That is the intended outcome: re-quote rather than honour stale paper.
-    ///
-    ///      Note the cap is measured against the EXECUTING block, not against signing
-    ///      time, so a cap below the issued TTL would not shorten a quote's life — it
-    ///      would forbid prompt execution and force the taker to wait until the quote was
-    ///      nearly expired. The cap must therefore always exceed the longest TTL the
-    ///      service issues: at 90s it clears today's ~60s class by 30 seconds, and a
-    ///      service change that issues longer-dated quotes must be re-checked against
-    ///      this number BEFORE it ships.
+    /// @notice Fallback quote lifetime when `maxQuoteTtl` is unset. NOT seeded by initialize.
+    /// @dev    A signed fixed price is a free option — the leak grows with the TTL — and 90s
+    ///         is ~7 Ethereum blocks: issuance, wallet approval, inclusion, no idling.
+    ///         Zero means UNSET, not zero seconds. Keeping this a fallback rather than a
+    ///         seed is what stops a proxy upgraded across the field's addition from
+    ///         rejecting every quote. Read only via `_effectiveMaxQuoteTtl`.
     uint64 public constant DEFAULT_MAX_QUOTE_TTL = 90 seconds;
 
     /// @dev Structural upper bound on `maxNavAgeSecs` (GYL-1135). Without it,
@@ -235,68 +187,12 @@ contract GyldAtomicSwap is
     ///      A `constant` costs no storage slot, so the ERC-7201 layout is unchanged.
     uint16 public constant MAX_QUOTE_DEVIATION_BPS_CEILING = 1000; // 10%
 
-    /// @dev Structural upper bound on `maxQuoteTtl` (GYL-1135). `setMaxQuoteTtl` had NO
-    ///      validation whatsoever and the field is `uint64`, so a single
-    ///      DEFAULT_ADMIN_ROLE call could push the cap past any real elapsed time and
-    ///      defeat quote expiry entirely — after which a leaked signed quote stays
-    ///      executable indefinitely, which is precisely the failure mode the F-4 TTL was
-    ///      added to prevent.
-    ///
-    ///      Note what this guard is and is NOT. Quote expiry is one of THREE containments
-    ///      on a leaked quote, and the only one that is timelocked. The two faster paths
-    ///      both act in a single block on hot keys held outside the timelock: `pause()`
-    ///      (PAUSER_ROLE, the ops multisig) halts every quote because executeSwap is
-    ///      `whenNotPaused`; and `setAllowed(taker, false)` (ALLOWLIST_ADMIN_ROLE, split
-    ///      off DEFAULT_ADMIN_ROLE for exactly this reason) kills every outstanding quote
-    ///      naming that taker, since quotes are taker-bound. Nor does the TTL protect the
-    ///      NAV band — `_checkQuoteBand` re-reads the feed LIVE on every execution, so a
-    ///      long-dated quote does not outlive the band's freshness. What the TTL actually
-    ///      bounds is the WINDOW in which a leaked quote can be exercised as an option
-    ///      before anyone notices, which is the case the two hot keys do not cover: they
-    ///      require someone to already know.
-    ///
-    ///      10 minutes is sized off the operational window, not off the NAV publication
-    ///      epoch. This ceiling was previously 1 hour, anchored to
-    ///      KaleidoscopeNAVFeed.MIN_UPDATE_INTERVAL on the argument that a quote must not
-    ///      outlive the NAV round it was priced against. That bound is real, but it is
-    ///      far looser than anything this contract needs — `_checkQuoteBand` re-reads the
-    ///      feed LIVE on every execution, so NAV freshness is already enforced
-    ///      independently of quote life. The binding constraint is the free-option window
-    ///      (see DEFAULT_MAX_QUOTE_TTL), and in normal operation the thing that actually
-    ///      binds is the 90s DEFAULT — not this ceiling. What this ceiling is for is the
-    ///      abnormal case: it is the escape hatch that lets an admin widen the window
-    ///      through a timelocked setMaxQuoteTtl when the chain itself is misbehaving
-    ///      (sustained congestion, a fee spike, an L1 reorg storm) and honest takers
-    ///      genuinely cannot get included inside 90 seconds. 10 minutes is deliberately
-    ///      generous for that job and still an order of magnitude below the old hour: the
-    ///      catastrophic setting (`uint64` reaches ~584 billion years, which would restore
-    ///      unbounded quote life) stays unreachable, as does any hour-scale setting.
-    ///
-    ///      THE TRADE-OFF, STATED PLAINLY: this is a `constant`, not a storage field.
-    ///      Anything up to 10 minutes is reachable through a timelocked setMaxQuoteTtl,
-    ///      but RAISING THE CEILING ITSELF REQUIRES A NEW IMPLEMENTATION AND A PROXY
-    ///      UPGRADE — an engineering and governance cycle, not the 48 h timelock. The
-    ///      moment that need is discovered is the moment an upgrade is hardest to run
-    ///      calmly, which is exactly why the ceiling is set with room to spare rather
-    ///      than shrink-wrapped around the default. The accepted cost is that 10 minutes
-    ///      is the permanent hard bound on the option window until someone ships code.
-    ///
-    ///      What breaks at the ceiling: any taker workflow needing a quote to stay live
-    ///      longer than ten minutes (collecting multisig signatures over an afternoon, or
-    ///      a wallet prompt left unattended) cannot be served by extending the TTL. The
-    ///      correct fix is for the quote service to re-issue a fresh quote at the current
-    ///      price, not for the chain to honour older paper.
-    ///
-    ///      Zero is permitted but no longer means "pin expiry to the current block" — it
-    ///      is the UNSET sentinel and falls back to DEFAULT_MAX_QUOTE_TTL (see that
-    ///      constant). Soft-pausing via the TTL was never usable anyway: setting it needs
-    ///      the 48 h timelock, whereas `pause()` is a hot key and one block.
-    ///      Enforced in setMaxQuoteTtl; initialize no longer writes the field at all.
-    ///
-    ///      This ceiling bounds the SETTER. It does not retro-narrow a value some earlier
-    ///      initializer already wrote to the slot — see the scope note on
-    ///      DEFAULT_MAX_QUOTE_TTL, and DEPLOYMENTS.md on why a pre-existing proxy is not
-    ///      upgraded into service.
+    /// @notice Structural upper bound on `maxQuoteTtl`, enforced in `setMaxQuoteTtl`.
+    /// @dev    Set well above the 90s default on purpose: this is the headroom an admin can
+    ///         reach through a timelocked `setMaxQuoteTtl` during an incident. Being a
+    ///         `constant`, widening it later needs a proxy upgrade — which is hardest to run
+    ///         calmly at exactly the moment you would need it. Bounds the setter only; it
+    ///         does not retro-narrow a value an earlier initializer already wrote.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 10 minutes;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
