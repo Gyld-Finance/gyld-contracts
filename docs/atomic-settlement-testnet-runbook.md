@@ -548,11 +548,29 @@ cast send $TOKEN "pause()" --private-key $PAUSER_KEY
 cast call $TOKEN "paused()(bool)"          # expected: true
 ```
 
-Step 3 leaves a window in which the token is transferable by anyone. Keep it short,
-and prefer a single full-balance withdrawal over several partial ones. If the incident
-is *itself* a reason the token must not move (a compromised holder mid-drain), weigh
-that against evacuating at all — leaving inventory in a paused token is a legitimate
-choice, and the swap's own pause already stops it being traded.
+Steps 2-4 are three separate transactions signed by **two different holders** — the
+token's `PAUSER_ROLE` (`OPS_MULTISIG`) does steps 2 and 4, the swap's `TREASURER_ROLE`
+(Kaleidoscope ops MPC wallet) does step 3. They cannot be batched atomically today: the
+roles are split, and the treasurer is an MPC wallet, i.e. an EOA, which cannot batch
+calls in one transaction. So the window between steps 2 and 4 is real.
+
+**The swap's inventory is not exposed during that window.** Only two paths move tokens
+out of this contract: `executeSwap` (`whenNotPaused` on the **swap**, which stays paused
+throughout — `GyldAtomicSwap.sol:452`) and `withdraw` (`TREASURER_ROLE` only, destination
+fixed to `withdrawalWallet` — `:790`). There is no third path. What the window does expose
+is **every other holder** of that bond token, who can transfer freely while the pause is
+lifted. Keep it short, and prefer a single full-balance withdrawal over several partial
+ones. If the incident is *itself* a reason the token must not move (a compromised holder
+mid-drain), weigh that against evacuating at all — leaving inventory in a paused token is
+a legitimate choice, and the swap's own pause already stops it being traded.
+
+> **Open decision — settle before mainnet.** Granting the ops Safe `TREASURER_ROLE` as
+> well would make all three steps one Safe MultiSend and close the window to zero blocks.
+> `TREASURER_ROLE` cannot redirect funds (destination is admin-fixed), so the
+> separation-of-duties cost is smaller than it looks — but it is a security-model change,
+> not a doc fix. `OPS_MULTISIG` is still unassigned for production (see the env table
+> above), so this is a topology choice, not a migration. TODO(ops): decide, or accept the
+> window explicitly.
 
 Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
 `test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot` and
