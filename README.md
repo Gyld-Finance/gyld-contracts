@@ -169,7 +169,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 522 tests, 20 suites; fuzz runs = 10000
+forge test                  # 524 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage --ir-minimum # plain `forge coverage` is stack-too-deep: it disables
                             # via_ir, which this source needs
@@ -195,7 +195,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 522 tests across 20 suites, all at full `foundry.toml` intensity.
+`forge test` — 524 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|

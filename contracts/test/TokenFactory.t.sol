@@ -99,6 +99,59 @@ contract TokenFactoryTest is Test {
         );
     }
 
+    // ── Post-deploy privilege surface (audit §18 item 1) ─────────────────────
+    //
+    // The factory's header used to claim it "holds no permanent permissions after
+    // deployment". That was false: REGISTRAR_ROLE on the IssuanceManager is held for
+    // the life of the stack. It is also REQUIRED — deployToken calls registerToken on
+    // every deployment, so revoking it bricks every subsequent deploy. These two tests
+    // pin the real shape so neither half can drift back into the wrong claim.
+
+    /// The factory KEEPS REGISTRAR_ROLE after deploying, and a second deploy proves why:
+    /// revoke it and this stops working.
+    function test_deployToken_factoryRetainsRegistrarRole_andNeedsIt() public {
+        assertTrue(
+            issuanceMgr.hasRole(issuanceMgr.REGISTRAR_ROLE(), address(factory)),
+            "precondition: factory holds REGISTRAR_ROLE"
+        );
+
+        _deploy();
+
+        assertTrue(
+            issuanceMgr.hasRole(issuanceMgr.REGISTRAR_ROLE(), address(factory)),
+            "factory must RETAIN REGISTRAR_ROLE - it is not shed, by design"
+        );
+
+        // Not vestigial: the role is consumed again on the next deployment. Revoke it
+        // and deployToken fails its own preflight.
+        issuanceMgr.revokeRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TokenFactory.MissingRegistrarRole.selector, address(factory), address(issuanceMgr)
+            )
+        );
+        factory.deployToken(
+            "Second Bond", "tBND2", "US912797KR73", TEST_MATURITY, operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// TOKEN-level roles ARE shed. The asymmetry with REGISTRAR_ROLE is the whole point:
+    /// those are needed only while the token is wired, so holding them would be real
+    /// standing privilege over a live series.
+    function test_deployToken_factoryShedsAllTokenRoles() public {
+        (address token,,) = _deploy();
+        GyldBondToken t = GyldBondToken(token);
+
+        assertFalse(t.hasRole(t.DEFAULT_ADMIN_ROLE(), address(factory)), "factory kept token admin");
+        assertFalse(t.hasRole(t.PAUSER_ROLE(),        address(factory)), "factory kept token pauser");
+        assertFalse(t.hasRole(t.MINTER_ROLE(),        address(factory)), "factory kept token minter");
+        assertFalse(t.hasRole(t.BURNER_ROLE(),        address(factory)), "factory kept token burner");
+        assertFalse(t.hasRole(t.DOCUMENT_ROLE(),      address(factory)), "factory kept token document");
+
+        // And admin landed on the factory owner (the timelock in production).
+        assertTrue(t.hasRole(t.DEFAULT_ADMIN_ROLE(), factory.owner()), "admin must go to factory owner");
+    }
+
     // ── constructor guards ────────────────────────────────────────────────────
 
     function test_constructor_zeroBondLogic_reverts() public {

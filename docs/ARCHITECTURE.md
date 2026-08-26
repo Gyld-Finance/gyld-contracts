@@ -4,7 +4,7 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on `main` @ `0678230` (522 tests,
+Verified against the Solidity on `main` @ `0678230` (524 tests,
 20 suites, all passing). Every claim here was checked against the source at the
 time of writing.
 
@@ -2234,7 +2234,7 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **522 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **524 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
@@ -2242,7 +2242,7 @@ intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 |---|---|---|
 | `GyldAtomicSwapTest` | 85 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts |
 | `KaleidoscopeNAVFeedTest` | 58 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`** |
-| `TokenFactoryTest` | 60 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
+| `TokenFactoryTest` | 62 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
 | `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
 | `GyldAtomicSwapSpecTest` | 48 | The numbered invariant / finding catalogue below |
@@ -2363,6 +2363,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. |
 | D-18 | **`answeredInRound` is deliberately not checked in `_checkQuoteBand`** (audit §4.10) | Chainlink **deprecated** the field — modern OCR aggregators return it equal to `roundId`, as does `KaleidoscopeNAVFeed` by construction, so the classic `answeredInRound < roundId` guard is structurally unable to fire on any feed we would point at. Adding it would be dead code on the hot path. Staleness is enforced on `updatedAt` against the 72 h-ceilinged `maxNavAgeSecs` plus a future-dating guard (F-6). Revisit only if an upstream is adopted whose `answeredInRound` can genuinely lag `roundId`. [§5.7](#57-gyldatomicswap) |
 | D-17 | **ERC-8056 dropped on EVM** (GYL-1201) | Splits standard used as a NAV mirror; no EVM wallet implements it; observed display divergence on our own deployment; nobody in our category uses it. Standing record: [`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md). [§8.3](#83-erc-8056-was-evaluated-and-dropped) |
+| D-21 | **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently, and that is required** (audit §18 item 1) | `deployToken` calls `registerToken` on *every* deployment, not just the first, so revoking the role would brick every subsequent deploy. Token-level roles are a different case and *are* shed — `_wireRoles` self-revokes `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, which are needed only while that one token is wired. What bounds the retained role: the factory is immutable (no proxy, no upgrade path) and contains no call to `deregisterToken`, the only other function it gates; its one `registerToken` call site targets a token CREATE2-deployed three lines earlier in the same transaction. The `IssuanceManager` admin (the timelock) can revoke it at any time, at the cost of disabling further deploys. Both halves pinned by `test_deployToken_factoryRetainsRegistrarRole_andNeedsIt` and `test_deployToken_factoryShedsAllTokenRoles`. |
 | D-20 | **Every cross-contract interface has exactly one declaration, in `contracts/interfaces/`, and implementers declare it** (audit §4.8) | Interfaces used to be restated per file — `ISanctionsList` twice, and three overlapping oracle shapes. Solidity types are per-declaration, so identical copies are unrelated types the compiler cannot cross-check, and implementers that merely *happened* to expose the right functions declared nothing. Renaming `SanctionsOracleMirror.isSanctioned` compiled cleanly across every production contract; only a test caught it. One shared declaration plus `is` on the implementer turns that into a build failure in the contract itself. |
 | D-19 | **No privileged bypass on the NAV write guards** — `emergencyUpdateAnswer` and `setEmergencyUpdater` removed | The premise for the bypass (D-7, now [superseded](#173-superseded--recorded-so-it-is-not-re-litigated)) was **arithmetically false**: the deviation band is relative to the *last stored* price, and `last` moves with each push, so chaining reaches **any** in-band fat-finger in **n = 2** calls. The bypass therefore bought ~2 hours of latency and cost an unbounded instant-price primitive that a compromised KMS key could reach in one extra transaction. The replacement procedure — `pause()` the token, chain `updateAnswer`, `unpause()` — adds no new privilege. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
 
@@ -2428,12 +2429,15 @@ Carried forward honestly. Ordered by severity.
 
 ### High
 
-1. **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently.**
-   Neither the contract nor `DeployDevNet.s.sol` ever revokes it — on any stack
-   deployed by the factory, `hasRole(REGISTRAR_ROLE, factory) == true`. The
-   exploitable surface is narrow (the factory is immutable and has no `registerToken`
-   passthrough) but the README asserted the opposite as a security property, and any
-   threat model built on that assertion is wrong.
+1. ~~**`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently.**~~
+   **Resolved — it was a documentation defect, not a privilege defect.** The role is
+   held for the life of the stack and *must* be: `deployToken` calls `registerToken`
+   on every deployment, so revoking it bricks every subsequent deploy. The finding was
+   that `TokenFactory`'s own header claimed the factory "holds no permanent permissions
+   after deployment" — the last place still asserting the opposite, after README and
+   this document had been corrected. That header now states the real shape and what
+   bounds it, and both halves (role retained, token-level roles shed) are pinned by
+   test. See **D-21**.
 2. **The NAV feed is the sole on-chain value-display channel.** It is load-bearing
    for display as well as for pricing.
 3. **The atomic swap's loss ceiling is unbounded under `DEFAULT_ADMIN_ROLE`

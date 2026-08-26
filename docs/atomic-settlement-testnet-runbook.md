@@ -2,7 +2,7 @@
 
 Deployment runbook and readiness assessment for taking the **self-custodial**
 `GyldAtomicSwap` stack to a public testnet. Updated for the GYL-1135 deploy
-hardening (522 Forge tests passing); section 8 is the fresh-deploy checklist.
+hardening (524 Forge tests passing); section 8 is the fresh-deploy checklist.
 
 **Guard note — read this with section 8.** GYL-1135 made the deploy scripts fail
 closed on production chains, but **Sepolia (11155111) is on the dev allowlist**
@@ -185,7 +185,7 @@ CLI-level (from `.env.example` — all still placeholders there): `PRIVKEY`
 
 ```bash
 forge build            # must compile clean at solc 0.8.28
-forge test             # 522 tests must pass
+forge test             # 524 tests must pass
 python3 ci/check_chain_guards.py      # every deploy script carries an allowlist guard
 cast chain-id --rpc-url $RPC          # expect 11155111
 cast balance $WALLET --rpc-url $RPC   # expect enough for ~15–20 txs
