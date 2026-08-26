@@ -140,7 +140,7 @@ assertions that abort the deployment on a mismatch. See
 
 - **Sanctions:** every `transfer` / `transferFrom` on `GyldBondToken` screens sender,
   receiver **and spender** against the configured on-chain oracle. Fail-closed — if
-  the oracle reverts, the transfer reverts. No role bypasses this; the contract uses
+  the oracle reverts, or its address is unset, the transfer reverts. No role bypasses this; the contract uses
   `AccessControl`, so there is no `owner` at all. Mint and burn skip the oracle
   (`IssuanceManager` pre-screens APs off-chain) but still respect `whenNotPaused`.
 - **Pause:** `PAUSER_ROLE` halts mint, burn, transfer, transferFrom, approve and
@@ -166,7 +166,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 536 tests, 20 suites; fuzz runs = 10000
+forge test                  # 540 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage --ir-minimum # plain `forge coverage` is stack-too-deep: it disables
                             # via_ir, which this source needs
@@ -192,7 +192,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 536 tests across 20 suites, all at full `foundry.toml` intensity.
+`forge test` — 540 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|

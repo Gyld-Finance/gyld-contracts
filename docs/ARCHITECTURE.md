@@ -4,7 +4,7 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on `main` @ `20f2211` (536 tests,
+Verified against the Solidity on `main` @ `0678230` (540 tests,
 20 suites, all passing). Every claim here was checked against the source at the
 time of writing.
 
@@ -285,21 +285,32 @@ function transferFrom(address from, address to, uint256 amount) public override 
 }
 ```
 
-`_requireAccess` reverts with the **custom error** `AccountSanctioned(address)`
-— not a string `require`, which is what two older docs claimed:
+`_requireAccess` reverts with **custom errors** — `AccountSanctioned(address)`
+when the oracle says the account is sanctioned, `SanctionsListNotSet()` when the
+oracle address is unset — not a string `require`, which is what two older docs
+claimed:
 
 ```solidity
 function _requireAccess(address account) internal view {
     ISanctionsList sl = _getStorage().sanctionsList;
-    if (address(sl) != address(0) && sl.isSanctioned(account)) revert AccountSanctioned(account);
+    if (address(sl) == address(0)) revert SanctionsListNotSet();
+    if (sl.isSanctioned(account)) revert AccountSanctioned(account);
 }
 ```
 
-The `!= address(0)` short-circuit is vestigial defence: both `initialize` and
-`setSanctionsList` reject zero, so `sanctionsList` is always non-zero on a live
-token and the check always runs. **Fail-closed** is a property of the call
-shape, not of an explicit branch: `sl.isSanctioned(account)` is a plain external
+**Fail-closed on every arm.** `sl.isSanctioned(account)` is a plain external
 call, so if the oracle reverts or is not a contract, the whole transfer reverts.
+The unset-list case is handled by an explicit branch rather than left implicit.
+
+That branch is not expected to fire: `initialize` and `setSanctionsList` both
+reject zero, so `sanctionsList` is non-zero on any live token. It is checked
+anyway because the earlier form guarded it with a short-circuit —
+`if (address(sl) != address(0) && sl.isSanctioned(account))` — which *skipped
+screening entirely* when the slot was zero. That made a mandatory compliance
+control depend on an invariant maintained by hand in two separate functions; a
+third writer forgetting its zero-check would have silently disabled screening
+instead of failing. Unreachable-but-loud is the correct posture here, and the
+cost is negative — the inverted branch is marginally cheaper (audit §4.1).
 
 **`approve` / `permit` do not screen the spender.** Granting an allowance to a
 sanctioned address succeeds — no tokens move at approval time. Enforcement fires
@@ -332,10 +343,12 @@ role management for the lifetime of the bond. Intentional removal must go throug
 
 `setSanctionsList(newSanctionsList)` is `DEFAULT_ADMIN_ROLE`-gated, applies the
 same 32-byte staticcall probe, and **rejects `address(0)`**. Disabling the oracle
-is not permitted: a token with no oracle would silently skip all sanctions
-checks, which is a worse compliance outcome than a frozen token. The emergency
-path when an oracle is compromised is to deploy a replacement and point at it —
-replace, never remove.
+is not permitted: a token with no oracle is a worse compliance outcome than a
+frozen token. The emergency path when an oracle is compromised is to deploy a
+replacement and point at it — replace, never remove. If the slot ever reached
+zero regardless, `_requireAccess` reverts `SanctionsListNotSet` rather than
+waving transfers through, so this rejection is defence in depth rather than the
+sole guarantee.
 
 There is **no `ReentrancyGuard`** on this contract, and that is deliberate. The
 only external call on the transfer path is the read-only sanctions oracle inside
@@ -729,6 +742,12 @@ Three properties:
 - **Fail-closed.** A revert, a non-contract, or malformed returndata all revert
   `InvalidForwardingOracle`, which propagates up through
   `GyldBondToken._requireAccess` and reverts the transfer.
+  Note the deliberate asymmetry with `GyldBondToken.sanctionsList`: the mirror's
+  `forwardingOracle` is **optional**, so `address(0)` is an accepted configuration
+  meaning "forwarding disabled" and the read short-circuits to the local list. The
+  token's `sanctionsList` is **mandatory** — zero is rejected by both `initialize`
+  and `setSanctionsList`, and `_requireAccess` reverts `SanctionsListNotSet` if it
+  is somehow reached. Absence is a configured state here and a fault there.
 
 `name()` returns **`"Gyld sanctions oracle"`**, not `"Chainalysis sanctions
 oracle"`. There is also **no `isSanctionedVerbose(address)`** function.
@@ -1506,8 +1525,10 @@ supply, the oracle governs who can move it.
 
 The oracle call in `_requireAccess` is an ordinary external call. If the oracle
 reverts, is not a contract, runs out of the forwarding gas budget, or returns
-malformed data, **the transfer reverts**. There is no fail-open branch and no
-try/catch.
+malformed data, **the transfer reverts**. If the oracle address is unset, the
+transfer reverts `SanctionsListNotSet`. There is no fail-open branch and no
+try/catch — as of audit §4.1 that is literally true rather than incidentally
+true, the last short-circuit having been removed.
 
 The operational consequences are worth being explicit about:
 
@@ -1516,8 +1537,9 @@ The operational consequences are worth being explicit about:
 - **The recovery path is `setSanctionsList(newOracle)`**, gated by
   `DEFAULT_ADMIN_ROLE` — the timelock — so recovery takes 48 h on production. The
   oracle can be *replaced* but never *removed*: `address(0)` is rejected, because a
-  token with no oracle silently skips all checks, which is a worse compliance
-  outcome than a frozen token.
+  token with no oracle is a worse compliance outcome than a frozen token. An unset
+  list is not an escape hatch either — it reverts `SanctionsListNotSet`, which is a
+  frozen token by another name.
 - **A `SanctionsOracleMirror` with a broken `forwardingOracle` is recoverable
   faster**, via `setForwardingOracle(address(0))` from the compliance
   `DEFAULT_ADMIN_ROLE` — but that also drops every address inherited from the
@@ -1819,6 +1841,9 @@ cost is that additions like `stalenessSeconds()` reach only future deployments.
   `MULTIPLIER_UPDATER_ROLE` / `UI_MULTIPLIER_ROLE` to `GyldBondToken`.
 - Never add an internal blocklist mapping, and never add a role-based carve-out to
   `_requireAccess`.
+- Never reintroduce a zero-address short-circuit in `_requireAccess`. An unset
+  `sanctionsList` must revert, never skip screening (audit §4.1). Any new writer of
+  that slot must reject zero, and must not be the only thing that does.
 - Never add an owner-callable bypass of the NAV feed's deviation cap.
 - Never add a staleness revert to a read path.
 - Never add `pendingRedemption` / `deposited` accounting to `IssuanceManager`
@@ -2125,7 +2150,7 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **536 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **540 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
@@ -2137,7 +2162,7 @@ intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 | `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
 | `GyldAtomicSwapSpecTest` | 48 | The numbered invariant / finding catalogue below |
-| `GyldBondTokenTest` | 42 | Core token functions; ERC-1643 document set/remove and `DOCUMENT_ROLE` gating |
+| `GyldBondTokenTest` | 46 | Core token functions; ERC-1643 document set/remove and `DOCUMENT_ROLE` gating; fail-closed screening on an unset sanctions list |
 | `NAVFeedForwarderTest` | 39 | Delegation, upstream swap, probe matrix, future-dated rejection, access control |
 | `TimelockTest` | 15 | 48 h delay enforcement, cancellation, `IssuanceManager` admin wiring |
 | `GyldBondTokenUnitTest` | 15 | Sanctions transfer paths, `setSanctionsList`, pause |

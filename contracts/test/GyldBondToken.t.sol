@@ -495,6 +495,86 @@ contract GyldBondTokenTest is Test {
         token.setSanctionsList(address(newOracle));
     }
 
+    // ── Fail-closed on an unset sanctions list (audit §4.1) ───────────────────
+    //
+    // `_requireAccess` used to read
+    //     if (address(sl) != address(0) && sl.isSanctioned(account)) revert ...
+    // whose `&&` short-circuits: a zero `sanctionsList` skipped screening entirely
+    // and every transfer succeeded unscreened. That is fail-OPEN on the compliance
+    // path. It was unreachable — `initialize` and `setSanctionsList` both reject
+    // zero (pinned by test_initialize_zeroSanctionsList_reverts and
+    // test_setSanctionsList_zeroAddress_reverts) — but the guard depended on an
+    // invariant maintained by hand in two places, so a third writer that forgot
+    // its zero-check would have silently disabled screening rather than failing.
+    //
+    // The zero state therefore cannot be reached through the public API, and these
+    // tests write the slot directly. That is the point: they pin what happens in a
+    // state only a future bug can produce.
+
+    /// Zeroing `sanctionsList` makes secondary transfers revert `SanctionsListNotSet`
+    /// rather than sail through unscreened.
+    function test_transfer_unsetSanctionsList_revertsFailClosed() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+
+        _zeroSanctionsListSlot();
+        assertEq(address(token.sanctionsList()), address(0), "precondition: list is unset");
+
+        vm.prank(ap);
+        vm.expectRevert(GyldBondToken.SanctionsListNotSet.selector);
+        token.transfer(address(0xB0B), 1e18);
+    }
+
+    /// The spender leg (`_requireAccess(_msgSender())` in `transferFrom`) fails closed too.
+    function test_transferFrom_unsetSanctionsList_revertsFailClosed() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+        vm.prank(ap); token.approve(address(this), 1e18);
+
+        _zeroSanctionsListSlot();
+
+        vm.expectRevert(GyldBondToken.SanctionsListNotSet.selector);
+        token.transferFrom(ap, address(0xB0B), 1e18);
+    }
+
+    /// Mint and burn deliberately skip `_requireAccess` (IssuanceManager pre-screens APs
+    /// off-chain), so an unset list must NOT brick primary issuance. Pins that the new
+    /// guard did not widen its blast radius beyond the secondary path.
+    function test_mintBurn_unsetSanctionsList_stillWork() public {
+        // Position the tokens while the list is still set — `redeem` burns from the
+        // manager's own balance, so getting them there is a secondary transfer and
+        // would (correctly) fail closed after the slot is zeroed.
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+        vm.prank(ap);     token.transfer(address(mgr), 40e18);
+
+        _zeroSanctionsListSlot();
+
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 10e18);
+        assertEq(token.balanceOf(ap), 70e18, "mint must survive an unset list");
+
+        vm.prank(issuer); mgr.redeem(address(token), ap, 40e18);
+        assertEq(token.balanceOf(address(mgr)), 0, "burn must survive an unset list");
+    }
+
+    /// A configured list still produces `AccountSanctioned`, not the new error — the
+    /// two failure modes stay distinguishable to an integrator.
+    function test_transfer_sanctionedAccount_stillRevertsAccountSanctioned() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+        mockSanctions.setSanctioned(address(0xB0B), true);
+
+        vm.prank(ap);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.AccountSanctioned.selector, address(0xB0B)));
+        token.transfer(address(0xB0B), 1e18);
+    }
+
+    /// Force `sanctionsList` to zero. The ERC-7201 root is re-derived from the namespace
+    /// string rather than hard-coded, so this cannot drift from the contract; `sanctionsList`
+    /// is offset 0 and sole occupant of that word, so zeroing the whole slot is exact.
+    /// Same derivation as test_storageLayout_erc7201OffsetsArePinned.
+    function _zeroSanctionsListSlot() internal {
+        bytes32 root = keccak256(abi.encode(uint256(keccak256("gyld.GyldBondToken")) - 1))
+            & ~bytes32(uint256(0xff));
+        vm.store(address(token), root, bytes32(0));
+    }
+
     // ── renounceRole guard ────────────────────────────────────────────────────
 
     function test_renounceRole_defaultAdmin_reverts() public {
