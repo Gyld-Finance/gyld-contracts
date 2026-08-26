@@ -29,8 +29,12 @@ import "./IssuanceManager.sol";
 /// factory owner MUST be a TimelockController — this guarantees a mandatory delay on
 /// all role changes, role grants, and UUPS upgrades on every deployed token.
 ///
-/// The factory holds no permanent permissions after deployment.
-/// DEFAULT_ADMIN_ROLE is self-revoked from the factory at the end of _wireRoles.
+/// TOKEN-level roles are shed: `_wireRoles` self-revokes `PAUSER_ROLE` and
+/// `DEFAULT_ADMIN_ROLE` from the factory on every token it deploys.
+///
+/// `REGISTRAR_ROLE` on the IssuanceManager is NOT, and must not be — `deployToken` calls
+/// `registerToken` on every deployment, so revoking it bricks all later deploys. What
+/// bounds it, and why that is safe: ARCHITECTURE.md D-21.
 ///
 /// The factory owner should be a TimelockController (48-hour delay) in production.
 contract TokenFactory is Ownable2Step, ReentrancyGuard {

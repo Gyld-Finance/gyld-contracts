@@ -20,7 +20,7 @@ Solidity `0.8.28`, compiled with Foundry, on OpenZeppelin v5.3.0.
 | `GyldBondToken` | UUPS | ERC-20 per bond series. Fixed balances — value accrues in the NAV feed, never in balances. On-chain sanctions check on every secondary transfer, fail-closed. Pausable. EIP-2612 permit. IERC-1643 document management (prospectus / supplements), gated by `DOCUMENT_ROLE`. |
 | `IssuanceManager` | UUPS | Single mint/burn gate for all bond series. Only whitelisted Authorised Participants (APs) may receive minted tokens or be recorded as redemption beneficiaries. |
 | `TokenFactory` | None (`Ownable2Step`) | Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed, NAVFeedForwarder)` triple atomically and wires the token's roles in one transaction. |
-| `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval, plus a separate-key emergency override. |
+| `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval. Both guards are unconditional — `updateAnswer` is the only write path and nothing bypasses it. |
 | `NAVFeedForwarder` | None (`Ownable2Step`) | Permanent, stable oracle address that forwards reads to a swappable upstream. DeFi protocols point here — **never** at `KaleidoscopeNAVFeed` directly. |
 | `SanctionsOracleMirror` | None | The platform sanctions oracle on **every** production EVM chain, Ethereum mainnet included (GYL-1051). A keeper bot syncs OFAC deltas into its local list; an optional gas-capped, fail-closed `forwardingOracle` can chain to a vendor oracle. |
 | `GyldAtomicSwap` | UUPS | Self-custodial atomic USDC⇄bond settlement against platform-signed EIP-712 quotes. **Holds its own inventory** — there is no vault, and it grants no standing outbound allowance. Taker binding, taker allowlist, single-use quotes, NAV sanity band. Net inventory leaves only via `withdraw()`, and only to the admin-fixed `withdrawalWallet`. |
@@ -55,14 +55,17 @@ GyldAtomicSwap
                           EIP-712 signer, so a revoke kills every in-flight quote
   ALLOWLIST_ADMIN_ROLE →  KYC/compliance hot key; setAllowed() and nothing else
   TREASURER_ROLE       →  Ops MPC wallet; withdraw() to the fixed withdrawalWallet.
-                          Deliberately live while paused (incident evacuation)
+                          Deliberately live while the SWAP is paused (incident
+                          evacuation). A paused bond token still gates its own
+                          leg — by design; unpause it first, see the runbook
   PAUSER_ROLE          →  Ops multisig; pause() ONLY — resuming needs the admin
 
 SanctionsOracleMirror
   SANCTIONS_UPDATER_ROLE →  Keeper bot (add / remove sanctioned addresses)
 
-KaleidoscopeNAVFeed.owner       →  KMS signer (pushes NAV)
-KaleidoscopeNAVFeed.emergencyUpdater → Ops Safe; contract-enforced ≠ owner()
+KaleidoscopeNAVFeed.owner       →  KMS signer (pushes NAV). The ONLY write path;
+                                    no bypass exists, so this key's ceiling is
+                                    genuinely 10%/hour. See ARCHITECTURE D-19
 NAVFeedForwarder.owner          →  TimelockController (oracle provider swaps)
 TokenFactory.owner              →  TimelockController
 ```
@@ -140,7 +143,7 @@ assertions that abort the deployment on a mismatch. See
 
 - **Sanctions:** every `transfer` / `transferFrom` on `GyldBondToken` screens sender,
   receiver **and spender** against the configured on-chain oracle. Fail-closed — if
-  the oracle reverts, the transfer reverts. No role bypasses this; the contract uses
+  the oracle reverts, or its address is unset, the transfer reverts. No role bypasses this; the contract uses
   `AccessControl`, so there is no `owner` at all. Mint and burn skip the oracle
   (`IssuanceManager` pre-screens APs off-chain) but still respect `whenNotPaused`.
 - **Pause:** `PAUSER_ROLE` halts mint, burn, transfer, transferFrom, approve and
@@ -166,7 +169,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 536 tests, 20 suites; fuzz runs = 10000
+forge test                  # 524 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage --ir-minimum # plain `forge coverage` is stack-too-deep: it disables
                             # via_ir, which this source needs
@@ -192,7 +195,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 536 tests across 20 suites, all at full `foundry.toml` intensity.
+`forge test` — 524 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|
@@ -203,7 +206,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 | `GyldBondToken.t.sol` | Transfer, sanctions, pause, permit, role management, storage slot-pinning, UUPS upgrade, IERC-1643 document management |
 | `GyldBondToken.invariants.t.sol` | Supply invariants under fuzz |
 | `IssuanceManager.t.sol` | Subscribe, redeem, whitelist, token registry, role isolation, UUPS |
-| `KaleidoscopeNAVFeed.t.sol` | Price updates, deviation guard, interval guard, emergency updater + key separation, and `test_noStalenessRevertPathExists` |
+| `KaleidoscopeNAVFeed.t.sol` | Price updates, deviation guard, interval guard, non-renounceable ownership, chained-update recovery from an in-band fat-finger, and `test_noStalenessRevertPathExists` |
 | `NAVFeedForwarder.t.sol` | Oracle forwarding, upstream swap, probe validation, future-dated rejection |
 | `SanctionsOracleMirror.t.sol` | Add/remove, role separation, forwarding-oracle probe and gas cap |
 | `TokenFactory.t.sol` | Atomic deployment, CREATE2 prediction, role wiring, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |

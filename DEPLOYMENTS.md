@@ -132,7 +132,7 @@ script is not in the tree — the source is preserved by the tag
    | `0xb7Fc5791910CeddB54BbD53136D2cfc67719A2B4` | 191216DP2 | 0 |
    | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | GTB8056 | 1e20 |
 
-   Because screening is fail-closed (`GyldBondToken._update` → `_checkNotSanctioned`
+   Because screening is fail-closed (`GyldBondToken._update` → `_requireAccess`
    → revert `AccountSanctioned`), any caller can freeze transfers for every holder of
    all four. Two carry supply.
 

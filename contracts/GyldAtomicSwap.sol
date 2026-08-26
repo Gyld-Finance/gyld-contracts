@@ -10,13 +10,9 @@ import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/crypt
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @dev Read-only view of a NAVFeedForwarder (Chainlink AggregatorV3 shape, 8 decimals).
-interface INavForwarder {
-    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
-    function decimals() external view returns (uint8);
-}
-
 /// @title GyldAtomicSwap
 /// @notice Self-custodial atomic two-leg settlement against platform-signed EIP-712
 ///         quotes. This contract HOLDS its own inventory (USDC, USDG, bond tokens):
@@ -176,9 +172,13 @@ contract GyldAtomicSwap is
     ///      What breaks at the ceiling: a quote priced more than 10% away from the last
     ///      published NAV can never settle. That is intended — such a quote is either
     ///      stale-priced or wrong. The correct operational response to a real >10% gap is
-    ///      to publish the new NAV (KaleidoscopeNAVFeed.emergencyUpdateAnswer bypasses the
-    ///      feed's own interval/deviation guards for exactly this) and then trade at the
-    ///      refreshed price — NOT to widen this band and trade against a dead one.
+    ///      to walk the published NAV up to the new level and then trade at the refreshed
+    ///      price — NOT to widen this band and trade against a dead one. The feed has no
+    ///      privileged bypass: `updateAnswer` is chained, one ≤10% step per hour, and the
+    ///      band is measured against the LAST stored price so it moves with each push. If
+    ///      the interim prices must not be traded or liquidated against, `pause()` the bond
+    ///      token for the duration — that also blocks swaps here, which is the point.
+    ///      See ARCHITECTURE §11.5 and D-19.
     ///
     ///      Zero remains permitted: that is the RESTRICTIVE end (quotes must match NAV
     ///      exactly — effectively a soft-pause), and a soft-pause is safe.
@@ -562,7 +562,11 @@ contract GyldAtomicSwap is
         uint256 usdcAmount = buy ? amountIn : amountOut;
 
         // navForwarderOf[bondToken] is guaranteed non-zero (set atomically in registerSeries).
-        (, int256 nav,, uint256 updatedAt,) = INavForwarder($.navForwarderOf[bondToken]).latestRoundData();
+        // roundId/startedAt/answeredInRound are deliberately discarded. Chainlink deprecated
+        // answeredInRound and OCR aggregators return it equal to roundId, as does
+        // KaleidoscopeNAVFeed — so an `answeredInRound < roundId` guard cannot fire on any
+        // feed we would point at. Staleness rides on updatedAt below (D-18, audit §4.10).
+        (, int256 nav,, uint256 updatedAt,) = AggregatorV3Interface($.navForwarderOf[bondToken]).latestRoundData();
         if (nav <= 0) revert InvalidNav(bondToken, nav);
         // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
         // (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — treat as stale.
@@ -630,6 +634,13 @@ contract GyldAtomicSwap is
     ///         contract still holds inventory of the series — silently orphaning
     ///         inventory that can no longer be priced or served is unsafe. Wind the
     ///         series down first (withdraw the remaining balance).
+    ///
+    ///         A PAUSED bond token blocks this call. Clearing the balance requires
+    ///         withdraw(), which a paused token blocks (see withdraw below), so the
+    ///         revert you get is SeriesNotEmpty — naming the balance, not the pause
+    ///         that is stopping you from clearing it. Check token.paused() before
+    ///         opening the timelock proposal; see the runbook's "Evacuating a paused
+    ///         bond token".
     /// @param token Registered bond series to remove.
     function deregisterSeries(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();
@@ -759,7 +770,21 @@ contract GyldAtomicSwap is
     ///         tokens) — this is how NET flow leaves for the broker/treasury bridge.
     /// @dev    Caller must hold TREASURER_ROLE. Deliberately NOT whenNotPaused: the
     ///         treasury drain must work during an incident pause so funds can be
-    ///         evacuated. CEI: no state to write; single external transfer guarded by
+    ///         evacuated.
+    ///
+    ///         Scope of that exemption: it covers THIS contract's pause only. Moving a
+    ///         GyldBondToken calls its `transfer`, which is `whenNotPaused` on the token,
+    ///         so a paused bond token blocks its own evacuation — the revert is
+    ///         `EnforcedPause`, raised by that `whenNotPaused` modifier on
+    ///         GyldBondToken.transfer itself, not here and not in the token's
+    ///         `_update` (which carries only the sanctions check). That is a
+    ///         design requirement: a pause inventory can be moved through is not a pause,
+    ///         and the swap holds no privileged position on the token. Do not add a
+    ///         bypass. Operators unpause the token, withdraw, then re-pause (PAUSER_ROLE
+    ///         on the token — no admin, no timelock); see the runbook's "Evacuating a
+    ///         paused bond token". USDC has no pause and is unaffected.
+    ///
+    ///         CEI: no state to write; single external transfer guarded by
     ///         nonReentrant (shared with executeSwap). The treasurer can never redirect
     ///         — funds only ever go to the admin-fixed withdrawalWallet. Reverts
     ///         ZeroAddress until the admin has set the withdrawalWallet (fail-closed).

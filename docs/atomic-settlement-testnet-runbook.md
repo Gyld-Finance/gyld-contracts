@@ -2,7 +2,7 @@
 
 Deployment runbook and readiness assessment for taking the **self-custodial**
 `GyldAtomicSwap` stack to a public testnet. Updated for the GYL-1135 deploy
-hardening (536 Forge tests passing); section 8 is the fresh-deploy checklist.
+hardening (524 Forge tests passing); section 8 is the fresh-deploy checklist.
 
 **Guard note — read this with section 8.** GYL-1135 made the deploy scripts fail
 closed on production chains, but **Sepolia (11155111) is on the dev allowlist**
@@ -185,7 +185,7 @@ CLI-level (from `.env.example` — all still placeholders there): `PRIVKEY`
 
 ```bash
 forge build            # must compile clean at solc 0.8.28
-forge test             # 536 tests must pass
+forge test             # 524 tests must pass
 python3 ci/check_chain_guards.py      # every deploy script carries an allowlist guard
 cast chain-id --rpc-url $RPC          # expect 11155111
 cast balance $WALLET --rpc-url $RPC   # expect enough for ~15–20 txs
@@ -498,8 +498,83 @@ evacuate funds, then fix under the timelock.
 | Kill every outstanding quote | `DEFAULT_ADMIN_ROLE` — timelock (schedule + execute) | timelock proposal calling `bumpQuoteEpoch()` on `$SWAP` | All quotes signed for the old epoch revert `QuoteEpochStale`; quote service must re-issue |
 | Cut off a taker | `ALLOWLIST_ADMIN_ROLE` — KMS allowlist key (hot, survives handover by design) | `cast send $SWAP "setAllowed(address,bool)" <taker> false --private-key $ALLOWLIST_ADMIN_KEY` | Immediate, no timelock delay — this is why GYL-1050 split the role |
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
-| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect; works while paused |
+| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **A paused bond token blocks its own evacuation** — see "Evacuating a paused bond token" below |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
+
+### Evacuating a paused bond token
+
+**There are two independent pause switches, and only one of them `withdraw()` ignores.**
+
+`withdraw()` deliberately carries no `whenNotPaused`, so the **swap's** pause never
+blocks evacuation. But moving a bond token means calling that token's `transfer`, and
+`GyldBondToken.transfer` *is* `whenNotPaused`. So if you paused the bond token as well
+— which is the natural incident response — the evacuation of that token reverts:
+
+```
+swap.withdraw(bondToken, amt)
+  └─ IERC20(bondToken).safeTransfer(withdrawalWallet, amt)
+       └─ GyldBondToken.transfer  ← whenNotPaused  ← REVERTS EnforcedPause
+            (_update is never entered — the modifier reverts first, and _update
+             carries only the sanctions check, no pause gate)
+```
+
+The revert comes from the **token**, not the swap. `cast` will show `EnforcedPause()`
+with no further context, which is easy to misread as the swap's pause; it is not.
+
+**This is a design requirement, not a defect.** A pause that inventory can still be
+moved through is not a pause. The token's pause is the stronger statement and it is
+meant to win. Do not "fix" this by adding a bypass in `withdraw()` — `GyldAtomicSwap`
+holds no privileged position on the token and must not be given one.
+
+**Cash is unaffected.** USDC has no pause of its own, so USDC evacuates normally with
+both switches pulled. The asymmetry is the part to know in advance.
+
+**The remedy, in order:**
+
+```bash
+# 1. Confirm this is what you are hitting, not the swap's pause.
+cast call $TOKEN "paused()(bool)"          # expected: true
+cast call $SWAP  "paused()(bool)"          # informational — irrelevant to withdraw()
+
+# 2. Lift the TOKEN's pause. PAUSER_ROLE only — not the token's admin, not the
+#    timelock. Same ops multisig that paused it, no 48 h wait.
+cast send $TOKEN "unpause()" --private-key $PAUSER_KEY
+
+# 3. Evacuate. The swap stays paused throughout — the hot path never reopens.
+cast send $SWAP "withdraw(address,uint256)" $TOKEN <amount> --private-key $TREASURER_KEY
+
+# 4. Re-pause the token immediately.
+cast send $TOKEN "pause()" --private-key $PAUSER_KEY
+cast call $TOKEN "paused()(bool)"          # expected: true
+```
+
+Steps 2-4 are three separate transactions signed by **two different holders** — the
+token's `PAUSER_ROLE` (`OPS_MULTISIG`) does steps 2 and 4, the swap's `TREASURER_ROLE`
+(Kaleidoscope ops MPC wallet) does step 3. They cannot be batched atomically today: the
+roles are split, and the treasurer is an MPC wallet, i.e. an EOA, which cannot batch
+calls in one transaction. So the window between steps 2 and 4 is real.
+
+**The swap's inventory is not exposed during that window.** Only two paths move tokens
+out of this contract: `executeSwap` (`whenNotPaused` on the **swap**, which stays paused
+throughout — `GyldAtomicSwap.sol:452`) and `withdraw` (`TREASURER_ROLE` only, destination
+fixed to `withdrawalWallet` — `:790`). There is no third path. What the window does expose
+is **every other holder** of that bond token, who can transfer freely while the pause is
+lifted. Keep it short, and prefer a single full-balance withdrawal over several partial
+ones. If the incident is *itself* a reason the token must not move (a compromised holder
+mid-drain), weigh that against evacuating at all — leaving inventory in a paused token is
+a legitimate choice, and the swap's own pause already stops it being traded.
+
+> **Open decision — settle before mainnet.** Granting the ops Safe `TREASURER_ROLE` as
+> well would make all three steps one Safe MultiSend and close the window to zero blocks.
+> `TREASURER_ROLE` cannot redirect funds (destination is admin-fixed), so the
+> separation-of-duties cost is smaller than it looks — but it is a security-model change,
+> not a doc fix. `OPS_MULTISIG` is still unassigned for production (see the env table
+> above), so this is a topology choice, not a migration. TODO(ops): decide, or accept the
+> window explicitly.
+
+Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
+`test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot` and
+`test_withdraw_bondToken_afterTokenUnpause_succeeds` in `GyldAtomicSwap.t.sol`.
 
 Notes:
 
@@ -510,7 +585,8 @@ Notes:
   revision once provisioned; this runbook deliberately names no key custodians.
 - Rehearse the full sequence (pause → epoch bump → allowlist revoke → withdraw →
   unpause) once on Sepolia before any mainnet planning; it doubles as the role-wiring
-  acceptance test.
+  acceptance test. Rehearse it with a **bond token**, not just USDC — a USDC-only
+  rehearsal walks straight past the paused-token case above.
 
 ---
 

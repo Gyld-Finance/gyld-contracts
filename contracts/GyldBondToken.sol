@@ -8,12 +8,8 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {IERC1643} from "./interfaces/IERC1643.sol";
-
-/// @dev Read-only interface for the Chainalysis on-chain sanctions oracle.
-/// Mainnet: 0x40C57923924B5c5c5455c48D93317139ADDaC8fb
-interface ISanctionsList {
-    function isSanctioned(address addr) external view returns (bool);
-}
+import {ISanctionsList} from "./interfaces/ISanctionsList.sol";
+import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 
 /// @title GyldBondToken
 /// @notice Standard ERC-20 per bond series. One token = one unit of bond ownership.
@@ -41,7 +37,8 @@ interface ISanctionsList {
 /// Compliance:
 ///   - All secondary transfers check sender, receiver, AND spender (msg.sender in transferFrom)
 ///     against the Chainalysis on-chain sanctions oracle.
-///   - The check is fail-closed: if the oracle call reverts, the transfer reverts.
+///   - The check is fail-closed: if the oracle call reverts, or the oracle address is
+///     unset, the transfer reverts. There is no path on which screening is skipped.
 ///   - Mint and burn skip the sanctions check — IssuanceManager pre-screens APs off-chain.
 ///   - No internal blocklist — sanctioning decisions are made by Chainalysis, not the platform.
 ///
@@ -59,7 +56,8 @@ contract GyldBondToken is
     AccessControlUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    IERC1643
+    IERC1643,
+    IGyldBondToken
 {
     // ── Roles ─────────────────────────────────────────────────────────────────
 
@@ -98,6 +96,7 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error NotValidSanctionsList(address addr);
+    error SanctionsListNotSet();
     error EmptyDocumentName();
     error EmptyDocumentUri();
     error EmptyDocumentHash();
@@ -230,8 +229,10 @@ contract GyldBondToken is
 
     /// @notice Replace the sanctions oracle with a new implementation.
     /// @dev    Fail-closed by design: zero-address is explicitly rejected. Disabling the
-    ///         oracle entirely is not permitted — a token with no oracle would silently skip
-    ///         all sanctions checks, which is a greater compliance risk than a frozen token.
+    ///         oracle entirely is not permitted — a token with no oracle is a greater
+    ///         compliance risk than a frozen token. Should the slot ever reach zero anyway,
+    ///         `_requireAccess` reverts `SanctionsListNotSet` rather than skipping the
+    ///         check, so this rejection is a first line of defence and not the only one.
     ///
     ///         Emergency path if the current oracle is compromised: deploy a new oracle
     ///         contract (e.g. SanctionsOracleMirror) and call this function with the new
@@ -345,11 +346,18 @@ contract GyldBondToken is
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    /// Fail-closed: reverts if `account` is sanctioned, or if the oracle call itself reverts.
-    /// sanctionsList is always non-zero after initialize (enforced there and in setSanctionsList).
+    /// Fail-closed on every path: reverts if the sanctions list is unset, if the oracle call
+    /// itself reverts, or if `account` is sanctioned.
+    ///
+    /// `initialize` and `setSanctionsList` both reject the zero address, so an unset list is
+    /// unreachable on a live token and `SanctionsListNotSet` is not expected to fire. It is
+    /// checked anyway rather than short-circuited past: the previous form skipped screening
+    /// entirely when the slot was zero, which turns a future setter that forgets its own
+    /// zero-check into silent compliance bypass. Screening now fails loudly instead.
     function _requireAccess(address account) internal view {
         ISanctionsList sl = _getStorage().sanctionsList;
-        if (address(sl) != address(0) && sl.isSanctioned(account)) revert AccountSanctioned(account);
+        if (address(sl) == address(0)) revert SanctionsListNotSet();
+        if (sl.isSanctioned(account)) revert AccountSanctioned(account);
     }
 
     /// Remove `name` from the docNames array (swap-and-pop). The array's ordering is purely

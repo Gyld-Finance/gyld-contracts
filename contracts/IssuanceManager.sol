@@ -5,11 +5,7 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-interface IGyldBondToken {
-    function mint(address to, uint256 amount) external;
-    function burn(address from, uint256 amount) external;
-}
-
+import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 /// @title IssuanceManager
 /// @notice Single gate for primary issuance and redemption of all Gyld bond series.
 ///
