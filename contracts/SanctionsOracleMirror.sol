@@ -2,11 +2,7 @@
 pragma solidity =0.8.28;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
-
-/// @dev Minimal read interface shared by Chainalysis oracle and this contract.
-interface ISanctionsList {
-    function isSanctioned(address addr) external view returns (bool);
-}
+import {ISanctionsList} from "./interfaces/ISanctionsList.sol";
 
 /// @title  SanctionsOracleMirror
 /// @notice Self-owned sanctions oracle for Gyld bond tokens.
@@ -31,7 +27,7 @@ interface ISanctionsList {
 ///         Access control:
 ///           - SANCTIONS_UPDATER_ROLE  → Forefi/MPC wallet (write-only); refreshes sanctions list weekly/per epoch
 ///           - DEFAULT_ADMIN_ROLE      → compliance ops multisig (Gnosis Safe)
-contract SanctionsOracleMirror is AccessControl {
+contract SanctionsOracleMirror is ISanctionsList, AccessControl {
     bytes32 public constant SANCTIONS_UPDATER_ROLE = keccak256("SANCTIONS_UPDATER_ROLE");
 
     mapping(address => bool) private _sanctioned;

@@ -10,13 +10,9 @@ import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/crypt
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @dev Read-only view of a NAVFeedForwarder (Chainlink AggregatorV3 shape, 8 decimals).
-interface INavForwarder {
-    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
-    function decimals() external view returns (uint8);
-}
-
 /// @title GyldAtomicSwap
 /// @notice Self-custodial atomic two-leg settlement against platform-signed EIP-712
 ///         quotes. This contract HOLDS its own inventory (USDC, USDG, bond tokens):
@@ -570,7 +566,7 @@ contract GyldAtomicSwap is
         // answeredInRound and OCR aggregators return it equal to roundId, as does
         // KaleidoscopeNAVFeed — so an `answeredInRound < roundId` guard cannot fire on any
         // feed we would point at. Staleness rides on updatedAt below (D-18, audit §4.10).
-        (, int256 nav,, uint256 updatedAt,) = INavForwarder($.navForwarderOf[bondToken]).latestRoundData();
+        (, int256 nav,, uint256 updatedAt,) = AggregatorV3Interface($.navForwarderOf[bondToken]).latestRoundData();
         if (nav <= 0) revert InvalidNav(bondToken, nav);
         // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
         // (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — treat as stale.

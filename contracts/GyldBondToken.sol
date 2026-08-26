@@ -8,12 +8,8 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {IERC1643} from "./interfaces/IERC1643.sol";
-
-/// @dev Read-only interface for the Chainalysis on-chain sanctions oracle.
-/// Mainnet: 0x40C57923924B5c5c5455c48D93317139ADDaC8fb
-interface ISanctionsList {
-    function isSanctioned(address addr) external view returns (bool);
-}
+import {ISanctionsList} from "./interfaces/ISanctionsList.sol";
+import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 
 /// @title GyldBondToken
 /// @notice Standard ERC-20 per bond series. One token = one unit of bond ownership.
@@ -60,7 +56,8 @@ contract GyldBondToken is
     AccessControlUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable,
-    IERC1643
+    IERC1643,
+    IGyldBondToken
 {
     // ── Roles ─────────────────────────────────────────────────────────────────
 

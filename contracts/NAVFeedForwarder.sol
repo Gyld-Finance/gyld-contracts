@@ -2,6 +2,7 @@
 pragma solidity =0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @title NAVFeedForwarder
 /// @notice A permanent, stable oracle address that forwards all price queries
@@ -31,20 +32,7 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///      pure delegations — no local state, no transformation, no caching.
 ///
 
-interface IUpstreamOracle {
-    function decimals() external view returns (uint8);
-    function description() external view returns (string memory);
-    function version() external view returns (uint256);
-    function getRoundData(uint80 roundId) external view returns (
-        uint80, int256, uint256, uint256, uint80
-    );
-    function latestRoundData() external view returns (
-        uint80, int256, uint256, uint256, uint80
-    );
-    function latestAnswer() external view returns (int256);
-}
-
-contract NAVFeedForwarder is Ownable2Step {
+contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     // ── State ─────────────────────────────────────────────────────────────────
 
     /// The current upstream oracle. All reads are delegated here.

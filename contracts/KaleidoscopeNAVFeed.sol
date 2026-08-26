@@ -2,6 +2,7 @@
 pragma solidity =0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @title KaleidoscopeNAVFeed
 /// @notice Publishes the NAV-per-token for a single bond instrument in the
@@ -38,28 +39,7 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///                                   `updatedAt` itself. See latestRoundData for why.
 ///
 
-// ── Chainlink AggregatorV3Interface (inlined — no @chainlink/contracts dep) ──
-interface AggregatorV3Interface {
-    function decimals() external view returns (uint8);
-    function description() external view returns (string memory);
-    function version() external view returns (uint256);
-    function getRoundData(uint80 _roundId) external view returns (
-        uint80 roundId,
-        int256 answer,
-        uint256 startedAt,
-        uint256 updatedAt,
-        uint80 answeredInRound
-    );
-    function latestRoundData() external view returns (
-        uint80 roundId,
-        int256 answer,
-        uint256 startedAt,
-        uint256 updatedAt,
-        uint80 answeredInRound
-    );
-}
-
-contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
+contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     // ── Price state ───────────────────────────────────────────────────────────
 
     /// Latest NAV per token, 8 decimal places.
