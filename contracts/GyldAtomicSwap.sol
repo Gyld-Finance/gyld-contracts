@@ -562,6 +562,10 @@ contract GyldAtomicSwap is
         uint256 usdcAmount = buy ? amountIn : amountOut;
 
         // navForwarderOf[bondToken] is guaranteed non-zero (set atomically in registerSeries).
+        // roundId/startedAt/answeredInRound are deliberately discarded. Chainlink deprecated
+        // answeredInRound and OCR aggregators return it equal to roundId, as does
+        // KaleidoscopeNAVFeed — so an `answeredInRound < roundId` guard cannot fire on any
+        // feed we would point at. Staleness rides on updatedAt below (D-18, audit §4.10).
         (, int256 nav,, uint256 updatedAt,) = INavForwarder($.navForwarderOf[bondToken]).latestRoundData();
         if (nav <= 0) revert InvalidNav(bondToken, nav);
         // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
