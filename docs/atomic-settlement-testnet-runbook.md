@@ -513,8 +513,9 @@ blocks evacuation. But moving a bond token means calling that token's `transfer`
 ```
 swap.withdraw(bondToken, amt)
   └─ IERC20(bondToken).safeTransfer(withdrawalWallet, amt)
-       └─ GyldBondToken.transfer  ← whenNotPaused
-            └─ GyldBondToken._update  ← REVERTS EnforcedPause
+       └─ GyldBondToken.transfer  ← whenNotPaused  ← REVERTS EnforcedPause
+            (_update is never entered — the modifier reverts first, and _update
+             carries only the sanctions check, no pause gate)
 ```
 
 The revert comes from the **token**, not the swap. `cast` will show `EnforcedPause()`

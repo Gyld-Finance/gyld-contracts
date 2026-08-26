@@ -563,7 +563,8 @@ contract GyldAtomicSwapTest is Test {
     // `withdraw()` carries no `whenNotPaused`, so the SWAP's pause never blocks it
     // (pinned above). But moving a bond token means calling that token's `transfer`,
     // which IS `whenNotPaused` on the token — so a paused BOND TOKEN blocks its own
-    // evacuation, at GyldBondToken._update, not in the swap.
+    // evacuation, at that modifier on GyldBondToken.transfer, not in the swap (and not
+    // in the token's _update, which carries only the sanctions check).
     //
     // This is a design requirement, not a defect: a pause that inventory could be
     // moved through is not a pause. The token's pause is the stronger statement and

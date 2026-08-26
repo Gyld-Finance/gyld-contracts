@@ -1044,8 +1044,10 @@ Three deliberate properties:
   still gates its own leg.** There are two independent pause switches. `withdraw`
   ignores the swap's. It cannot ignore the token's: moving a `GyldBondToken` calls
   its `transfer`, which is `whenNotPaused`, so the revert is `EnforcedPause` raised
-  in `GyldBondToken._update` — not in the swap, and easy to misattribute from a bare
-  `cast` error. USDC has no pause and evacuates normally with both switches pulled.
+  by that modifier on `GyldBondToken.transfer` itself — not in the swap, and not in
+  the token's `_update` (which carries only the sanctions check; the pause gate never
+  reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
+  evacuates normally with both switches pulled.
 
   This is a **design requirement, not a gap**. A pause that inventory can be moved
   through is not a pause; the token's pause is the stronger statement and is meant

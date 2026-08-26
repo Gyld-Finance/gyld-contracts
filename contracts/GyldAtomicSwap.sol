@@ -768,7 +768,9 @@ contract GyldAtomicSwap is
     ///         Scope of that exemption: it covers THIS contract's pause only. Moving a
     ///         GyldBondToken calls its `transfer`, which is `whenNotPaused` on the token,
     ///         so a paused bond token blocks its own evacuation — the revert is
-    ///         `EnforcedPause` raised in GyldBondToken._update, not here. That is a
+    ///         `EnforcedPause`, raised by that `whenNotPaused` modifier on
+    ///         GyldBondToken.transfer itself, not here and not in the token's
+    ///         `_update` (which carries only the sanctions check). That is a
     ///         design requirement: a pause inventory can be moved through is not a pause,
     ///         and the swap holds no privileged position on the token. Do not add a
     ///         bypass. Operators unpause the token, withdraw, then re-pause (PAUSER_ROLE
