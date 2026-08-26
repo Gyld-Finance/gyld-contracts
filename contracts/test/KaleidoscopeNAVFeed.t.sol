@@ -7,14 +7,11 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract KaleidoscopeNAVFeedTest is Test {
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
-    event EmergencyUpdaterSet(address indexed previous, address indexed newUpdater);
-    event EmergencyAnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
 
     KaleidoscopeNAVFeed feed;
     address owner            = address(0xA1);
     address stranger         = address(0xB2);
     address newOwner         = address(0xC3);
-    address emergencyUpdater = address(0xE4);
 
     uint256 constant ONE_HOUR          = 1 hours;
     int256  constant ANSWER            = 9_542_000_000; // $95.42
@@ -325,21 +322,6 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertTrue(feed.isFresh());
     }
 
-    function test_stalenessSeconds_resetByEmergencyUpdate() public {
-        vm.warp(1_000_000);
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        feed.updateAnswer(ANSWER);
-
-        vm.warp(1_000_000 + 10 days);
-        assertEq(feed.stalenessSeconds(), 10 days);
-
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER);
-        assertEq(feed.stalenessSeconds(), 0, "the emergency path must also refresh the clock");
-    }
-
     // ── The Chainlink-compat decision, pinned (GYL-1135) ─────────────────────
 
     /// LOAD-BEARING. This feed has exactly ONE revert path on reads — NoPriceSet — and
@@ -567,74 +549,6 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.updateAnswer(ANSWER);
     }
 
-    // ── setEmergencyUpdater ───────────────────────────────────────────────────
-
-    function test_setEmergencyUpdater_ownerSetsAddress() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        assertEq(feed.emergencyUpdater(), emergencyUpdater);
-    }
-
-    function test_setEmergencyUpdater_nonOwnerReverts() public {
-        vm.prank(stranger);
-        vm.expectRevert();
-        feed.setEmergencyUpdater(emergencyUpdater);
-    }
-
-    function test_setEmergencyUpdater_zeroAddressDisablesPath() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        feed.setEmergencyUpdater(address(0));
-        assertEq(feed.emergencyUpdater(), address(0));
-    }
-
-    function test_setEmergencyUpdater_emitsEvent() public {
-        vm.prank(owner);
-        vm.expectEmit(true, true, false, false);
-        emit EmergencyUpdaterSet(address(0), emergencyUpdater);
-        feed.setEmergencyUpdater(emergencyUpdater);
-    }
-
-    function test_setEmergencyUpdater_emitsEventWithPreviousAddress() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        vm.expectEmit(true, true, false, false);
-        emit EmergencyUpdaterSet(emergencyUpdater, newOwner);
-        feed.setEmergencyUpdater(newOwner);
-    }
-
-    // ── key separation: owner() != emergencyUpdater (GYL-961) ─────────────────
-
-    function test_setEmergencyUpdater_ownerAddressReverts() public {
-        vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
-        feed.setEmergencyUpdater(owner);
-    }
-
-    function test_transferOwnership_toEmergencyUpdaterReverts() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
-        feed.transferOwnership(emergencyUpdater);
-    }
-
-    function test_acceptOwnership_intoEmergencyUpdaterReverts() public {
-        // Drive the completion funnel (_transferOwnership) directly: start a
-        // transfer to `newOwner`, THEN promote that same address to emergency
-        // updater, so the fail-fast transferOwnership guard is bypassed and the
-        // invariant must be caught at acceptOwnership().
-        vm.prank(owner);
-        feed.transferOwnership(newOwner);
-        vm.prank(owner);
-        feed.setEmergencyUpdater(newOwner);
-        vm.prank(newOwner);
-        vm.expectRevert(KaleidoscopeNAVFeed.EmergencyUpdaterCannotBeOwner.selector);
-        feed.acceptOwnership();
-    }
-
     // ── renounceOwnership is disabled (GLD-165) ──────────────────────────────
 
     /// The feed is not upgradeable and its reads never revert on staleness, so a
@@ -653,19 +567,6 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
         feed.renounceOwnership();
         assertEq(feed.owner(), owner, "owner must be unchanged");
-    }
-
-    /// The dangerous state the guard exists to prevent: a renounce with an
-    /// emergency updater set would strand that address with permanent, uncapped
-    /// price authority and nobody able to clear it.
-    function test_renounceOwnership_revertsWithEmergencyUpdaterSet() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
-        feed.renounceOwnership();
-        assertEq(feed.owner(), owner, "owner must be unchanged");
-        assertEq(feed.emergencyUpdater(), emergencyUpdater, "updater must be unchanged");
     }
 
     /// Premise the `_transferOwnership` comment now rests on: OZ's constructor
@@ -707,186 +608,123 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.latestAnswer(), 9_542_000_000);
     }
 
-    function test_transferOwnership_toDifferentAddressStillWorks() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
+    /// Accepting must clear `pendingOwner` and fully revoke the old key. Previously the
+    /// only place `_transferOwnership` (the completion funnel) was exercised beyond a
+    /// happy-path `owner()` read was the key-separation test that has been removed with
+    /// the emergency path; this pins the funnel's real post-conditions directly.
+    function test_acceptOwnership_clearsPendingOwnerAndRevokesOldOwner() public {
         vm.prank(owner);
         feed.transferOwnership(newOwner);
         vm.prank(newOwner);
         feed.acceptOwnership();
-        assertEq(feed.owner(), newOwner);
-    }
 
-    // ── emergencyUpdateAnswer — access control ────────────────────────────────
+        assertEq(feed.owner(), newOwner, "owner must be the acceptor");
+        assertEq(feed.pendingOwner(), address(0), "pendingOwner must be cleared on accept");
 
-    function test_emergencyUpdateAnswer_strangerReverts() public {
+        // The old key retains nothing: neither price authority nor the ability to
+        // start another handoff.
         vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(stranger);
-        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
-        feed.emergencyUpdateAnswer(ANSWER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        feed.transferOwnership(stranger);
+
+        // And a replay of acceptOwnership by the (now former) pending owner fails —
+        // pendingOwner is address(0), so nobody is authorised.
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        feed.acceptOwnership();
     }
 
-    function test_emergencyUpdateAnswer_ownerCannotCallDirectly() public {
-        // owner is not the emergency updater — different keys by design
-        vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
-        feed.emergencyUpdateAnswer(ANSWER);
+    // ── The emergency path is gone (audit §4.11) ─────────────────────────────
+
+    /// LOAD-BEARING. `updateAnswer` is now the ONLY way a price reaches this feed, and
+    /// its interval + deviation guards have no privileged bypass. This asserts the
+    /// removal at the ABI level rather than trusting that the source no longer mentions
+    /// it: the contract declares no fallback, so a call carrying a selector it does not
+    /// implement reverts, and `success` is false.
+    ///
+    /// If any of these three ever starts returning true, a bypass has been reintroduced
+    /// and `test_chainedUpdates_escapeTheBand` below no longer describes the system.
+    function test_emergencyPathSurfaceIsGone() public {
+        vm.startPrank(owner);
+
+        (bool setOk,) = address(feed).call(
+            abi.encodeWithSignature("setEmergencyUpdater(address)", stranger)
+        );
+        assertFalse(setOk, "setEmergencyUpdater(address) must no longer exist");
+
+        (bool updOk,) = address(feed).call(
+            abi.encodeWithSignature("emergencyUpdateAnswer(int256)", ANSWER)
+        );
+        assertFalse(updOk, "emergencyUpdateAnswer(int256) must no longer exist");
+
+        (bool getOk,) = address(feed).call(abi.encodeWithSignature("emergencyUpdater()"));
+        assertFalse(getOk, "the emergencyUpdater() getter must no longer exist");
+
+        // Control: the same low-level call shape DOES succeed against a selector the
+        // feed implements, so the three assertions above are about the missing
+        // functions and not about a malformed call or a blanket-reverting contract.
+        (bool ctrlOk,) = address(feed).call(abi.encodeWithSignature("updateAnswer(int256)", ANSWER));
+        assertTrue(ctrlOk, "control: updateAnswer(int256) still exists and is callable");
+
+        vm.stopPrank();
     }
 
-    function test_emergencyUpdateAnswer_revertsWhenPathDisabled() public {
-        // emergencyUpdater never set — address(0) — nobody can call
-        vm.prank(stranger);
-        vm.expectRevert(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector);
-        feed.emergencyUpdateAnswer(ANSWER);
-    }
-
-    // ── emergencyUpdateAnswer — bypasses guards ───────────────────────────────
-
-    function test_emergencyUpdateAnswer_bypassesInterval() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
+    /// Every price push emits exactly one event, and it is always `AnswerUpdated` —
+    /// there is no second, privileged price event for monitoring to have to watch.
+    function test_updateAnswer_emitsOnlyAnswerUpdated() public {
+        vm.warp(1000);
+        vm.recordLogs();
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
 
-        // no warp — still within MIN_UPDATE_INTERVAL
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER_PLUS_SMALL); // succeeds without waiting 1h
-        (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, ANSWER_PLUS_SMALL);
-    }
-
-    function test_emergencyUpdateAnswer_bypassesDeviationUp() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        feed.updateAnswer(ANSWER); // $95.42
-
-        // 50% up — way beyond MAX_PRICE_DEVIATION_BPS
-        int256 bigMove = (ANSWER * 150) / 100;
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(bigMove);
-        (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, bigMove);
-    }
-
-    function test_emergencyUpdateAnswer_bypassesDeviationDown() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        feed.updateAnswer(ANSWER); // $95.42
-
-        // 50% down — way beyond MAX_PRICE_DEVIATION_BPS
-        int256 bigDrop = ANSWER / 2;
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(bigDrop);
-        (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, bigDrop);
-    }
-
-    // ── emergencyUpdateAnswer — validation ───────────────────────────────────
-
-    function test_emergencyUpdateAnswer_zeroReverts() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(emergencyUpdater);
-        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
-        feed.emergencyUpdateAnswer(0);
-    }
-
-    function test_emergencyUpdateAnswer_negativeReverts() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(emergencyUpdater);
-        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
-        feed.emergencyUpdateAnswer(-1);
-    }
-
-    // ── emergencyUpdateAnswer — state ─────────────────────────────────────────
-
-    function test_emergencyUpdateAnswer_storesAnswer() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER);
-        (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, ANSWER);
-    }
-
-    function test_emergencyUpdateAnswer_updatesTimestamp() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.warp(1000);
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER);
-        (,,, uint256 updatedAt,) = feed.latestRoundData();
-        assertEq(updatedAt, 1000);
-    }
-
-    function test_emergencyUpdateAnswer_incrementsRoundId() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.prank(owner);
-        feed.updateAnswer(ANSWER);           // round 1
-
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER);  // round 2
-        (uint80 roundId,,,,) = feed.latestRoundData();
-        assertEq(roundId, 2);
-    }
-
-    // ── emergencyUpdateAnswer — event ─────────────────────────────────────────
-
-    function test_emergencyUpdateAnswer_emitsEmergencyEvent() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.warp(1000);
-        vm.prank(emergencyUpdater);
-        vm.expectEmit(true, true, false, true);
-        emit EmergencyAnswerUpdated(ANSWER, 1, 1000);
-        feed.emergencyUpdateAnswer(ANSWER);
-    }
-
-    function test_emergencyUpdateAnswer_doesNotEmitAnswerUpdated() public {
-        // EmergencyAnswerUpdated and AnswerUpdated are distinct — monitoring
-        // rules must watch both but they never fire in the same call.
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-        vm.recordLogs();
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(ANSWER);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        // Only one event emitted; its topic[0] must be EmergencyAnswerUpdated, not AnswerUpdated
-        assertEq(logs.length, 1);
-        assertEq(logs[0].topics[0], keccak256("EmergencyAnswerUpdated(int256,uint256,uint256)"));
+        assertEq(logs.length, 1, "exactly one event per push");
+        assertEq(
+            logs[0].topics[0],
+            keccak256("AnswerUpdated(int256,uint256,uint256)"),
+            "the only price event is AnswerUpdated"
+        );
+        assertEq(logs[0].emitter, address(feed));
     }
 
-    // ── Trapped-price scenario — the root cause of this feature ───────────────
+    // ── Trapped price: chaining escapes the band (audit §4.11) ───────────────
 
-    /// A fat-finger pushes a price 9.9 % below correct value (within deviation band,
-    /// so it is accepted). The correct price is now 10.97 % above the wrong price —
-    /// beyond MAX_PRICE_DEVIATION_BPS, so normal updateAnswer is blocked.
-    /// emergencyUpdateAnswer corrects it in one call with no waiting period.
-    function test_emergencyUpdateAnswer_solvesTrappedPriceScenario() public {
-        vm.prank(owner);
-        feed.setEmergencyUpdater(emergencyUpdater);
-
+    /// The scenario the deleted `emergencyUpdateAnswer` was justified by — and the proof
+    /// that it never needed to exist.
+    ///
+    /// The claim used to be: a fat-finger inside the band traps the feed, because the
+    /// correct price is then MORE than 10% away from the wrong one, so `updateAnswer`
+    /// can never walk back to it. That is true only of a SINGLE step. The deviation band
+    /// is measured against the LAST price, and the last price MOVES with every accepted
+    /// push — so each push re-centres the band around wherever the feed now is.
+    ///
+    /// Concretely: from a wrong price W the owner may reach up to W * 1.10 in one push
+    /// (the guard is `>`, so the +10% ceiling is INCLUSIVE), and from THERE the band has
+    /// travelled with it. Any error that got in through the band (≤10% off) is therefore
+    /// always correctable in exactly two chained pushes, at a cost of one extra
+    /// MIN_UPDATE_INTERVAL. An unconditional guard plus a 1 h wait is strictly safer than
+    /// a second key with uncapped, un-rate-limited price authority — which is why the
+    /// emergency path was removed (audit §4.11). If the bad price must not be liquidated
+    /// against during that hour, pause the bond token; do not weaken the feed.
+    function test_chainedUpdates_escapeTheBand() public {
         int256 correctPrice = 9_500_000_000; // $95.00
         int256 wrongPrice   = 8_560_000_000; // $85.60 — 9.89% below $95.00
 
-        // Step 1: push correct NAV at t=1000 (first update, no deviation check)
+        // Step 1 — the correct NAV. First update: no interval or deviation check.
         vm.warp(1000);
         vm.prank(owner);
         feed.updateAnswer(correctPrice);
 
-        // Step 2: fat-finger pushes $85.60 at t=4600 (+1 h) — 9.89% below $95.00,
-        // just within MAX_PRICE_DEVIATION_BPS — accepted
+        // Step 2 — the fat-finger, +1 h. 9.89% below correct, so it slips through the
+        // band and is accepted. This is the state the emergency path claimed to need.
         vm.warp(4600);
         vm.prank(owner);
         feed.updateAnswer(wrongPrice);
+        assertEq(feed.latestAnswer(), wrongPrice, "the wrong price is now live");
 
-        // Step 3: normal correction at t=8200 (+1 h) — ($95.00 - $85.60) / $85.60 = 10.98%
-        // exceeds MAX_PRICE_DEVIATION_BPS from the wrong baseline — BLOCKED
+        // Step 3 — the single-step correction, +1 h. Measured from the WRONG baseline,
+        // $95.00 is 10.98% up: beyond the band, so it reverts. The old test stopped here
+        // and concluded the feed was trapped.
         vm.warp(8200);
         vm.prank(owner);
         vm.expectRevert(
@@ -898,11 +736,26 @@ contract KaleidoscopeNAVFeedTest is Test {
         );
         feed.updateAnswer(correctPrice);
 
-        // Step 4: emergency path restores correct price immediately
-        vm.prank(emergencyUpdater);
-        feed.emergencyUpdateAnswer(correctPrice);
-        (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, correctPrice);
-    }
+        // Step 4 — it is not trapped. Push the +10% ceiling from the wrong price
+        // instead. The guard is `diff * 10_000 > last * 1000`, a strict `>`, so exactly
+        // +10% is accepted. The revert above consumed no time, so we are still at t=8200,
+        // a full hour after step 2. $85.60 → $94.16.
+        int256 ceiling = wrongPrice + (wrongPrice * 1000) / 10_000;
+        assertEq(ceiling, 9_416_000_000, "the +10% ceiling from $85.60 is $94.16");
+        vm.prank(owner);
+        feed.updateAnswer(ceiling);
+        assertEq(feed.latestAnswer(), ceiling, "the inclusive boundary is accepted");
 
+        // Step 5 — the band has moved with the price. From $94.16, the correct $95.00 is
+        // only 0.89% away, comfortably inside the band. +1 h and the feed is corrected.
+        vm.warp(11_800);
+        vm.prank(owner);
+        feed.updateAnswer(correctPrice);
+        assertEq(feed.latestAnswer(), correctPrice, "corrected in exactly two chained pushes");
+
+        // Two pushes, four rounds total, no privileged key involved.
+        (uint80 roundId,,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(roundId, 4);
+        assertEq(updatedAt, 11_800);
+    }
 }

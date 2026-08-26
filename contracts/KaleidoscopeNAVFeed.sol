@@ -26,6 +26,10 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///      Safety constraints:
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
+///          Both guards are unconditional — there is no privileged bypass. A larger
+///          correction is reached by chaining updates (the band is relative to the
+///          LAST price, so it moves with each push); pause the bond token meanwhile
+///          if a wrong price must not be liquidated against. See ARCHITECTURE D-19.
 ///        - MAX_STALENESS:           threshold for the isFresh() monitoring view;
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
 ///                                   so DeFi integrations work over weekends and holidays.
@@ -90,14 +94,6 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     /// Denominator for basis-point arithmetic (1 bps = 1 / 10_000).
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
-    // ── Emergency updater ─────────────────────────────────────────────────────
-
-    /// Address authorised to call emergencyUpdateAnswer().
-    /// Should be a Gnosis Safe multisig — a DIFFERENT key from the KMS owner so
-    /// a compromised KMS key cannot bypass the deviation / interval guards.
-    /// address(0) means the emergency path is disabled.
-    address private _emergencyUpdater;
-
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error AnswerMustBePositive();
@@ -108,21 +104,12 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     // NOTE (GYL-1135): there is deliberately no `PriceStale` error. A declared-but-
     // never-thrown one used to live here and led readers (and two design docs) to
     // believe reads revert on staleness. They do not — see latestRoundData below.
-    error NotEmergencyUpdater();
-    error EmergencyUpdaterCannotBeOwner();
     error CannotRenounceOwnership();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
     /// Standard Chainlink event emitted on every price update.
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
-
-    /// Emitted when the emergency updater address is changed.
-    event EmergencyUpdaterSet(address indexed previous, address indexed newUpdater);
-
-    /// Emitted by emergencyUpdateAnswer() — distinct from AnswerUpdated so
-    /// monitoring rules can alert on any emergency use.
-    event EmergencyAnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -132,61 +119,18 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         _description = desc;
     }
 
-    // ── Emergency updater management ─────────────────────────────────────────
-
-    /// @notice Returns the current emergency updater address.
-    function emergencyUpdater() external view returns (address) {
-        return _emergencyUpdater;
-    }
-
-    /// @notice Set or clear the emergency updater address.
-    /// @dev    Must be a Gnosis Safe multisig — a different key from the KMS
-    ///         owner. A compromised KMS key must not be able to call
-    ///         emergencyUpdateAnswer. Pass address(0) to disable the path.
-    function setEmergencyUpdater(address newUpdater) external onlyOwner {
-        // Key-separation invariant: the emergency updater must be a different
-        // key from the owner (see design doc §4). address(0) disables the path
-        // and is always allowed — the owner is never address(0) while set.
-        if (newUpdater == owner()) revert EmergencyUpdaterCannotBeOwner();
-        address previous = _emergencyUpdater;
-        _emergencyUpdater = newUpdater;
-        emit EmergencyUpdaterSet(previous, newUpdater);
-    }
-
-    // ── Ownership (key-separation guards) ─────────────────────────────────────
-
-    /// @dev Fail-fast guard: reject starting an ownership transfer to the current
-    ///      emergency updater so the two roles can never collapse into one key.
-    ///      address(0) is allowed (cancels a pending transfer).
-    function transferOwnership(address newOwner) public virtual override onlyOwner {
-        if (newOwner != address(0) && newOwner == _emergencyUpdater)
-            revert EmergencyUpdaterCannotBeOwner();
-        super.transferOwnership(newOwner);
-    }
+    // ── Ownership ─────────────────────────────────────────────────────────────
 
     /// @notice Disabled (GLD-165) — this feed can never be left without an owner.
     /// @dev    An ownerless feed is unrecoverable: `updateAnswer` dies, there is no
     ///         proxy to upgrade, and reads never revert on staleness (see
     ///         `latestRoundData`) so it serves its last answer forever instead of
-    ///         failing loudly. Renouncing with an `_emergencyUpdater` set is worse
-    ///         still — that address keeps unbounded price authority with nobody left
-    ///         to clear it. Rotate with transferOwnership + acceptOwnership instead.
+    ///         failing loudly. Rotate with transferOwnership + acceptOwnership instead.
     ///         No `onlyOwner`: nobody can ever succeed, so one unambiguous error
     ///         beats telling a non-owner the owner could have done it.
     ///         Not retrofittable — feeds deployed before this guard lack it.
     function renounceOwnership() public virtual override {
         revert CannotRenounceOwnership();
-    }
-
-    /// @dev Single funnel that actually changes owner() (acceptOwnership). Enforce
-    ///      the key-separation invariant here so it holds regardless of the path.
-    ///      The address(0) carve-out is retained defensively — with
-    ///      renounceOwnership() disabled above and OZ's constructor rejecting a zero
-    ///      initialOwner, nothing currently reaches this with address(0).
-    function _transferOwnership(address newOwner) internal virtual override {
-        if (newOwner != address(0) && newOwner == _emergencyUpdater)
-            revert EmergencyUpdaterCannotBeOwner();
-        super._transferOwnership(newOwner);
     }
 
     // ── Price update ──────────────────────────────────────────────────────────
@@ -218,22 +162,6 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
         _latestAnswer = answer;
         _updatedAt = block.timestamp;
         emit AnswerUpdated(answer, _roundId, block.timestamp);
-    }
-
-    /// @notice Correct a wrong NAV without the normal interval / deviation guards.
-    /// @dev    Use only when a bad price is stuck — e.g. a fat-finger within the
-    ///         10 % band that makes the correct price unreachable in one step.
-    ///         Caller must be the emergencyUpdater (set via setEmergencyUpdater).
-    ///         Emits EmergencyAnswerUpdated, NOT AnswerUpdated — keep both event
-    ///         types in your monitoring rules so any emergency use pages on-call.
-    ///         Every use should trigger an immediate ops review.
-    function emergencyUpdateAnswer(int256 answer) external {
-        if (msg.sender != _emergencyUpdater) revert NotEmergencyUpdater();
-        if (answer <= 0) revert AnswerMustBePositive();
-        _roundId += 1;
-        _latestAnswer = answer;
-        _updatedAt = block.timestamp;
-        emit EmergencyAnswerUpdated(answer, _roundId, block.timestamp);
     }
 
     // ── AggregatorV3Interface ─────────────────────────────────────────────────
@@ -325,8 +253,8 @@ contract KaleidoscopeNAVFeed is AggregatorV3Interface, Ownable2Step {
     ///         Ownable2Step only), so feeds already deployed — including the live
     ///         production feed — do not have this function. It benefits future deployments
     ///         only. Monitoring of existing feeds must derive age off-chain from
-    ///         `latestRoundData().updatedAt` (or watch `AnswerUpdated` /
-    ///         `EmergencyAnswerUpdated`), which works on every version of this contract.
+    ///         `latestRoundData().updatedAt` (or watch `AnswerUpdated`), which works on
+    ///         every version of this contract.
     function stalenessSeconds() external view returns (uint256) {
         if (_updatedAt == 0) return type(uint256).max;
         return block.timestamp - _updatedAt;

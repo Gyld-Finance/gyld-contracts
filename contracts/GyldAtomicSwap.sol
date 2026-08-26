@@ -176,9 +176,13 @@ contract GyldAtomicSwap is
     ///      What breaks at the ceiling: a quote priced more than 10% away from the last
     ///      published NAV can never settle. That is intended — such a quote is either
     ///      stale-priced or wrong. The correct operational response to a real >10% gap is
-    ///      to publish the new NAV (KaleidoscopeNAVFeed.emergencyUpdateAnswer bypasses the
-    ///      feed's own interval/deviation guards for exactly this) and then trade at the
-    ///      refreshed price — NOT to widen this band and trade against a dead one.
+    ///      to walk the published NAV up to the new level and then trade at the refreshed
+    ///      price — NOT to widen this band and trade against a dead one. The feed has no
+    ///      privileged bypass: `updateAnswer` is chained, one ≤10% step per hour, and the
+    ///      band is measured against the LAST stored price so it moves with each push. If
+    ///      the interim prices must not be traded or liquidated against, `pause()` the bond
+    ///      token for the duration — that also blocks swaps here, which is the point.
+    ///      See ARCHITECTURE §11.5 and D-19.
     ///
     ///      Zero remains permitted: that is the RESTRICTIVE end (quotes must match NAV
     ///      exactly — effectively a soft-pause), and a soft-pause is safe.
