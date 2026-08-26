@@ -1782,6 +1782,21 @@ age check.*
 **A missed push is an ops incident requiring alerting, not a self-limiting
 condition.** The feed keeps serving the last price forever.
 
+**What is deliberately *not* checked — and the condition under which that expires.**
+`_checkQuoteBand` does not test `answeredInRound < roundId`, the classic Chainlink
+stale-round guard ([D-18](#171-adopted-and-current), audit §4.10). Chainlink deprecated
+the field; modern OCR aggregators return it equal to `roundId`, as does
+`KaleidoscopeNAVFeed` by construction, so on any feed we would point at today the guard
+is structurally unable to fire and would be dead code on the hot path.
+
+That reasoning is **conditional on the upstream**, not permanent. The only place an
+upstream is adopted is `NAVFeedForwarder.setUpstreamOracle`, and the forwarder's own
+roadmap (Phase 2 RedStone, Phase 3 Chainlink NAVLink) leads to exactly the third-party
+feeds where the assumption could stop holding. Adopting an upstream whose
+`answeredInRound` can genuinely lag `roundId` re-opens D-18 and requires a contract
+change — `setUpstreamOracle` cannot detect this and does not try. **Re-check D-18 as
+part of any upstream migration**, before the timelock proposal, not after.
+
 ### 11.5 Correcting a wrong NAV — the incident procedure
 
 A wrong answer is on the feed. There is no bypass and there will not be one

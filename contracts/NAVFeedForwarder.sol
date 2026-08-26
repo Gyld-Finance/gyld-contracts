@@ -75,6 +75,23 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
 
     /// @notice Swap the upstream oracle. Effective immediately — all subsequent
     ///         reads return data from the new upstream.
+    ///
+    /// @dev    MIGRATION GATE — re-check decision D-18 before proposing.
+    ///         GyldAtomicSwap._checkQuoteBand deliberately does NOT check
+    ///         `answeredInRound < roundId`. That is sound only because every upstream
+    ///         we point at returns `answeredInRound == roundId` — true of modern OCR
+    ///         aggregators (Chainlink deprecated the field) and true of
+    ///         KaleidoscopeNAVFeed by construction. The Phase 2/3 path above leads to
+    ///         third-party feeds where that may not hold.
+    ///
+    ///         The probes below verify decimals(), version() and non-future-dating.
+    ///         They CANNOT verify this one: whether a feed's `answeredInRound` can lag
+    ///         `roundId` is a property of its round lifecycle, not of any value
+    ///         readable at swap time. Adopting such an upstream silently disarms a
+    ///         guard the swap never had, and closing it needs a contract change, not
+    ///         a setter call. Confirm the new upstream's behaviour off-chain first;
+    ///         see ARCHITECTURE.md §11.4 and D-18 (§17.1).
+    ///
     /// @param newUpstream  New oracle address. Must implement AggregatorV3Interface
     ///                     + latestAnswer(). Passing address(0) reverts.
     function setUpstreamOracle(address newUpstream) external onlyOwner {
