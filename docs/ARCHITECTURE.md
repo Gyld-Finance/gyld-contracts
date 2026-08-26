@@ -1017,6 +1017,16 @@ priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
 mappings. The list is **not** externally observable, and **order is not stable
 across deregistrations** (invariant I-24).
 
+> **A paused bond token blocks deregistration too.** The only way to reach
+> `balanceOf(swap) == 0` is `withdraw`, and `withdraw` is precisely what a paused
+> bond token blocks (see *Treasury withdrawal* below). So a token pause silently
+> gates this second, unrelated admin operation: the retirement of a matured series
+> fails with a bare `SeriesNotEmpty(token)` that names the balance, not the pause
+> that is actually preventing you from clearing it — and via the timelock, 48 h
+> after the proposal. The runbook's unpause → withdraw → re-pause sequence is
+> therefore a **precondition for deregistration**, not just an evacuation remedy.
+> Check `token.paused()` before proposing.
+
 #### Treasury withdrawal
 
 ```solidity
@@ -1047,7 +1057,9 @@ Three deliberate properties:
   by that modifier on `GyldBondToken.transfer` itself — not in the swap, and not in
   the token's `_update` (which carries only the sanctions check; the pause gate never
   reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
-  evacuates normally with both switches pulled.
+  evacuates normally with both switches pulled. This also gates `deregisterSeries`,
+  which needs `balanceOf(swap) == 0` and so cannot succeed until the token is
+  unpaused long enough to withdraw — see *Series registration* above.
 
   This is a **design requirement, not a gap**. A pause that inventory can be moved
   through is not a pause; the token's pause is the stronger statement and is meant

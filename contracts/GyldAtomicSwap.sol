@@ -634,6 +634,13 @@ contract GyldAtomicSwap is
     ///         contract still holds inventory of the series — silently orphaning
     ///         inventory that can no longer be priced or served is unsafe. Wind the
     ///         series down first (withdraw the remaining balance).
+    ///
+    ///         A PAUSED bond token blocks this call. Clearing the balance requires
+    ///         withdraw(), which a paused token blocks (see withdraw below), so the
+    ///         revert you get is SeriesNotEmpty — naming the balance, not the pause
+    ///         that is stopping you from clearing it. Check token.paused() before
+    ///         opening the timelock proposal; see the runbook's "Evacuating a paused
+    ///         bond token".
     /// @param token Registered bond series to remove.
     function deregisterSeries(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();
