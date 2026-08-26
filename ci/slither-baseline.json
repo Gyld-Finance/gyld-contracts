@@ -1,0 +1,225 @@
+{
+  "_comment": "Triaged Slither baseline. Every entry is explained in docs/audit/known-issues.md. ci/check_slither.py fails on any production finding NOT listed here. Regenerate deliberately -- never to silence a new finding.",
+  "findings": [
+    {
+      "check": "assembly",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "_getStorage"
+    },
+    {
+      "check": "assembly",
+      "file": "contracts/GyldBondToken.sol",
+      "element": "_getStorage"
+    },
+    {
+      "check": "assembly",
+      "file": "contracts/IssuanceManager.sol",
+      "element": "_getStorage"
+    },
+    {
+      "check": "assembly",
+      "file": "contracts/TokenFactory.sol",
+      "element": "deployToken"
+    },
+    {
+      "check": "cyclomatic-complexity",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "executeSwap"
+    },
+    {
+      "check": "divide-before-multiply",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "_checkQuoteBand"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "getRoundData"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "isFresh"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "latestAnswer"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "latestRoundData"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "stalenessSeconds"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "initialize"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "registerSeries"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/GyldBondToken.sol",
+      "element": "initialize"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/GyldBondToken.sol",
+      "element": "setSanctionsList"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/IssuanceManager.sol",
+      "element": "registerToken"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/NAVFeedForwarder.sol",
+      "element": "_probeNotFutureDated"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/NAVFeedForwarder.sol",
+      "element": "constructor"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/NAVFeedForwarder.sol",
+      "element": "setUpstreamOracle"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/SanctionsOracleMirror.sol",
+      "element": "_setForwardingOracle"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/SanctionsOracleMirror.sol",
+      "element": "isSanctioned"
+    },
+    {
+      "check": "low-level-calls",
+      "file": "contracts/TokenFactory.sol",
+      "element": "constructor"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/IssuanceManager.t.sol",
+      "element": "ReentrantToken"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/MockSanctionsList.sol",
+      "element": "MockSanctionsList"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/NAVFeedForwarder.t.sol",
+      "element": "MockFutureDatedOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "GasGriefingOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "MalformedReturnOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "SelectiveRevertingOracle"
+    },
+    {
+      "check": "naming-convention",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "_rid"
+    },
+    {
+      "check": "pragma",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "=0.8.28"
+    },
+    {
+      "check": "reentrancy-benign",
+      "file": "contracts/TokenFactory.sol",
+      "element": "deployToken"
+    },
+    {
+      "check": "return-bomb",
+      "file": "contracts/SanctionsOracleMirror.sol",
+      "element": "_setForwardingOracle"
+    },
+    {
+      "check": "return-bomb",
+      "file": "contracts/SanctionsOracleMirror.sol",
+      "element": "isSanctioned"
+    },
+    {
+      "check": "shadowing-local",
+      "file": "contracts/GyldBondToken.sol",
+      "element": "name"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "_checkQuoteBand"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "executeSwap"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "getRoundData"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "isFresh"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "latestAnswer"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "latestRoundData"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "stalenessSeconds"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "updateAnswer"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/NAVFeedForwarder.sol",
+      "element": "_probeNotFutureDated"
+    },
+    {
+      "check": "unused-return",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "_checkQuoteBand"
+    }
+  ]
+}
