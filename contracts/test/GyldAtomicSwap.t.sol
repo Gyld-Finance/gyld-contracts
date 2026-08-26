@@ -557,6 +557,75 @@ contract GyldAtomicSwapTest is Test {
         assertEq(usdc.balanceOf(wallet), 1_000e6, "withdraw must work while paused");
     }
 
+    // ── Evacuation vs. the OTHER pause switch (audit §4.5) ────────────────────
+    //
+    // There are two independent pause switches: the swap's, and each bond token's.
+    // `withdraw()` carries no `whenNotPaused`, so the SWAP's pause never blocks it
+    // (pinned above). But moving a bond token means calling that token's `transfer`,
+    // which IS `whenNotPaused` on the token — so a paused BOND TOKEN blocks its own
+    // evacuation, at GyldBondToken._update, not in the swap.
+    //
+    // This is a design requirement, not a defect: a pause that inventory could be
+    // moved through is not a pause. The token's pause is the stronger statement and
+    // it is meant to win. The operational consequence — unpause the token before
+    // evacuating it — belongs in the runbook, and §7 now carries it.
+    //
+    // These tests exist so the boundary is pinned rather than rediscovered during an
+    // incident, and so anyone who later "fixes" it by adding a bypass fails here.
+
+    /// A paused bond token blocks its own evacuation. Reverts at the token, not the swap.
+    function test_withdraw_bondToken_blockedByTokenPause() public {
+        vm.prank(pauser);
+        token.pause();
+
+        vm.prank(treasurer);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        swap.withdraw(address(token), 100e18);
+    }
+
+    /// The incident case in full: BOTH switches pulled. Cash still evacuates; the bond
+    /// leg does not. This asymmetry is the thing an operator must know in advance.
+    function test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot() public {
+        vm.prank(pauser); swap.pause();
+        vm.prank(pauser); token.pause();
+
+        // Cash leg: USDC has no pause of its own, so the swap's pause is the only one
+        // in play — and withdraw() ignores it by design.
+        vm.prank(treasurer);
+        swap.withdraw(address(usdc), 1_000e6);
+        assertEq(usdc.balanceOf(wallet), 1_000e6, "cash must still evacuate");
+
+        // Bond leg: blocked by the token's pause.
+        vm.prank(treasurer);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        swap.withdraw(address(token), 100e18);
+    }
+
+    /// The documented remedy works, and needs only PAUSER_ROLE on the token — not the
+    /// token's admin and not the timelock. So "unpause, evacuate, re-pause" is a
+    /// same-multisig operation measured in minutes, with the swap left paused throughout.
+    function test_withdraw_bondToken_afterTokenUnpause_succeeds() public {
+        vm.prank(pauser); swap.pause();
+        vm.prank(pauser); token.pause();
+
+        vm.prank(treasurer);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        swap.withdraw(address(token), 100e18);
+
+        // Same role that paused it can lift it — no admin, no timelock.
+        assertTrue(token.hasRole(token.PAUSER_ROLE(), pauser), "remedy must not need admin");
+        vm.prank(pauser); token.unpause();
+
+        vm.prank(treasurer);
+        swap.withdraw(address(token), 100e18);
+        assertEq(token.balanceOf(wallet), 100e18, "bond leg must evacuate once the token is live");
+
+        // Re-pause: the swap stayed paused the whole time, so the hot path never reopened.
+        vm.prank(pauser); token.pause();
+        assertTrue(token.paused(), "token re-paused");
+        assertTrue(swap.paused(), "swap must never have been unpaused to evacuate");
+    }
+
     // ── setWithdrawalWallet (DEFAULT_ADMIN only) ─────────────────────────────────
 
     function test_setWithdrawalWallet_onlyAdmin_reverts() public {

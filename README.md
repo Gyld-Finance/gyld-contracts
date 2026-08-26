@@ -55,7 +55,9 @@ GyldAtomicSwap
                           EIP-712 signer, so a revoke kills every in-flight quote
   ALLOWLIST_ADMIN_ROLE →  KYC/compliance hot key; setAllowed() and nothing else
   TREASURER_ROLE       →  Ops MPC wallet; withdraw() to the fixed withdrawalWallet.
-                          Deliberately live while paused (incident evacuation)
+                          Deliberately live while the SWAP is paused (incident
+                          evacuation). A paused bond token still gates its own
+                          leg — by design; unpause it first, see the runbook
   PAUSER_ROLE          →  Ops multisig; pause() ONLY — resuming needs the admin
 
 SanctionsOracleMirror
@@ -166,7 +168,7 @@ assertions that abort the deployment on a mismatch. See
 
 ```sh
 forge build                 # compile (via_ir, optimizer_runs = 200)
-forge test                  # 540 tests, 20 suites; fuzz runs = 10000
+forge test                  # 543 tests, 20 suites; fuzz runs = 10000
 forge test -vvv             # traces for failures
 forge coverage --ir-minimum # plain `forge coverage` is stack-too-deep: it disables
                             # via_ir, which this source needs
@@ -192,7 +194,7 @@ Prerequisites: [Foundry](https://getfoundry.sh) (pinned to `v1.5.1`),
 
 ## Tests
 
-`forge test` — 540 tests across 20 suites, all at full `foundry.toml` intensity.
+`forge test` — 543 tests across 20 suites, all at full `foundry.toml` intensity.
 
 | Test file | Coverage |
 |---|---|

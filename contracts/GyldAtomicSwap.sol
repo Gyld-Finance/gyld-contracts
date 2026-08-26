@@ -759,7 +759,19 @@ contract GyldAtomicSwap is
     ///         tokens) — this is how NET flow leaves for the broker/treasury bridge.
     /// @dev    Caller must hold TREASURER_ROLE. Deliberately NOT whenNotPaused: the
     ///         treasury drain must work during an incident pause so funds can be
-    ///         evacuated. CEI: no state to write; single external transfer guarded by
+    ///         evacuated.
+    ///
+    ///         Scope of that exemption: it covers THIS contract's pause only. Moving a
+    ///         GyldBondToken calls its `transfer`, which is `whenNotPaused` on the token,
+    ///         so a paused bond token blocks its own evacuation — the revert is
+    ///         `EnforcedPause` raised in GyldBondToken._update, not here. That is a
+    ///         design requirement: a pause inventory can be moved through is not a pause,
+    ///         and the swap holds no privileged position on the token. Do not add a
+    ///         bypass. Operators unpause the token, withdraw, then re-pause (PAUSER_ROLE
+    ///         on the token — no admin, no timelock); see the runbook's "Evacuating a
+    ///         paused bond token". USDC has no pause and is unaffected.
+    ///
+    ///         CEI: no state to write; single external transfer guarded by
     ///         nonReentrant (shared with executeSwap). The treasurer can never redirect
     ///         — funds only ever go to the admin-fixed withdrawalWallet. Reverts
     ///         ZeroAddress until the admin has set the withdrawalWallet (fail-closed).

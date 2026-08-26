@@ -4,7 +4,7 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on `main` @ `0678230` (540 tests,
+Verified against the Solidity on `main` @ `0678230` (543 tests,
 20 suites, all passing). Every claim here was checked against the source at the
 time of writing.
 
@@ -1058,6 +1058,22 @@ Three deliberate properties:
   so inventory can be evacuated. It shares the `nonReentrant` guard with
   `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer
   hook to enter `executeSwap` (I-17).
+- **That exemption covers this contract's pause only — and a paused bond token
+  still gates its own leg.** There are two independent pause switches. `withdraw`
+  ignores the swap's. It cannot ignore the token's: moving a `GyldBondToken` calls
+  its `transfer`, which is `whenNotPaused`, so the revert is `EnforcedPause` raised
+  in `GyldBondToken._update` — not in the swap, and easy to misattribute from a bare
+  `cast` error. USDC has no pause and evacuates normally with both switches pulled.
+
+  This is a **design requirement, not a gap**. A pause that inventory can be moved
+  through is not a pause; the token's pause is the stronger statement and is meant
+  to win, and `GyldAtomicSwap` holds no privileged position on the token — giving it
+  one to make evacuation smoother would hand the swap a transfer path that bypasses
+  the token's own halt. The operational answer is sequencing, not a bypass: unpause
+  the token (`PAUSER_ROLE` on the token — no admin, no timelock), withdraw, re-pause,
+  with the swap left paused throughout. Written out step by step in the runbook's
+  **"Evacuating a paused bond token"**, and pinned by three tests in
+  `GyldAtomicSwap.t.sol` (audit §4.5).
 
 The `withdrawalWallet` is intentionally **not** required to be on the taker
 allowlist: it is a cold treasury address that never calls `executeSwap`, and
@@ -1203,7 +1219,7 @@ production. This is the table to read first if you are auditing the system.
 | `PAUSER_ROLE` (token) | Halt all token movement, including liquidations on Morpho and Euler | Denial of service, not theft. Note this **freezes DeFi liquidations** — undercollateralised positions cannot be closed until unpause. |
 | `QUOTE_SIGNER_ROLE` | Sign quotes at any price | Bounded by `maxQuoteDeviationBps` (deployed 2 %) against the on-chain NAV, **per trade**. The feed is written by a *different* key and is itself capped at ±10 % per hour, so one stolen key cannot both move the reference and exploit the band. Contained by `bumpQuoteEpoch`. |
 | `ALLOWLIST_ADMIN_ROLE` | Allowlist an attacker address as a swap taker | Still needs a valid signed quote from `QUOTE_SIGNER_ROLE`, still bounded by the NAV band. No access to funds or upgrades. |
-| `TREASURER_ROLE` | Move all swap inventory out | **Only to the admin-fixed `withdrawalWallet`.** Cannot redirect. This is why the role is safe to keep live while paused. |
+| `TREASURER_ROLE` | Move all swap inventory out | **Only to the admin-fixed `withdrawalWallet`.** Cannot redirect. This is why the role is safe to keep live while paused — the swap's pause, that is; a paused bond token still blocks its own leg, by design — see §5.7 › *Treasury withdrawal*. |
 | `emergencyUpdater` | Push any positive NAV, bypassing both caps | Would mass-liquidate Morpho borrowers. Contract-enforced to be a different key from the feed owner, so a KMS compromise alone cannot reach it. Every use emits the distinct `EmergencyAnswerUpdated`. |
 | `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV ±10 % per hour | Rate-limited; a 25 % total move takes 3 hours of chained updates, which is enough time to detect, pause the token and rotate the key. |
 | `SANCTIONS_UPDATER_ROLE` (keeper) | Sanction arbitrary addresses (griefing) or un-sanction a designated one (evasion) | Cannot grant itself admin. Compliance multisig revokes and re-grants in one transaction. |
@@ -1431,7 +1447,7 @@ BUY, worked end to end
 | **Future-dated NAV rejection** (F-6) | An `updatedAt` ahead of the clock satisfying the age check forever. |
 | **Decimal probes** (F-1) | The `/1e20` ladder mis-scaling silently on a non-18dp series or non-6dp cash token. |
 | **Push, not allowance** | The Hashflow-June-2023 class: the swap grants **zero** outbound allowances, ever. Outbound funds move only by push; the only inbound `transferFrom` pulls from `msg.sender`. |
-| **Asymmetric pause** | A hot-key incident. `PAUSER_ROLE` halts cheaply; only the timelock resumes. `withdraw` stays live so inventory can be evacuated. |
+| **Asymmetric pause** | A hot-key incident. `PAUSER_ROLE` halts cheaply; only the timelock resumes. `withdraw` stays live so inventory can be evacuated — past *this* contract's pause; a paused bond token still gates its own leg by design — see §5.7 › *Treasury withdrawal*. |
 | **CEI + shared reentrancy guard** | `_consumeQuote` is the only state write and precedes all external calls. `executeSwap` and `withdraw` share one guard, so a malicious inventory token's transfer hook cannot re-enter (I-17). |
 | **Probe-before-store** | Fat-finger config: `registerSeries` probes forwarder `decimals()==8` and token `decimals()==18`; `initialize` probes USDC `decimals()==6`. |
 | **Permit griefing tolerance** | A front-run `permit()` cannot brick the swap — `try/catch` swallows it and `safeTransferFrom` enforces the allowance regardless. |
@@ -2150,13 +2166,13 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **540 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **543 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `GyldAtomicSwapTest` | 82 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; permit front-run; withdrawal-wallet family; zero amounts |
+| `GyldAtomicSwapTest` | 85 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts |
 | `KaleidoscopeNAVFeedTest` | 79 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, emergency updater + key separation, **`test_noStalenessRevertPathExists`** |
 | `TokenFactoryTest` | 60 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
 | `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
