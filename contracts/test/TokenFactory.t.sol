@@ -739,12 +739,58 @@ contract TokenFactoryTest is Test {
 
     // ── fuzz: maturity timestamp ──────────────────────────────────────────────
 
-    function testFuzz_deployToken_maturityTimestamp_anyValue(uint256 maturity) public {
+    /// Any future value is stored verbatim. Bounded because deployToken now rejects a past
+    /// maturity (FIND-009); the reverting half is covered by the two tests below.
+    function testFuzz_deployToken_maturityTimestamp_anyFutureValue(uint256 maturity) public {
+        maturity = bound(maturity, block.timestamp + 1, type(uint256).max);
         // Each fuzz iteration gets a fresh EVM snapshot, so reusing the same ISIN is safe.
         (address token,,) = factory.deployToken(
             "Fuzz Bond", "FZZ", "US999999FZ99", maturity, operator, address(issuanceMgr), navFeedOwner
         );
         assertEq(GyldBondToken(token).maturityTimestamp(), maturity);
+    }
+
+    // ── FIND-009: maturity is validated at deploy, never enforced afterwards ───
+
+    /// 0 is the documented open-ended sentinel and must survive the past-maturity check.
+    function test_deployToken_maturityZero_allowed() public {
+        (address token,,) = factory.deployToken(
+            "Perp Bond", "PERP", "US999999PP99", 0, operator, address(issuanceMgr), navFeedOwner
+        );
+        assertEq(GyldBondToken(token).maturityTimestamp(), 0, "open-ended sentinel not stored");
+    }
+
+    function testFuzz_deployToken_maturityInPast_reverts(uint256 maturity) public {
+        vm.warp(1_800_000_000); // 2027-01-15, so there is a past range to fuzz over
+        maturity = bound(maturity, 1, block.timestamp); // 0 is the sentinel, excluded
+        vm.expectRevert(
+            abi.encodeWithSelector(TokenFactory.MaturityInPast.selector, maturity, block.timestamp)
+        );
+        factory.deployToken(
+            "Past Bond", "PAST", "US999999PS99", maturity, operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The boundary: maturity == block.timestamp is already matured and must be rejected.
+    function test_deployToken_maturityExactlyNow_reverts() public {
+        vm.warp(1_800_000_000);
+        vm.expectRevert(
+            abi.encodeWithSelector(TokenFactory.MaturityInPast.selector, block.timestamp, block.timestamp)
+        );
+        factory.deployToken(
+            "Now Bond", "NOW", "US999999NW99", block.timestamp, operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The finding itself: past maturity is refused at deploy, but a series that matures
+    /// while live keeps minting. This pins the documented behaviour so a future reader
+    /// cannot mistake the deploy check for an enforcement gate.
+    function test_mintStillWorksAfterMaturity_documentedNotEnforced() public {
+        (address token,,) = _deploy();
+        vm.warp(TEST_MATURITY + 365 days);
+        vm.prank(address(issuanceMgr));
+        GyldBondToken(token).mint(operator, 1e18);
+        assertEq(GyldBondToken(token).balanceOf(operator), 1e18, "maturity must not gate mint");
     }
 
     // ── same operator, multiple tokens ───────────────────────────────────────

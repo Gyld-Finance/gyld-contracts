@@ -88,7 +88,7 @@ contract AtomicSettlementDeployTest is Test {
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
             "US14913UBF62",
-            1_788_739_200,
+            1_851_811_200,
             pauser,
             address(issuanceMgr),
             navFeedOwner

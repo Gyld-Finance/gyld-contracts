@@ -222,6 +222,11 @@
       "element": "_probeNotFutureDated"
     },
     {
+      "check": "timestamp",
+      "file": "contracts/TokenFactory.sol",
+      "element": "deployToken"
+    },
+    {
       "check": "unused-return",
       "file": "contracts/GyldAtomicSwap.sol",
       "element": "_checkQuoteBand"

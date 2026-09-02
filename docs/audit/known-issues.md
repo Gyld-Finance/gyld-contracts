@@ -115,16 +115,24 @@ bytecode the factory itself just wrote — not attacker-controlled. There is no
 untrusted re-entry point, and `deployToken` is `onlyOwner` (the timelock in
 production) and `nonReentrant` besides.
 
-### `timestamp` ×10 — **False positive**
+### `timestamp` ×11 — **False positive**
 
 `GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
 freshness), `NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
-cap window, audit FIND-001).
+cap window, audit FIND-001), `TokenFactory.deployToken` (past-maturity check,
+audit FIND-009).
 
 Every comparison is on an **hour-to-day** scale: `MIN_UPDATE_INTERVAL` is 1 hour,
 `maxNavAgeSecs` is ceilinged at 72 hours, quote TTL at 10 minutes, and the
 issuance `CAP_WINDOW` is 24 hours. Proposer timestamp latitude is seconds. There
 is no threshold here a validator could straddle to gain anything.
+
+`TokenFactory.deployToken` is the loosest of all: `maturityTimestamp` is a bond
+maturity, months to years out, compared once at deployment to reject a date
+already in the past. A proposer with seconds of latitude cannot move a date
+across that boundary in either direction, and the call is `onlyOwner` (the
+timelock) besides. The check is a payload sanity gate, not a security control —
+D-25 is explicit that maturity is never enforced after deployment.
 
 The issuance window deserves the explicit version, because it is the one where
 straddling a boundary *does* buy something: a mint at the end of one window and

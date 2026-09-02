@@ -425,11 +425,11 @@ contract DeployDevNet is Script {
 
         // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF62, CUSIP 14913UBF6, matures 2028-09-06)
         {
-            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_788_739_200);
+            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_851_811_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62",
-                 1_788_739_200, operator, issuanceMgr_, navFeedOwner)
+                 1_851_811_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"));
@@ -441,11 +441,11 @@ contract DeployDevNet is Script {
 
         // C — Citigroup Inc 3.887% 2028 (ISIN US172967LD16, CUSIP 172967LD1, matures 2028-01-10)
         {
-            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16", 1_767_052_800);
+            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16", 1_831_075_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16",
-                 1_767_052_800, operator, issuanceMgr_, navFeedOwner)
+                 1_831_075_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"));
@@ -457,11 +457,11 @@ contract DeployDevNet is Script {
 
         // KO — Coca-Cola Co 2.25% 2032 (ISIN US191216DP29, CUSIP 191216DP2, matures 2032-09-01)
         {
-            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29", 1_975_017_600);
+            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29", 1_977_609_600);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29",
-                 1_975_017_600, operator, issuanceMgr_, navFeedOwner)
+                 1_977_609_600, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"));
