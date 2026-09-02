@@ -1290,6 +1290,33 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.withdraw(address(evil), 10e18);
     }
 
+    /// The FIND-024 sweep is the third path that moves tokens out, so it carries the same
+    /// exclusion: a malicious series cannot use the sweep's transfer hook to enter
+    /// executeSwap. Same guard, so the re-entrant call dies before the message is read.
+    function test_deregisterSeriesSweep_cannotReenterExecuteSwap() public {
+        MockReentrantToken evil = new MockReentrantToken();
+        evil.mint(address(swap), 100e18); // mint BEFORE arming (the hook fires on mint too)
+
+        vm.prank(admin);
+        swap.registerSeries(address(evil), address(navFeed)); // reports 18 decimals
+
+        ISwapReentryTarget.SwapMessage memory rm = ISwapReentryTarget.SwapMessage({
+            quoteId: 998,
+            taker: taker,
+            tokenIn: address(usdc),
+            maxAmountIn: 1_000e6,
+            tokenOut: address(evil),
+            price: 1e28,
+            expiry: uint64(block.timestamp + 60 seconds),
+            epoch: 0
+        });
+        evil.armExecuteSwap(address(swap), rm, "", 1_000e6);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("ReentrancyGuardReentrantCall()"));
+        swap.deregisterSeries(address(evil));
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // I-8 — Admin-role non-renounceability holds for every holder
     // ═════════════════════════════════════════════════════════════════════════

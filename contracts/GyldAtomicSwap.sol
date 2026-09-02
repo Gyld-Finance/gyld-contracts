@@ -284,7 +284,6 @@ contract GyldAtomicSwap is
     ///      "unset — fall back to DEFAULT_MAX_QUOTE_TTL", not zero seconds.
     error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
-    error SeriesNotEmpty(address token);
     // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
     // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
@@ -653,23 +652,44 @@ contract GyldAtomicSwap is
         emit SeriesRegistered(token, navForwarder);
     }
 
-    /// @notice Deregister a matured bond series.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Reverts SeriesNotEmpty while this
-    ///         contract still holds inventory of the series — silently orphaning
-    ///         inventory that can no longer be priced or served is unsafe. Wind the
-    ///         series down first (withdraw the remaining balance).
+    /// @notice Deregister a matured bond series, sweeping any residual inventory out.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Any remaining balance is swept to the
+    ///         fixed `withdrawalWallet` in the same call, then the series is retired.
     ///
-    ///         A PAUSED bond token blocks this call. Clearing the balance requires
-    ///         withdraw(), which a paused token blocks (see withdraw below), so the
-    ///         revert you get is SeriesNotEmpty — naming the balance, not the pause
-    ///         that is stopping you from clearing it. Check token.paused() before
-    ///         opening the timelock proposal; see the runbook's "Evacuating a paused
-    ///         bond token".
+    ///         Replaces a `SeriesNotEmpty` precondition (audit FIND-024). Requiring a zero
+    ///         balance at execution time was racy: clearing it is a separate `withdraw`,
+    ///         this call waits on the 48 h timelock, and `GyldBondToken` screens only
+    ///         sanctions (no transfer allowlist), so any holder could re-seed one wei and
+    ///         cost the operator both again. A dust threshold fails the same way at
+    ///         threshold + 1; making the two steps atomic is what closes it.
+    ///
+    ///         Reverts ZeroAddress on a residual balance with no destination set
+    ///         (fail-closed, like `withdraw`). A zero balance needs none, so a PAUSED bond
+    ///         token — which blocks the sweep with its own `EnforcedPause` — cannot block
+    ///         an empty retirement; hence the zero-code remedy for the griefing above:
+    ///         withdraw, pause the token, then execute (runbook, "Retiring a matured
+    ///         series").
+    ///
+    ///         Note this gives DEFAULT_ADMIN_ROLE a token path that skips TREASURER_ROLE.
+    ///         Per call the destination is the fixed `withdrawalWallet` — but the admin
+    ///         also sets that, so `setWithdrawalWallet` + `deregisterSeries` drains a
+    ///         registered series anywhere, where before it took a UUPS upgrade. Same
+    ///         actor behind the same timelock either way, so no new trust assumption;
+    ///         what is lost is the upgrade ceremony and its storage-layout review gate.
+    ///         Bounded to registered (18dp) series and loud: SeriesDeregistered plus
+    ///         Withdrawn, with the registry entry destroyed.
+    ///
+    ///         CEI: registry writes precede the transfer, covered by `nonReentrant`
+    ///         (shared with executeSwap and withdraw, I-17).
     /// @param token Registered bond series to remove.
-    function deregisterSeries(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function deregisterSeries(address token) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();
         if (!$.registeredSeries[token]) revert UnregisteredSeries(token);
-        if (IERC20(token).balanceOf(address(this)) != 0) revert SeriesNotEmpty(token);
+
+        uint256 residual = IERC20(token).balanceOf(address(this));
+        address to = $.withdrawalWallet;
+        if (residual != 0 && to == address(0)) revert ZeroAddress();
+
         uint256 n = $.seriesList.length;
         for (uint256 i = 0; i < n;) {
             if ($.seriesList[i] == token) {
@@ -687,6 +707,12 @@ contract GyldAtomicSwap is
         // re-apply a matured series' threshold if the same token were ever re-registered.
         delete $.maxNavAgeSecsOf[token];
         emit SeriesDeregistered(token);
+
+        // Interaction last (CEI). Withdrawn keeps the sweep in the log stream ops index.
+        if (residual != 0) {
+            IERC20(token).safeTransfer(to, residual);
+            emit Withdrawn(token, to, residual);
+        }
     }
 
     // ── Admin: band params, allowlist, withdrawal wallet ──────────────────────

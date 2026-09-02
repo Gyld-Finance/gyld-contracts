@@ -556,8 +556,10 @@ calls in one transaction. So the window between steps 2 and 4 is real.
 
 **The swap's inventory is not exposed during that window.** Only two paths move tokens
 out of this contract: `executeSwap` (`whenNotPaused` on the **swap**, which stays paused
-throughout — `GyldAtomicSwap.sol:452`) and `withdraw` (`TREASURER_ROLE` only, destination
-fixed to `withdrawalWallet` — `:790`). There is no third path. What the window does expose
+throughout — `GyldAtomicSwap.sol:470`) and `withdraw` (`TREASURER_ROLE` only, destination
+fixed to `withdrawalWallet` — `:895`). Since FIND-024, `deregisterSeries` (`:696`) also
+moves tokens — `DEFAULT_ADMIN_ROLE`, and to that same fixed `withdrawalWallet`, so the
+guarantee is unchanged: nothing leaves for an attacker-chosen destination. What the window does expose
 is **every other holder** of that bond token, who can transfer freely while the pause is
 lifted. Keep it short, and prefer a single full-balance withdrawal over several partial
 ones. If the incident is *itself* a reason the token must not move (a compromised holder
@@ -575,6 +577,76 @@ a legitimate choice, and the swap's own pause already stops it being traded.
 Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
 `test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot` and
 `test_withdraw_bondToken_afterTokenUnpause_succeeds` in `GyldAtomicSwap.t.sol`.
+
+### Retiring a matured series
+
+`deregisterSeries(token)` is a `DEFAULT_ADMIN_ROLE` timelock proposal — 48 h from
+schedule to execute. Since audit **FIND-024** it **sweeps** any residual balance of
+the series to the `withdrawalWallet` in the same call rather than requiring the
+balance to already be zero, so a leftover position no longer blocks retirement and
+cannot be used to stall it.
+
+**Why that mattered.** The old form required `balanceOf(swap) == 0` *at execution
+time*. `GyldBondToken` screens transfers against Chainalysis and nothing else —
+there is no transfer allowlist — so **any** unsanctioned holder could send **one
+wei** to the swap in the 48 h window and force the whole cycle to start over: a
+fresh treasurer withdrawal plus a fresh 48 h proposal, each time, for the cost of
+one ERC-20 transfer.
+
+**Preflight before scheduling the proposal:**
+
+```bash
+cast call $SWAP  "registeredSeries(address)(bool)" $TOKEN   # expected: true
+cast call $SWAP  "withdrawalWallet()(address)"              # must NOT be 0x0 if a balance remains
+cast call $TOKEN "balanceOf(address)(uint256)" $SWAP        # the amount that will be swept
+cast call $TOKEN "paused()(bool)"                           # see below
+```
+
+Two ways it can still revert:
+
+- **`ZeroAddress`** — there is a residual balance and no `withdrawalWallet` is set.
+  Fail-closed, matching `withdraw`: inventory is never burned to `address(0)`. Set
+  the wallet first (itself a timelock action — schedule both together).
+- **`EnforcedPause`** — there is a residual balance and the **bond token** is
+  paused, so the sweep's `transfer` reverts on the token. Raised by
+  `GyldBondToken.transfer`, not by the swap. With a **zero** balance there is no
+  transfer and a paused token is no obstacle at all.
+
+**The hardened sequence — use this when a griefer is actively re-seeding dust:**
+
+```bash
+# 1. Clear the balance the normal way.
+cast send $SWAP "withdraw(address,uint256)" $TOKEN <full-balance> --private-key $TREASURER_KEY
+
+# 2. Pause the BOND TOKEN. PAUSER_ROLE on the token — no admin, no timelock.
+#    This blocks the dust refill outright; nobody can transfer the token at all.
+cast send $TOKEN "pause()" --private-key $PAUSER_KEY
+
+# 3. Execute the timelock proposal. deregisterSeries only READS the balance —
+#    with a zero balance it performs no transfer, so the token's pause does not
+#    block it.
+cast call $TOKEN "balanceOf(address)(uint256)" $SWAP        # expected: 0
+# ... execute the scheduled deregisterSeries(token) proposal ...
+cast call $SWAP "registeredSeries(address)(bool)" $TOKEN    # expected: false
+```
+
+This sequence needs no code and closes the griefing window completely. For a
+matured series being retired anyway, pausing the token costs nothing. The sweep in
+step 3 is the belt to this braces — either alone is sufficient.
+
+**On success** the series is gone from `registeredSeries`, `navForwarderOf` and
+`maxNavAgeSecsOf` (the per-series age override, D-23, is cleared so it cannot
+outlive the series). A sweep emits `Withdrawn(token, withdrawalWallet, amount)` —
+the same event the withdrawal path emits, so existing log indexing picks it up with
+no change. Re-registering the same token later is supported and restores
+tradability from a clean slate.
+
+Pinned by `test_deregisterSeries_sweepsResidualInventory`,
+`test_deregisterSeries_dustRefillCannotGrief`,
+`test_deregisterSeries_residualWithNoWithdrawalWallet_reverts`,
+`test_deregisterSeries_pausedTokenZeroBalance_succeeds` and
+`test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause` in
+`GyldAtomicSwap.t.sol`.
 
 Notes:
 

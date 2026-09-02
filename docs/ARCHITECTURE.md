@@ -1021,21 +1021,61 @@ decimals, pushes `token` onto `seriesList` if new, and sets
 `registeredSeries` / `navForwarderOf`. Re-registering an active series just
 updates its forwarder — which is also the escape hatch if a forwarder is bricked.
 
-`deregisterSeries(token)` reverts `SeriesNotEmpty` while the contract still holds
-any balance of the series: silently orphaning inventory that can no longer be
-priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
-mappings. The list is **not** externally observable, and **order is not stable
-across deregistrations** (invariant I-24).
+`deregisterSeries(token)` **sweeps** any residual balance of the series to the
+fixed `withdrawalWallet` and then retires it: it swap-and-pops `seriesList` and
+deletes all three mappings (`registeredSeries`, `navForwarderOf`,
+`maxNavAgeSecsOf`). The list is **not** externally observable, and **order is not
+stable across deregistrations** (invariant I-24). Silently orphaning inventory
+that can no longer be priced or served is unsafe — the sweep, not a
+balance precondition, is what prevents it.
 
-> **A paused bond token blocks deregistration too.** The only way to reach
-> `balanceOf(swap) == 0` is `withdraw`, and `withdraw` is precisely what a paused
-> bond token blocks (see *Treasury withdrawal* below). So a token pause silently
-> gates this second, unrelated admin operation: the retirement of a matured series
-> fails with a bare `SeriesNotEmpty(token)` that names the balance, not the pause
-> that is actually preventing you from clearing it — and via the timelock, 48 h
-> after the proposal. The runbook's unpause → withdraw → re-pause sequence is
-> therefore a **precondition for deregistration**, not just an evacuation remedy.
-> Check `token.paused()` before proposing.
+> **Why the sweep replaced the `SeriesNotEmpty` guard (audit FIND-024, D-24).**
+> The old form required `balanceOf(swap) == 0` *at execution time*. Clearing the
+> balance needs a separate `withdraw` (`TREASURER_ROLE`) and the deregistration
+> itself waits on the 48 h timelock, so the two were never atomic. Anything that
+> passes the token's sanctions screen — the only transfer gate
+> `GyldBondToken._update` carries, there is no transfer allowlist — could re-open
+> that window for **one wei** of dust, costing the operator a fresh withdrawal plus
+> a fresh 48 h cycle each time, for the price of one ERC-20 transfer. The
+> asymmetry ran strongly against the defender and needed no privilege. Clearing
+> and retiring are now one call, so there is no gap to race.
+>
+> A dust *threshold* was rejected as the remedy: an attacker simply sends
+> `threshold + 1`, and a threshold additionally licenses orphaning real inventory.
+
+**Fail-closed on an unset `withdrawalWallet`**, matching `withdraw`: with a
+residual balance and no destination the call reverts `ZeroAddress` rather than
+burning inventory to `address(0)`. A zero balance needs no destination and
+deregisters regardless.
+
+**CEI and reentrancy.** Registry writes land before the sweep, which is the only
+external call and is covered by `nonReentrant` — the same guard `executeSwap` and
+`withdraw` share (I-17), so a hostile inventory token cannot re-enter on its
+transfer hook and observe a half-removed series. The sweep emits `Withdrawn` so it
+appears in the log stream ops already index for the withdrawal path.
+
+**DEFAULT_ADMIN_ROLE gains a token-moving path that does not require
+`TREASURER_ROLE`** — called out because the two concerns are deliberately separated
+elsewhere (see `setWithdrawalWallet`). Per call the destination is the fixed
+`withdrawalWallet`, but the admin sets that too, so `setWithdrawalWallet` +
+`deregisterSeries` can drain a registered series to an arbitrary address where
+before it took a UUPS upgrade. **No new trust assumption** — same role, same 48 h
+timelock, and `_authorizeUpgrade` is already `DEFAULT_ADMIN_ROLE`, so the inventory
+was always reachable. What is genuinely lost is friction and visibility: the
+upgrade ceremony and its `ci/check_storage_layout.py` review gate. Bounded (only
+registered series, and `registerSeries` demands `decimals() == 18`, so the USDC
+float is unreachable) and loud (`SeriesDeregistered` + `Withdrawn`, registry entry
+destroyed).
+
+> **A paused bond token blocks the sweep, not the deregistration.** The transfer
+> calls `GyldBondToken.transfer`, which is `whenNotPaused`, so with a residual
+> balance the revert is `EnforcedPause` — raised on the token, not here (see
+> *Treasury withdrawal* below). With a **zero** balance there is no transfer and a
+> paused token is no obstacle. That ordering is also the cheapest operational
+> answer to the griefing above and needs no code: **withdraw to zero → pause the
+> token → execute the proposal.** The pause blocks the attacker's dust transfer,
+> `balanceOf` still reads zero, and the retirement goes through. For a matured
+> series being retired anyway, the pause costs nothing.
 
 #### Treasury withdrawal
 
@@ -1059,7 +1099,7 @@ Three deliberate properties:
 - **Not `whenNotPaused`.** The treasury drain must work during an incident pause
   so inventory can be evacuated. It shares the `nonReentrant` guard with
   `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer
-  hook to enter `executeSwap` (I-17).
+  hook to enter `executeSwap` (I-17). The `deregisterSeries` sweep shares it too.
 - **That exemption covers this contract's pause only — and a paused bond token
   still gates its own leg.** There are two independent pause switches. `withdraw`
   ignores the swap's. It cannot ignore the token's: moving a `GyldBondToken` calls
@@ -1067,9 +1107,10 @@ Three deliberate properties:
   by that modifier on `GyldBondToken.transfer` itself — not in the swap, and not in
   the token's `_update` (which carries only the sanctions check; the pause gate never
   reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
-  evacuates normally with both switches pulled. This also gates `deregisterSeries`,
-  which needs `balanceOf(swap) == 0` and so cannot succeed until the token is
-  unpaused long enough to withdraw — see *Series registration* above.
+  evacuates normally with both switches pulled. This also gates the
+  `deregisterSeries` **sweep** — a residual balance cannot leave until the token is
+  unpaused, though an already-empty series retires fine while paused (FIND-024,
+  D-24) — see *Series registration* above.
 
   This is a **design requirement, not a gap**. A pause that inventory can be moved
   through is not a pause; the token's pause is the stronger statement and is meant
@@ -1453,7 +1494,7 @@ BUY, worked end to end
 | **Decimal probes** (F-1) | The `/1e20` ladder mis-scaling silently on a non-18dp series or non-6dp cash token. |
 | **Push, not allowance** | The Hashflow-June-2023 class: the swap grants **zero** outbound allowances, ever. Outbound funds move only by push; the only inbound `transferFrom` pulls from `msg.sender`. |
 | **Asymmetric pause** | A hot-key incident. `PAUSER_ROLE` halts cheaply; only the timelock resumes. `withdraw` stays live so inventory can be evacuated — past *this* contract's pause; a paused bond token still gates its own leg by design — see §5.7 › *Treasury withdrawal*. |
-| **CEI + shared reentrancy guard** | `_consumeQuote` is the only state write and precedes all external calls. `executeSwap` and `withdraw` share one guard, so a malicious inventory token's transfer hook cannot re-enter (I-17). |
+| **CEI + shared reentrancy guard** | `_consumeQuote` is the only state write and precedes all external calls. `executeSwap`, `withdraw` and the `deregisterSeries` sweep share one guard, so a malicious inventory token's transfer hook cannot re-enter (I-17). |
 | **Probe-before-store** | Fat-finger config: `registerSeries` probes forwarder `decimals()==8` and token `decimals()==18`; `initialize` probes USDC `decimals()==6`. |
 | **Permit griefing tolerance** | A front-run `permit()` cannot brick the swap — `try/catch` swallows it and `safeTransferFrom` enforces the allowance regardless. |
 
@@ -2304,11 +2345,13 @@ test suite, so every reference resolves to something checkable.
 | **I-14** | Exactly one bond leg — `tokenIn == tokenOut` can never classify as a swap (`buy == redeem` → `NotOneBondLeg`). This is what makes the post-pull-in inventory measurement sound | `test_executeSwap_sameTokenBothLegs_reverts` |
 | **I-15** | NAV fail-closed — a `<= 0` answer reverts `InvalidNav`; a stale answer reverts `StaleNav`; the guard is structurally bounded by `MAX_NAV_AGE_CEILING` | `test_executeSwap_negativeNav_reverts` and the GYL-1135 ceiling tests |
 | **I-16** | Withdrawal target — `withdraw` can only ever send to the admin-fixed `withdrawalWallet` | `test_withdraw_*` family |
-| **I-17** | Reentrancy exclusion covers `withdraw` too — it shares the guard with `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap` |
+| **I-17** | Reentrancy exclusion covers `withdraw` and the `deregisterSeries` sweep too — all three share one guard, so a malicious inventory token cannot use a transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap`, `test_deregisterSeriesSweep_cannotReenterExecuteSwap` |
 | **I-18** | Pause asymmetry — `PAUSER_ROLE` halts, only `DEFAULT_ADMIN_ROLE` resumes | `test_pause_asymmetric_onlyAdminUnpauses` |
 | **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8, `maxNavAgeSecsOf` appended at B+9 | `test_storageLayout_erc7201SlotAndPacking` |
 | **I-20** | Upgrade authority — `upgradeToAndCall` is admin-only | `test_upgradeToAndCall_onlyAdmin` |
 | **I-21** | Series deregistration then re-registration restores tradability | `test_deregisterSeries_thenReregister_restoresTradability` |
+| **I-25** | Deregistration sweeps any residual inventory to the `withdrawalWallet` and retires the series, so dust cannot block it (FIND-024) | `test_deregisterSeries_sweepsResidualInventory`, `test_deregisterSeries_dustRefillCannotGrief`, `test_deregisterSeries_sweepEmitsWithdrawn` |
+| **I-26** | The sweep is fail-closed on an unset `withdrawalWallet`, and a paused bond token blocks the sweep but not an already-empty retirement (FIND-024) | `test_deregisterSeries_residualWithNoWithdrawalWallet_reverts`, `test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause`, `test_deregisterSeries_pausedTokenZeroBalance_succeeds` |
 | **I-22** | Permit is never load-bearing for authorization — a `tokenIn` with no `permit()` at all still settles via a plain approval | `test_executeSwap_permitOnTokenWithoutPermit_doesNotBrick` |
 | **I-23** | Quote expiry is TTL-bounded: `block.timestamp <= expiry <= block.timestamp + maxQuoteTtl`, upper edge **inclusive** | `test_executeSwap_quoteExpiryTtlBound_inclusiveEdge` |
 | **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | **Not covered.** `seriesList` is not externally observable and is read by no other contract logic, so the swap-and-pop loop (`registerSeries`/`deregisterSeries`) has no external assertion point. Pre-existing gap on `main`. |
@@ -2384,6 +2427,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-20 | **Every cross-contract interface has exactly one declaration, in `contracts/interfaces/`, and implementers declare it** (audit §4.8) | Interfaces used to be restated per file — `ISanctionsList` twice, and three overlapping oracle shapes. Solidity types are per-declaration, so identical copies are unrelated types the compiler cannot cross-check, and implementers that merely *happened* to expose the right functions declared nothing. Renaming `SanctionsOracleMirror.isSanctioned` compiled cleanly across every production contract; only a test caught it. One shared declaration plus `is` on the implementer turns that into a build failure in the contract itself. |
 | D-19 | **No privileged bypass on the NAV write guards** — `emergencyUpdateAnswer` and `setEmergencyUpdater` removed | The premise for the bypass (D-7, now [superseded](#173-superseded--recorded-so-it-is-not-re-litigated)) was **arithmetically false**: the deviation band is relative to the *last stored* price, and `last` moves with each push, so chaining reaches **any** in-band fat-finger in **n = 2** calls. The bypass therefore bought ~2 hours of latency and cost an unbounded instant-price primitive that a compromised KMS key could reach in one extra transaction. The replacement procedure — `pause()` the token, chain `updateAnswer`, `unpause()` — adds no new privilege. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
 | D-22 | **The `isFresh()` window is owner-settable and pinned to the strictest enforced age (24 h)** (audit FIND-022) | Two halves. **Settable:** `KaleidoscopeNAVFeed` has no proxy, so a `constant` window could only be corrected by deploying a replacement feed and repointing every `NAVFeedForwarder.setUpstreamOracle()` — a migration to fix a monitoring number. `setStalenessThreshold` makes it a transaction. It carries no ceiling (unlike D-16) because it gates a view and no on-chain guarantee; a ceiling would imply a protection that does not exist. Zero is rejected. **Pinned to 24 h, matching `maxNavAgeSecs`:** the defect was a monitoring view sitting ABOVE the age its consumer enforces — settlement began failing at +24 h while `isFresh()` read healthy to +96 h, a three-day blind spot on a weekday keeper failure. `isFresh()` now answers exactly one question, "will `executeSwap` accept this NAV right now?", and flips as settlement starts refusing. **We considered and rejected keeping it at 96 h** to avoid a false signal over weekends: the keeper pushes once per market day, so a normal weekend is a ~65 h gap and the view is false all weekend. That is correct rather than noisy — settlement genuinely is refusing then, nothing pages on this boolean, and a window above the enforced age is precisely the defect. What `isFresh()` cannot do is separate "the keeper died" from "the market is closed"; no on-chain constant can, which is why the operator signal is `stalenessSeconds()` under a **calendar-aware off-chain rule** (page ~26 h on a market day) and this boolean is the coarse backstop. Retune both together: if `maxNavAgeSecs` moves — including per-series, D-23 — move this with it. **Not retrofittable, and the deployed feed is not remediated:** the contract is immutable, so the live Sepolia feed (`0x4266a4A4…`, [DEPLOYMENTS](../DEPLOYMENTS.md)) keeps its hardcoded window and cannot be retuned. Reaching it means deploying a replacement feed and repointing `setUpstreamOracle()` — exactly the migration the setter exists to avoid *next* time. This lands before the production deployment, which is why the audit flagged it as pre-deployment work. [§11](#11-oracle-design) |
+| D-24 | **`deregisterSeries` sweeps residual inventory instead of requiring a zero balance** (audit FIND-024) | The old guard demanded `balanceOf(swap) == 0` *at execution time*, but clearing the balance is a separate `withdraw` (`TREASURER_ROLE`) and the deregistration itself waits on the 48 h timelock — the two were never atomic. `GyldBondToken._update` carries only a sanctions screen and **no transfer allowlist**, so any unsanctioned holder could re-seed **one wei** in that window and cost the operator a fresh withdrawal plus a fresh 48 h cycle, for the price of one ERC-20 transfer. The asymmetry ran strongly against the defender and required no privilege. The sweep makes clearing and retiring one call, leaving no gap to race. **A dust threshold was rejected:** an attacker sends `threshold + 1`, and a threshold additionally licenses orphaning real inventory — the very thing the original guard existed to prevent. Fail-closed on an unset `withdrawalWallet` (`ZeroAddress`), matching `withdraw`, so residual inventory is never burned to `address(0)`; a zero balance needs no destination and retires regardless. `nonReentrant` was added with the external call and registry writes precede it (CEI). This does hand `DEFAULT_ADMIN_ROLE` a token-moving path that skips `TREASURER_ROLE` — no new trust assumption, since the admin also sets that wallet and `_authorizeUpgrade` is already `DEFAULT_ADMIN_ROLE` — but it does skip the upgrade ceremony and its storage-layout review gate, which is the honest delta. **The zero-code half of the remedy stands too:** `deregisterSeries` only *reads* the balance, so withdraw → **pause the token** → execute blocks the dust refill outright and needs no upgrade. [§9](#9-gyldatomicswap) |
 
 ### 17.2 Deferred
 

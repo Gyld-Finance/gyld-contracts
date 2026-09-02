@@ -884,11 +884,119 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(0xD00D), address(navFeed));
     }
 
-    function test_deregisterSeries_nonEmpty_reverts() public {
+    // ── FIND-024: deregistration sweeps residual inventory ───────────────────
+
+    /// Residual inventory is swept to the withdrawalWallet in the same call.
+    function test_deregisterSeries_sweepsResidualInventory() public {
         // The swap still holds 1_000e18 of the series from setUp.
+        uint256 held = token.balanceOf(address(swap));
+        assertGt(held, 0, "precondition: swap holds inventory");
+        uint256 walletBefore = token.balanceOf(wallet);
+
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.SeriesNotEmpty.selector, address(token)));
         swap.deregisterSeries(address(token));
+
+        assertEq(token.balanceOf(address(swap)), 0, "swap inventory must be swept");
+        assertEq(token.balanceOf(wallet), walletBefore + held, "sweep must land in withdrawalWallet");
+        assertFalse(swap.registeredSeries(address(token)), "series must be deregistered");
+        assertEq(swap.navForwarderOf(address(token)), address(0), "forwarder must be cleared");
+    }
+
+    /// The sweep emits Withdrawn, so ops' existing log indexing picks it up.
+    function test_deregisterSeries_sweepEmitsWithdrawn() public {
+        uint256 held = token.balanceOf(address(swap));
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit GyldAtomicSwap.Withdrawn(address(token), wallet, held);
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+    }
+
+    /// The FIND-024 griefing vector: an unprivileged holder re-seeds one wei to force
+    /// a fresh withdrawal plus a fresh 48 h cycle. The sweep carries the dust out instead.
+    function test_deregisterSeries_dustRefillCannotGrief() public {
+        // Operator clears inventory the old way first.
+        uint256 held = token.balanceOf(address(swap));
+        vm.prank(treasurer);
+        swap.withdraw(address(token), held);
+        assertEq(token.balanceOf(address(swap)), 0, "inventory cleared");
+
+        // An ordinary holder (passes sanctions screening, holds no role) re-seeds dust
+        // in the gap before the timelocked proposal executes.
+        address griefer = address(0xBEEF);
+        vm.prank(wallet);
+        token.transfer(griefer, 1);
+        vm.prank(griefer);
+        token.transfer(address(swap), 1);
+        assertEq(token.balanceOf(address(swap)), 1, "dust reintroduced");
+
+        // Deregistration still succeeds and carries the dust out.
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertFalse(swap.registeredSeries(address(token)), "dust must not block retirement");
+        assertEq(token.balanceOf(address(swap)), 0, "dust must be swept");
+    }
+
+    /// Both sides of the `residual != 0 && to == address(0)` guard: an empty series
+    /// retires with no wallet set; a residual balance is fail-closed, never burned.
+    function test_deregisterSeries_withdrawalWalletUnset_bothBranches() public {
+        GyldAtomicSwap freshImpl = new GyldAtomicSwap();
+        GyldAtomicSwap fresh = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(freshImpl),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, MAX_NAV_AGE)
+                    )
+                )
+            )
+        );
+        assertEq(fresh.withdrawalWallet(), address(0), "fresh proxy should have no withdrawalWallet");
+
+        // Zero balance needs no destination: the `residual != 0` conjunct short-circuits
+        // and the series retires even with the wallet unset.
+        vm.prank(admin);
+        fresh.registerSeries(address(token), address(navFeed));
+        assertEq(token.balanceOf(address(fresh)), 0, "precondition: fresh proxy holds nothing");
+        vm.prank(admin);
+        fresh.deregisterSeries(address(token));
+        assertFalse(fresh.registeredSeries(address(token)), "empty series must retire without a wallet");
+
+        // A residual balance with no destination is fail-closed rather than burned.
+        vm.prank(admin);
+        fresh.registerSeries(address(token), address(navFeed));
+        token.mint(address(fresh), 1e18); // this test contract holds MINTER_ROLE
+        vm.prank(admin);
+        vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
+        fresh.deregisterSeries(address(token));
+        assertTrue(fresh.registeredSeries(address(token)), "failed sweep must leave the series intact");
+    }
+
+    /// Zero balance means no transfer, so a paused token is no obstacle — this is the
+    /// zero-code remedy: withdraw to zero, pause, execute.
+    function test_deregisterSeries_pausedTokenZeroBalance_succeeds() public {
+        uint256 held = token.balanceOf(address(swap));
+        vm.prank(treasurer);
+        swap.withdraw(address(token), held);
+
+        vm.prank(pauser);
+        token.pause();
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertFalse(swap.registeredSeries(address(token)), "pause must not block an empty retirement");
+    }
+
+    /// With a residual balance the paused token blocks the sweep, via its own
+    /// whenNotPaused — not the swap's.
+    function test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause() public {
+        vm.prank(pauser);
+        token.pause();
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        swap.deregisterSeries(address(token));
+        assertTrue(swap.registeredSeries(address(token)), "failed sweep must leave the series intact");
     }
 
     function test_deregisterSeries_unregistered_reverts() public {
