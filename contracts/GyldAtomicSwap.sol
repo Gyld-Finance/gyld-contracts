@@ -216,6 +216,13 @@ contract GyldAtomicSwap is
         // slot has never been written) will reject every quote. See the fallback rationale
         // on DEFAULT_MAX_QUOTE_TTL.
         uint64 maxQuoteTtl;
+        // Per-series NAV age override (audit FIND-022). ZERO MEANS UNSET, not zero
+        // seconds — always read via _effectiveMaxNavAge(), never directly. A proxy
+        // upgraded from a pre-FIND-022 implementation has never written this mapping,
+        // so a raw read returns 0 for every series; treating that as a literal age
+        // would revert StaleNav on every swap. Unset means "follow the global
+        // maxNavAgeSecs", which is exactly the pre-upgrade behaviour.
+        mapping(address => uint32) maxNavAgeSecsOf;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -234,6 +241,21 @@ contract GyldAtomicSwap is
     function _effectiveMaxQuoteTtl(GyldAtomicSwapStorage storage $) private view returns (uint64) {
         uint64 ttl = $.maxQuoteTtl;
         return ttl == 0 ? DEFAULT_MAX_QUOTE_TTL : ttl;
+    }
+
+    /// @dev The max NAV age actually in force for one series (audit FIND-022). A series
+    ///      with no override follows the global `maxNavAgeSecs`, so a feed pushing daily
+    ///      and one pushing hourly are no longer forced onto a single threshold that is
+    ///      necessarily wrong for one of them. This is the ONLY permitted read path for
+    ///      `maxNavAgeSecsOf` — see the field's note for why a raw read bricks
+    ///      executeSwap on a proxy upgraded across the mapping's addition.
+    function _effectiveMaxNavAge(GyldAtomicSwapStorage storage $, address bondToken)
+        private
+        view
+        returns (uint32)
+    {
+        uint32 perSeries = $.maxNavAgeSecsOf[bondToken];
+        return perSeries == 0 ? $.maxNavAgeSecs : perSeries;
     }
 
     // ── Errors ────────────────────────────────────────────────────────────────
@@ -284,6 +306,8 @@ contract GyldAtomicSwap is
     event SeriesDeregistered(address indexed token);
     event MaxQuoteDeviationUpdated(uint16 newBps);
     event MaxNavAgeUpdated(uint32 newSecs);
+    /// newSecs == 0 means the override was CLEARED and the series follows the global value.
+    event MaxNavAgeForSeriesUpdated(address indexed token, uint32 newSecs);
     event MaxQuoteTtlUpdated(uint64 newTtl);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
@@ -571,7 +595,7 @@ contract GyldAtomicSwap is
         // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
         // (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — treat as stale.
         if (updatedAt > block.timestamp) revert StaleNav(bondToken, updatedAt);
-        if (block.timestamp > updatedAt + $.maxNavAgeSecs) revert StaleNav(bondToken, updatedAt);
+        if (block.timestamp > updatedAt + _effectiveMaxNavAge($, bondToken)) revert StaleNav(bondToken, updatedAt);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 navValue = (tokenAmount * uint256(nav)) / 1e20; // nav > 0 checked above
@@ -659,6 +683,9 @@ contract GyldAtomicSwap is
         }
         delete $.registeredSeries[token];
         delete $.navForwarderOf[token];
+        // Clear the per-series age override too (FIND-022). Leaving it would silently
+        // re-apply a matured series' threshold if the same token were ever re-registered.
+        delete $.maxNavAgeSecsOf[token];
         emit SeriesDeregistered(token);
     }
 
@@ -697,6 +724,43 @@ contract GyldAtomicSwap is
         if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecs = newSecs;
         emit MaxNavAgeUpdated(newSecs);
+    }
+
+    /// @notice Hold ONE series to its own max NAV age instead of the global value.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE (audit FIND-022). The global
+    ///         `maxNavAgeSecs` is a single value applied to every registered series, so
+    ///         a feed pushing hourly and one pushing daily are held to one threshold
+    ///         that is necessarily wrong for one of them: sized for the daily feed, the
+    ///         hourly one may be most of a day dead and still settle.
+    ///
+    ///         The SAME 72 h ceiling as the global setter applies (D-16). An override is
+    ///         a per-series tightening or loosening WITHIN that bound, never an escape
+    ///         from it — otherwise a single series could be widened into the no-op the
+    ///         ceiling exists to prevent.
+    ///
+    ///         `newSecs == 0` CLEARS the override and returns the series to the global
+    ///         value. It does not mean "zero seconds", and it is the one place this
+    ///         setter's zero differs from `setMaxNavAgeSecs`, where zero is rejected
+    ///         because the global has no value to fall back to.
+    ///
+    ///         Requires the series to be registered, so a typo cannot park an override
+    ///         on an address that is not a series. `deregisterSeries` clears it again.
+    /// @param token   Registered bond series to hold to its own threshold.
+    /// @param newSecs Max feed age in seconds for this series, or 0 to clear the
+    ///                override. Non-zero values must be <= MAX_NAV_AGE_CEILING (72 h).
+    function setMaxNavAgeSecsFor(address token, uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!_getStorage().registeredSeries[token]) revert UnregisteredSeries(token);
+        if (newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
+        _getStorage().maxNavAgeSecsOf[token] = newSecs;
+        emit MaxNavAgeForSeriesUpdated(token, newSecs);
+    }
+
+    /// @notice The max NAV age actually enforced for `token` by executeSwap.
+    /// @dev    Resolves the override against the global fallback, so this is what the
+    ///         StaleNav check will use — read this rather than `maxNavAgeSecs()` when
+    ///         reasoning about one series (audit FIND-022).
+    function maxNavAgeSecsFor(address token) external view returns (uint32) {
+        return _effectiveMaxNavAge(_getStorage(), token);
     }
 
     /// @notice Set the upper bound on quote lifetime (seconds).

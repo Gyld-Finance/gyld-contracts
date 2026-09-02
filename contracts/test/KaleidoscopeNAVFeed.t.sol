@@ -7,6 +7,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 contract KaleidoscopeNAVFeedTest is Test {
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+    event StalenessThresholdUpdated(uint256 oldSeconds, uint256 newSeconds);
 
     KaleidoscopeNAVFeed feed;
     address owner            = address(0xA1);
@@ -251,7 +252,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(answeredInRound, roundId);
     }
 
-    /// Staleness is NOT an error condition for this feed. Past MAX_STALENESS the read
+    /// Staleness is NOT an error condition for this feed. Past stalenessThreshold the read
     /// still succeeds and returns the last known NAV together with its true (old)
     /// `updatedAt`, so DeFi integrations keep functioning across weekends and holidays
     /// and consumers can age-check for themselves. See
@@ -263,7 +264,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.warp(1_000_000);
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(1_000_000 + 97 hours); // past 96h MAX_STALENESS
+        vm.warp(1_000_000 + 97 hours); // far past the 24h default stalenessThreshold
         (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
         assertEq(answer, ANSWER);
         // The staleness must be visible to the caller, not papered over: `updatedAt`
@@ -274,7 +275,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     function test_isFresh_trueBeforeStaleness() public {
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        vm.warp(block.timestamp + 95 hours);
+        vm.warp(block.timestamp + 23 hours);
         assertTrue(feed.isFresh());
     }
 
@@ -308,7 +309,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.warp(1_000_000 + 3 hours);
         assertEq(feed.stalenessSeconds(), 3 hours);
 
-        // Past MAX_STALENESS it keeps counting rather than saturating or reverting —
+        // Past stalenessThreshold it keeps counting rather than saturating or reverting —
         // an alert needs the magnitude to escalate on, which is exactly what the live
         // production feed (silent since 2026-05-19) had no way to expose.
         vm.warp(1_000_000 + 100 days);
@@ -347,7 +348,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
 
-        // Far beyond any plausible threshold: 1000 days, ~250x MAX_STALENESS.
+        // Far beyond any plausible threshold: 1000 days, ~1000x the default window.
         vm.warp(1_000_000 + 1000 days);
 
         (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
@@ -372,7 +373,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     function test_latestRoundData_recoversAfterNewUpdate() public {
         vm.prank(owner);
         feed.updateAnswer(ANSWER);
-        // Warp well past MAX_STALENESS, then push again. 97 h is >> the 1 h
+        // Warp well past stalenessThreshold, then push again. 97 h is >> the 1 h
         // MIN_UPDATE_INTERVAL, so the second push is unobstructed.
         vm.warp(block.timestamp + 97 hours);
         vm.prank(owner);
@@ -757,5 +758,164 @@ contract KaleidoscopeNAVFeedTest is Test {
         (uint80 roundId,,, uint256 updatedAt,) = feed.latestRoundData();
         assertEq(roundId, 4);
         assertEq(updatedAt, 11_800);
+    }
+
+    // ── stalenessThreshold — settable monitoring window (audit FIND-022) ───────
+
+    /// The window must start at the documented default. A feed that deployed with
+    /// zero here would report every price as stale from birth.
+    ///
+    /// 24 h is not arbitrary: it is GyldAtomicSwap's deployed maxNavAgeSecs, and the
+    /// whole point of FIND-022 is that the monitoring view must not sit ABOVE the
+    /// strictest age a consumer enforces. If this constant is ever raised past that,
+    /// the finding is reintroduced.
+    function test_stalenessThreshold_defaultsToTheEnforcedAge() public view {
+        assertEq(feed.DEFAULT_STALENESS_THRESHOLD(), 24 hours);
+        assertEq(feed.stalenessThreshold(), 24 hours, "constructor must seed the live value");
+    }
+
+    /// The point of the finding: as a constant this could only be corrected by
+    /// redeploying the feed and repointing every forwarder. It must be a transaction.
+    function test_setStalenessThreshold_ownerCanRetune() public {
+        vm.prank(owner);
+        feed.setStalenessThreshold(20 hours);
+        assertEq(feed.stalenessThreshold(), 20 hours);
+    }
+
+    function test_setStalenessThreshold_emitsOldAndNew() public {
+        vm.expectEmit(false, false, false, true, address(feed));
+        emit StalenessThresholdUpdated(24 hours, 20 hours);
+        vm.prank(owner);
+        feed.setStalenessThreshold(20 hours);
+    }
+
+    function test_setStalenessThreshold_revertsForStranger() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        feed.setStalenessThreshold(20 hours);
+    }
+
+    /// Zero is never a deliberate window, only a forgotten argument — and it would
+    /// make isFresh() false in the same block as a push.
+    function test_setStalenessThreshold_rejectsZero() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidStalenessThreshold.selector, uint256(0)));
+        feed.setStalenessThreshold(0);
+    }
+
+    /// Deliberately unbounded above (see the setter's natspec): this gates a view and
+    /// no on-chain guarantee, so a ceiling here would imply a protection that is absent.
+    function test_setStalenessThreshold_hasNoUpperCeiling() public {
+        vm.prank(owner);
+        feed.setStalenessThreshold(365 days);
+        assertEq(feed.stalenessThreshold(), 365 days);
+    }
+
+    /// The whole reason the value is settable: isFresh() must follow it, so an
+    /// operator can move the alarm ahead of the consumer that enforces the tightest age.
+    function test_setStalenessThreshold_isFreshFollowsTheNewWindow() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+
+        vm.warp(block.timestamp + 18 hours);
+        assertTrue(feed.isFresh(), "18 h is inside the 24 h default");
+
+        vm.prank(owner);
+        feed.setStalenessThreshold(12 hours);
+        assertFalse(feed.isFresh(), "the same 18 h age is outside a 12 h window");
+
+        // And it moves back: this is a monitoring dial, not a one-way latch.
+        vm.prank(owner);
+        feed.setStalenessThreshold(48 hours);
+        assertTrue(feed.isFresh());
+    }
+
+    /// Retuning the alarm must not touch the price, the round, or the timestamp —
+    /// the settlement path reads those and must be unaffected by a monitoring change.
+    function test_setStalenessThreshold_doesNotDisturbPriceState() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        (uint80 roundBefore,,, uint256 updatedBefore,) = feed.latestRoundData();
+
+        vm.prank(owner);
+        feed.setStalenessThreshold(20 hours);
+
+        (uint80 roundAfter, int256 answerAfter,, uint256 updatedAfter,) = feed.latestRoundData();
+        assertEq(roundAfter, roundBefore, "round must not advance");
+        assertEq(answerAfter, ANSWER, "answer must not move");
+        assertEq(updatedAfter, updatedBefore, "updatedAt must not be refreshed");
+    }
+
+    /// Staleness stays SURFACED, never ENFORCED — even past a freshly tightened
+    /// window the read still serves the last answer rather than reverting.
+    function test_setStalenessThreshold_readsStillNeverRevert() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        vm.prank(owner);
+        feed.setStalenessThreshold(1 hours);
+        vm.warp(block.timestamp + 10 hours);
+
+        assertFalse(feed.isFresh(), "well past the tightened window");
+        assertEq(feed.latestAnswer(), ANSWER, "read must not revert on staleness");
+        assertEq(feed.stalenessSeconds(), 10 hours);
+    }
+
+    /// The deployment log is where an off-chain indexer learns the initial window,
+    /// so the constructor's emission is observable behaviour, not an implementation
+    /// detail. oldSeconds = 0 is a sentinel the setter can never produce.
+    function test_constructor_emitsInitialStalenessThreshold() public {
+        vm.recordLogs();
+        KaleidoscopeNAVFeed fresh = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == StalenessThresholdUpdated.selector) {
+                (uint256 oldSeconds, uint256 newSeconds) = abi.decode(logs[i].data, (uint256, uint256));
+                assertEq(oldSeconds, 0, "no previous value at construction");
+                assertEq(newSeconds, 24 hours);
+                found = true;
+            }
+        }
+        assertTrue(found, "constructor must log the initial window");
+        assertEq(fresh.stalenessThreshold(), 24 hours);
+    }
+
+    /// isFresh() is inclusive at the boundary (`<=`). The whole finding is about
+    /// tuning this number, so the off-by-one at its edge is worth pinning — the same
+    /// way test_updateAnswer_exactly10PercentAllowed pins the deviation guard's edge.
+    function test_isFresh_inclusiveAtExactlyTheThreshold() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+        vm.prank(owner);
+        feed.setStalenessThreshold(20 hours);
+
+        vm.warp(block.timestamp + 20 hours);
+        assertEq(feed.stalenessSeconds(), 20 hours, "sitting exactly on the window");
+        assertTrue(feed.isFresh(), "the boundary is inclusive");
+
+        vm.warp(block.timestamp + 1);
+        assertFalse(feed.isFresh(), "one second past it is stale");
+    }
+
+    /// The audit response asserts this setter's access control, so it must survive the
+    /// two-step handover: a pending owner is still a stranger until acceptOwnership.
+    function test_setStalenessThreshold_respectsTwoStepHandover() public {
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+
+        vm.prank(newOwner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, newOwner));
+        feed.setStalenessThreshold(20 hours);
+
+        vm.prank(newOwner);
+        feed.acceptOwnership();
+        vm.prank(newOwner);
+        feed.setStalenessThreshold(20 hours);
+        assertEq(feed.stalenessThreshold(), 20 hours);
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        feed.setStalenessThreshold(30 hours);
     }
 }

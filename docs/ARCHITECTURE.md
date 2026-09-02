@@ -135,7 +135,7 @@ Rust crates that do not exist in this tree, and it has been removed.
                             push oracle, Ownable2Step, NOT upgradeable
                                       ▲
                                       │ updateAnswer(int256)   ← KMS signer
-                                      │   (the only write path — no bypass)
+                                      │   (the only price write path — no bypass)
                               Kaleidoscope backend
 
         ┌──────────────────────── Token layer ───────────────────────────┐
@@ -181,7 +181,7 @@ Two independent settlement paths reach the same token:
 | `GyldBondToken` | `contracts/GyldBondToken.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | ERC-20 per bond series. Fixed balances. Sanctions screen on every secondary transfer. Pausable. EIP-2612 permit. ERC-1643 document register (prospectus / supplements), `DOCUMENT_ROLE`-gated. |
 | `IssuanceManager` | `contracts/IssuanceManager.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | Single mint/burn gate for every series. AP whitelist. Token registry. |
 | `TokenFactory` | `contracts/TokenFactory.sol` | None (immutable) | `Ownable2Step` | Deploys the `(token proxy, NAV feed, forwarder)` triple per series and wires roles atomically. |
-| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | None (immutable) | `Ownable2Step` | Push NAV oracle in `AggregatorV3Interface` shape. Deviation cap and interval gate, both unconditional — `updateAnswer` is the only write path. |
+| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | None (immutable) | `Ownable2Step` | Push NAV oracle in `AggregatorV3Interface` shape. Deviation cap and interval gate, both unconditional — `updateAnswer` is the only write path into price state. |
 | `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | None (immutable) | `Ownable2Step` | Permanent DeFi-facing oracle address. Pure delegation to a swappable upstream. |
 | `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | None (immutable) | `AccessControl` | Platform sanctions oracle on **every** production EVM chain. Local list plus an optional gas-capped, fail-closed forward to a vendor oracle. |
 | `GyldAtomicSwap` | `contracts/GyldAtomicSwap.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | Self-custodial atomic USDC⇄bond settlement against signed EIP-712 quotes. Holds its own inventory. |
@@ -567,7 +567,8 @@ e.g. 1,000 TLT at $95.42 backing 10,000 tokens
 
 | Constant | Value | What it actually does |
 |---|---|---|
-| `MAX_STALENESS` | **96 hours** | Threshold for the `isFresh()` **monitoring view only**. No read function reverts on staleness. Sized so `isFresh() == false` means "a push was missed", not "the market is closed": a normal weekend is ~65 h, a 3-day holiday weekend ~87 h, and 96 h clears both. |
+| `stalenessThreshold` | **24 hours**, owner-settable | Threshold for the `isFresh()` **monitoring view only**. No read function reverts on staleness. Pinned to `GyldAtomicSwap.maxNavAgeSecs`, so `isFresh()` answers exactly "will `executeSwap` accept this NAV right now?" and goes false as settlement starts refusing rather than a day later. False over weekends by design — settlement is refusing then too. See [D-22](#171-adopted-and-current) (audit FIND-022). |
+| `DEFAULT_STALENESS_THRESHOLD` | 24 hours | The constructor's seed for `stalenessThreshold`. A `constant`; changing the live window is `setStalenessThreshold`, not a redeploy. Retune it whenever `maxNavAgeSecs` moves. |
 | `MIN_UPDATE_INTERVAL` | 1 hour | `updateAnswer` reverts `UpdateTooSoon` if called sooner. A security floor, not the operational cadence (which is once per market day). |
 | `MAX_PRICE_DEVIATION_BPS` | 1000 (**10 %**) | `updateAnswer` reverts `PriceDeviationTooLarge` if the new answer moves more than 10 % from the last. Applies only *after* the first push — the initial anchor has nothing to compare against and is accepted as-is. |
 | `BPS_DENOMINATOR` | 10_000 | Basis-point denominator. |
@@ -582,11 +583,16 @@ if (diff * int256(BPS_DENOMINATOR) > last * int256(MAX_PRICE_DEVIATION_BPS))
 
 #### Write paths
 
-| Function | Caller | Bypasses | Event |
-|---|---|---|---|
-| `updateAnswer(int256)` | `owner()` — the KMS signer | nothing | `AnswerUpdated` |
+| Function | Caller | Writes | Bypasses | Event |
+|---|---|---|---|---|
+| `updateAnswer(int256)` | `owner()` — the KMS signer | price, round, `updatedAt` | nothing | `AnswerUpdated` |
+| `setStalenessThreshold(uint256)` | `owner()` — the KMS signer | `stalenessThreshold` only | nothing — it gates no guard | `StalenessThresholdUpdated` |
 
-**There is exactly one write path, and it has no privileged bypass.** Every guard
+**There is exactly one write path into price state, and it has no privileged
+bypass.** `setStalenessThreshold` (D-22) is owner-only but touches no price, no
+round and no `updatedAt`, and no guard reads it — it retunes the `isFresh()` view
+and nothing else. What that adds to a compromised owner key is bounded and stated
+in [§6.3](#63-what-a-single-key-compromise-buys). Every guard
 — `answer > 0`, `MIN_UPDATE_INTERVAL`, `MAX_PRICE_DEVIATION_BPS` — is
 unconditional. A correction larger than 10 % is reached by *chaining* calls: the
 deviation band is measured against the **last stored** answer, and `last` moves
@@ -623,8 +629,8 @@ time-weighted-NAV requirement needs a new feed that stores a round history.
 The full reasoning for non-reverting reads is in [§11](#11-oracle-design).
 
 `stalenessSeconds()` returns a magnitude rather than a bool so an alerting rule
-can choose its own threshold (page at ~26 h, escalate at 96 h) instead of being
-pinned to `MAX_STALENESS`, and so a dashboard can chart the gap. The sentinel for
+can choose its own threshold (page at ~26 h on a market day, escalate at 48 h) instead of being
+pinned to `stalenessThreshold`, and so a dashboard can chart the gap. The sentinel for
 "never set" is `type(uint256).max` rather than `0` so a never-initialised feed
 can never be mistaken for a just-updated one.
 
@@ -898,7 +904,7 @@ if (buy == redeem) revert NotOneBondLeg(tokenIn, tokenOut);   // covers tokenIn 
 (, int256 nav,, uint256 updatedAt,) = INavForwarder(navForwarderOf[bondToken]).latestRoundData();
 if (nav <= 0)                                  revert InvalidNav(bondToken, nav);
 if (updatedAt > block.timestamp)               revert StaleNav(bondToken, updatedAt);   // F-6
-if (block.timestamp > updatedAt + maxNavAgeSecs) revert StaleNav(bondToken, updatedAt);
+if (block.timestamp > updatedAt + _effectiveMaxNavAge($, bondToken)) revert StaleNav(bondToken, updatedAt);
 
 navValue = tokenAmount * uint256(nav) / 1e20;       // 18dp bond × 8dp NAV / 1e20 = 6dp USDC
 band     = navValue * maxQuoteDeviationBps / 10_000;
@@ -936,7 +942,11 @@ usable `decimals()`" signal.
 semantics). **This consumer-side `StaleNav` check is therefore the only staleness
 defence anywhere in the swap path.**
 
-`maxNavAgeSecs` is admin-settable but structurally bounded:
+`maxNavAgeSecs` is admin-settable but structurally bounded. Since FIND-022 it is a
+global **default** rather than the only value: `setMaxNavAgeSecsFor(token, secs)` holds
+one series to its own threshold, read through `_effectiveMaxNavAge()` where zero means
+"unset, follow the global" (D-23). The same 72 h ceiling binds an override — a per-series
+escape from it would reopen exactly the no-op the ceiling prevents:
 
 ```
 0 < maxNavAgeSecs <= MAX_NAV_AGE_CEILING (72 hours)
@@ -1161,7 +1171,7 @@ production. This is the table to read first if you are auditing the system.
 | `IssuanceManager` | `WHITELIST_ADMIN_ROLE` | `addToWhitelist`, `removeFromWhitelist`, `addToWhitelistBatch` | Compliance ops Gnosis Safe | Yes |
 | `IssuanceManager` | `REGISTRAR_ROLE` | `registerToken`, `deregisterToken` | `TokenFactory` — **held permanently, never revoked** | Yes |
 | `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to factories deployed before it. |
-| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer` — **the only write path**, and it bypasses nothing | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
+| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer` — **the only write path into price state**, and it bypasses nothing. `setStalenessThreshold` (D-22) is also owner-only but writes no price and gates no guard | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
 | `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to forwarders already deployed.
 | `SanctionsOracleMirror` | `DEFAULT_ADMIN_ROLE` | Grant/revoke roles; `setForwardingOracle` | Compliance ops Gnosis Safe | **No** |
 | `SanctionsOracleMirror` | `SANCTIONS_UPDATER_ROLE` | `addToSanctionsList`, `removeFromSanctionsList` | Keeper-bot hot wallet | Yes |
@@ -1216,7 +1226,7 @@ production. This is the table to read first if you are auditing the system.
 | `QUOTE_SIGNER_ROLE` | Sign quotes at any price | Bounded by `maxQuoteDeviationBps` (deployed 2 %) against the on-chain NAV, **per trade**. The feed is written by a *different* key and is itself capped at ±10 % per hour, so one stolen key cannot both move the reference and exploit the band. Contained by `bumpQuoteEpoch`. |
 | `ALLOWLIST_ADMIN_ROLE` | Allowlist an attacker address as a swap taker | Still needs a valid signed quote from `QUOTE_SIGNER_ROLE`, still bounded by the NAV band. No access to funds or upgrades. |
 | `TREASURER_ROLE` | Move all swap inventory out | **Only to the admin-fixed `withdrawalWallet`.** Cannot redirect. This is why the role is safe to keep live while paused — the swap's pause, that is; a paused bond token still blocks its own leg, by design — see §5.7 › *Treasury withdrawal*. |
-| `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV **±10 % per hour, and nothing faster** | Hard ceiling — the feed has no bypass function and no second privileged address, so this is the whole of what the key buys. A 25 % total move takes 3 hours of chained updates, which is enough time to detect it, pause the token and rotate the key. Every push emits `AnswerUpdated`. |
+| `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV **±10 % per hour, and nothing faster**; and retune the `isFresh()` window | Hard ceiling on price: the feed has no bypass function and no second privileged *price* path, so ±10 %/h is the whole of what the key buys over NAV. A 25 % total move takes 3 hours of chained updates — enough time to detect it, pause the token and rotate the key. Every push emits `AnswerUpdated`. The one thing the key additionally buys since D-22 is `setStalenessThreshold`, which can widen the window until `isFresh()` reads `true` through any outage. That blinds **only the coarse boolean**: `stalenessSeconds()` returns a raw magnitude that no owner action can alter, and it — not `isFresh()` — is the designated monitoring entrypoint precisely so the alert does not depend on an on-chain threshold. The change also emits `StalenessThresholdUpdated`. A key that can already push a wrong price is not meaningfully more dangerous for being able to widen a view. |
 | `SANCTIONS_UPDATER_ROLE` (keeper) | Sanction arbitrary addresses (griefing) or un-sanction a designated one (evasion) | Cannot grant itself admin. Compliance multisig revokes and re-grants in one transaction. |
 | `TokenFactory` (holds `REGISTRAR_ROLE` forever) | If the factory were ever upgraded — it cannot be, it is immutable — or if its `owner` (the timelock) were compromised, `deployToken` could register a token | The factory has no `registerToken` passthrough, so the only reachable effect is registering a token it deploys itself. The residual `REGISTRAR_ROLE` is a **documentation defect, not an exploitable one** — but do not build a threat model that assumes the factory holds no permissions post-deploy. |
 
@@ -1634,7 +1644,7 @@ independently of the vault's own `totalAssets()`.
 ```
 Kaleidoscope backend (KMS signer)
     │ updateAnswer(navPerToken)        ← ±10% per update, >= 1h apart
-    │                                    the ONLY write path; no bypass exists
+    │                                    the ONLY price write path; no bypass exists
     ▼
 KaleidoscopeNAVFeed          AggregatorV3Interface + latestAnswer()
     │                        immutable, Ownable2Step, 8 decimals
@@ -1655,7 +1665,8 @@ stops pushing, the feed keeps serving the last answer indefinitely.
 
 ### 11.2 The three write-side guards
 
-All three are **unconditional**. `updateAnswer` is the feed's only write path and
+All three are **unconditional**. `updateAnswer` is the feed's only write path into
+price state and
 there is no privileged address, role or function that can skip any of them — see
 [D-19](#171-adopted-and-current).
 
@@ -1665,8 +1676,10 @@ there is no privileged address, role or function that can skip any of them — s
 | `MIN_UPDATE_INTERVAL` | **1 hour** between pushes | `updateAnswer` |
 | `answer > 0` | — | `updateAnswer` |
 
-`MAX_STALENESS` is **not** a write-side guard and **not** a circuit breaker. It
-gates only the `isFresh()` view. Changing it would change no on-chain guarantee.
+`stalenessThreshold` is **not** a write-side guard and **not** a circuit breaker.
+It gates only the `isFresh()` view. Changing it would change no on-chain guarantee
+— which is precisely why `setStalenessThreshold` carries no structural ceiling,
+unlike `setMaxNavAgeSecs` ([D-16](#171-adopted-and-current)). See [D-22](#171-adopted-and-current).
 
 Why 10 % is the right width for this asset class:
 
@@ -1699,10 +1712,10 @@ higher-volatility instrument are a design choice; a bypass is attack surface.
 Friday 16:00   push NAV = $95.42
 Saturday       markets closed, nothing pushed
 Sunday 23:00   latestRoundData() → ($95.42, updatedAt = Friday 16:00)
-               isFresh() == true          (55 h < 96 h)
+               isFresh() == false         (55 h > 24 h — settlement is refusing too)
                stalenessSeconds() == 198_000
 Wednesday      latestRoundData() → ($95.42, updatedAt = Friday 16:00)
-               isFresh() == false         (> 96 h)
+               isFresh() == false         (> 24 h)
                stalenessSeconds() == 450_000
                ← still no revert. Ever.
 ```
@@ -1776,8 +1789,11 @@ age check.*
    is a keeper/alerting failure, not a contract failure: every contract behaves as
    written. `isFresh()` and `stalenessSeconds()` exist to be *polled*;
    they protect nobody if nothing polls them. A missed daily push is visible within
-   ~26 h, which is far earlier than the 96 h `MAX_STALENESS` threshold — page on the
-   magnitude, not on the bool.
+   ~26 h on a market day. `isFresh()` now flips at the same 24 h the swap enforces
+   (D-22), so it no longer reads healthy while settlement fails — but it is false every
+   weekend too, because settlement is refusing then. Distinguishing "the keeper died"
+   from "the market is closed" is what the calendar-aware rule over `stalenessSeconds()`
+   is for. Page on the magnitude, not on the bool.
 
 **A missed push is an ops incident requiring alerting, not a self-limiting
 condition.** The feed keeps serving the last price forever.
@@ -2234,14 +2250,14 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **524 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **547 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `GyldAtomicSwapTest` | 85 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts |
-| `KaleidoscopeNAVFeedTest` | 58 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`** |
+| `GyldAtomicSwapTest` | 96 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts; per-series `maxNavAgeSecs` overrides (FIND-022) |
+| `KaleidoscopeNAVFeedTest` | 70 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`**, settable `stalenessThreshold` (FIND-022) |
 | `TokenFactoryTest` | 62 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
 | `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
@@ -2290,7 +2306,7 @@ test suite, so every reference resolves to something checkable.
 | **I-16** | Withdrawal target — `withdraw` can only ever send to the admin-fixed `withdrawalWallet` | `test_withdraw_*` family |
 | **I-17** | Reentrancy exclusion covers `withdraw` too — it shares the guard with `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap` |
 | **I-18** | Pause asymmetry — `PAUSER_ROLE` halts, only `DEFAULT_ADMIN_ROLE` resumes | `test_pause_asymmetric_onlyAdminUnpauses` |
-| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8 | `test_storageLayout_erc7201SlotAndPacking` |
+| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8, `maxNavAgeSecsOf` appended at B+9 | `test_storageLayout_erc7201SlotAndPacking` |
 | **I-20** | Upgrade authority — `upgradeToAndCall` is admin-only | `test_upgradeToAndCall_onlyAdmin` |
 | **I-21** | Series deregistration then re-registration restores tradability | `test_deregisterSeries_thenReregister_restoresTradability` |
 | **I-22** | Permit is never load-bearing for authorization — a `tokenIn` with no `permit()` at all still settles via a plain approval | `test_executeSwap_permitOnTokenWithoutPermit_doesNotBrick` |
@@ -2360,12 +2376,14 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-13 | **`ALLOWLIST_ADMIN_ROLE` split off `DEFAULT_ADMIN_ROLE`** (GYL-1050) | Per-taker allowlisting must stay a same-day operational action after the timelock handover. It grants access to swap, never to funds or upgrades. |
 | D-14 | **Asymmetric pause on the swap; symmetric on the token** | The swap runs off a hot signing key, so re-arming it is deliberately slow. |
 | D-15 | **Chain-allowlist deploy guards, fail-closed** (GYL-1135) | Denylist guards let every L2 through; that is how a zero-delay timelock and a bare-EOA admin reached a production chain. [§13](#13-deployment-model) |
-| D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. |
+| D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. The ceiling binds per-series overrides too (D-23). |
+| D-23 | **`maxNavAgeSecs` is per-series, with the global as fallback** (audit FIND-022) | One `GyldAtomicSwap` serves many series, each with its own feed — `navForwarderOf` and `registeredSeries` are already per-token mappings — but the age threshold was a single `uint32` applied to all of them. A feed pushing hourly and one pushing daily were held to one number that is necessarily wrong for one of them: sized for the daily feed, the hourly one may be most of a day dead and still settle. `maxNavAgeSecsOf` is an **append-only** ERC-7201 field read only through `_effectiveMaxNavAge()`, where **zero means unset, not zero seconds** — the same contract as `maxQuoteTtl` (F-4) and for the same reason: a proxy upgraded across the mapping's addition reads 0 for every series, and that must resolve to the pre-upgrade behaviour rather than reverting `StaleNav` on every swap. `setMaxNavAgeSecsFor` requires the series be registered, obeys the 72 h ceiling (D-16), and takes 0 to CLEAR an override; `deregisterSeries` clears it too, so an override cannot outlive its series. [§11](#11-oracle-design) |
 | D-18 | **`answeredInRound` is deliberately not checked in `_checkQuoteBand`** (audit §4.10) | Chainlink **deprecated** the field — modern OCR aggregators return it equal to `roundId`, as does `KaleidoscopeNAVFeed` by construction, so the classic `answeredInRound < roundId` guard is structurally unable to fire on any feed we would point at. Adding it would be dead code on the hot path. Staleness is enforced on `updatedAt` against the 72 h-ceilinged `maxNavAgeSecs` plus a future-dating guard (F-6). Revisit only if an upstream is adopted whose `answeredInRound` can genuinely lag `roundId`. [§5.7](#57-gyldatomicswap) |
 | D-17 | **ERC-8056 dropped on EVM** (GYL-1201) | Splits standard used as a NAV mirror; no EVM wallet implements it; observed display divergence on our own deployment; nobody in our category uses it. Standing record: [`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md). [§8.3](#83-erc-8056-was-evaluated-and-dropped) |
 | D-21 | **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently, and that is required** (audit §18 item 1) | `deployToken` calls `registerToken` on *every* deployment, not just the first, so revoking the role would brick every subsequent deploy. Token-level roles are a different case and *are* shed — `_wireRoles` self-revokes `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, which are needed only while that one token is wired. What bounds the retained role: the factory is immutable (no proxy, no upgrade path) and contains no call to `deregisterToken`, the only other function it gates; its one `registerToken` call site targets a token CREATE2-deployed three lines earlier in the same transaction. The `IssuanceManager` admin (the timelock) can revoke it at any time, at the cost of disabling further deploys. Both halves pinned by `test_deployToken_factoryRetainsRegistrarRole_andNeedsIt` and `test_deployToken_factoryShedsAllTokenRoles`. |
 | D-20 | **Every cross-contract interface has exactly one declaration, in `contracts/interfaces/`, and implementers declare it** (audit §4.8) | Interfaces used to be restated per file — `ISanctionsList` twice, and three overlapping oracle shapes. Solidity types are per-declaration, so identical copies are unrelated types the compiler cannot cross-check, and implementers that merely *happened* to expose the right functions declared nothing. Renaming `SanctionsOracleMirror.isSanctioned` compiled cleanly across every production contract; only a test caught it. One shared declaration plus `is` on the implementer turns that into a build failure in the contract itself. |
 | D-19 | **No privileged bypass on the NAV write guards** — `emergencyUpdateAnswer` and `setEmergencyUpdater` removed | The premise for the bypass (D-7, now [superseded](#173-superseded--recorded-so-it-is-not-re-litigated)) was **arithmetically false**: the deviation band is relative to the *last stored* price, and `last` moves with each push, so chaining reaches **any** in-band fat-finger in **n = 2** calls. The bypass therefore bought ~2 hours of latency and cost an unbounded instant-price primitive that a compromised KMS key could reach in one extra transaction. The replacement procedure — `pause()` the token, chain `updateAnswer`, `unpause()` — adds no new privilege. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
+| D-22 | **The `isFresh()` window is owner-settable and pinned to the strictest enforced age (24 h)** (audit FIND-022) | Two halves. **Settable:** `KaleidoscopeNAVFeed` has no proxy, so a `constant` window could only be corrected by deploying a replacement feed and repointing every `NAVFeedForwarder.setUpstreamOracle()` — a migration to fix a monitoring number. `setStalenessThreshold` makes it a transaction. It carries no ceiling (unlike D-16) because it gates a view and no on-chain guarantee; a ceiling would imply a protection that does not exist. Zero is rejected. **Pinned to 24 h, matching `maxNavAgeSecs`:** the defect was a monitoring view sitting ABOVE the age its consumer enforces — settlement began failing at +24 h while `isFresh()` read healthy to +96 h, a three-day blind spot on a weekday keeper failure. `isFresh()` now answers exactly one question, "will `executeSwap` accept this NAV right now?", and flips as settlement starts refusing. **We considered and rejected keeping it at 96 h** to avoid a false signal over weekends: the keeper pushes once per market day, so a normal weekend is a ~65 h gap and the view is false all weekend. That is correct rather than noisy — settlement genuinely is refusing then, nothing pages on this boolean, and a window above the enforced age is precisely the defect. What `isFresh()` cannot do is separate "the keeper died" from "the market is closed"; no on-chain constant can, which is why the operator signal is `stalenessSeconds()` under a **calendar-aware off-chain rule** (page ~26 h on a market day) and this boolean is the coarse backstop. Retune both together: if `maxNavAgeSecs` moves — including per-series, D-23 — move this with it. **Not retrofittable, and the deployed feed is not remediated:** the contract is immutable, so the live Sepolia feed (`0x4266a4A4…`, [DEPLOYMENTS](../DEPLOYMENTS.md)) keeps its hardcoded window and cannot be retuned. Reaching it means deploying a replacement feed and repointing `setUpstreamOracle()` — exactly the migration the setter exists to avoid *next* time. This lands before the production deployment, which is why the audit flagged it as pre-deployment work. [§11](#11-oracle-design) |
 
 ### 17.2 Deferred
 
@@ -2383,7 +2401,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 
 | Was | Now | Why it changed |
 |---|---|---|
-| `MAX_STALENESS = 36 hours`, reads revert when exceeded | **96 hours, advisory only**; no read has ever reverted | Never implemented. Both halves were false against the deployed bytecode from the day it was written. The reverting design was then re-rejected on its merits (D-6). |
+| `MAX_STALENESS = 36 hours`, reads revert when exceeded | **`stalenessThreshold`, 24 h default, advisory only, owner-settable** (D-22); no read has ever reverted | Never implemented. Both halves were false against the deployed bytecode from the day it was written. The reverting design was then re-rejected on its merits (D-6). |
 | **D-7:** `emergencyUpdateAnswer(int256)` ships, gated on a separate `emergencyUpdater` key, bypassing **both** the interval and deviation caps | **The entire path is deleted.** `updateAnswer` is the feed's only write function and all three of its guards are unconditional (D-19) | **D-7's premise was arithmetically wrong, and that is the reason — not a change of appetite.** It claimed a fat-finger *within* the 10 % band strands the correct price out of reach because chained hourly updates "cannot fix that at all". False: the band is measured against the **last stored** price, and `last` advances with each accepted push, so the reachable set compounds. Worked example, pinned by a passing test — wrong `8_560_000_000`, correct `9_500_000_000`: push `9_416_000_000` (exactly +10 %, and the guard is `>`, so the boundary is **inclusive**), wait 1 h, push `9_500_000_000`. Two calls, two hours. This is general: any answer that passed the band sits within 10 % of what it displaced, so the return trip is at most `ln(1/0.9) = 0.1054` of log-distance against a per-step reach of `ln(1.1) = 0.0953` — **n = 2 for every in-band error**. So the bypass bought roughly two hours of latency. What it cost: an **unbounded, instant, rate-limit-free** price primitive. And the key separation that was supposed to make that safe never held. The feed's owner is the **KMS signer, not the timelock** (`TokenFactory.deployToken` sets the feed owner to `navFeedOwner`; only the forwarder gets the timelock), and `setEmergencyUpdater` was `onlyOwner` with a single check, `newUpdater != owner()`. A compromised KMS key simply appointed a second address it also controlled — one extra transaction — and then had the bypass. The setter's own NatSpec asserted "a compromised KMS key must not be able to call `emergencyUpdateAnswer`"; that goal was never achieved. Live exposure was nonetheless **zero**: `_emergencyUpdater` was `address(0)` in every deploy script and no script ever called `setEmergencyUpdater`. **Do not re-propose this, in owner-callable or separate-key form.** The correct response to a bad NAV is [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure). |
 | ERC-8056 display multiplier permitted as a narrow display-only carve-out (GYL-956) | Removed; the prohibition on any multiplier is absolute again (GYL-1201) | See D-17. |
 | `SanctionsOracleMirror` is a "deployment gap adapter" for chains where Chainalysis never deployed, to be retired when a vendor oracle appears | It is the primary oracle **everywhere**, mainnet included, and is not retired (GYL-1051) | The founding premise inverted. Its access-control design, keeper model and not-a-blacklist argument all carry over unchanged; only the which-chain-uses-which-oracle question reversed. |

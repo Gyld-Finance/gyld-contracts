@@ -20,7 +20,7 @@ Solidity `0.8.28`, compiled with Foundry, on OpenZeppelin v5.3.0.
 | `GyldBondToken` | UUPS | ERC-20 per bond series. Fixed balances — value accrues in the NAV feed, never in balances. On-chain sanctions check on every secondary transfer, fail-closed. Pausable. EIP-2612 permit. IERC-1643 document management (prospectus / supplements), gated by `DOCUMENT_ROLE`. |
 | `IssuanceManager` | UUPS | Single mint/burn gate for all bond series. Only whitelisted Authorised Participants (APs) may receive minted tokens or be recorded as redemption beneficiaries. |
 | `TokenFactory` | None (`Ownable2Step`) | Deploys a `(GyldBondToken proxy, KaleidoscopeNAVFeed, NAVFeedForwarder)` triple atomically and wires the token's roles in one transaction. |
-| `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval. Both guards are unconditional — `updateAnswer` is the only write path and nothing bypasses it. |
+| `KaleidoscopeNAVFeed` | None (`Ownable2Step`) | Chainlink `AggregatorV3Interface`-compatible NAV oracle, 8 decimals. The backend pushes NAV here. 10 % max deviation per update, 1-hour minimum interval. Both guards are unconditional — `updateAnswer` is the only write path into price state and nothing bypasses it. The `isFresh()` window is owner-settable and gates no guard (audit FIND-022). |
 | `NAVFeedForwarder` | None (`Ownable2Step`) | Permanent, stable oracle address that forwards reads to a swappable upstream. DeFi protocols point here — **never** at `KaleidoscopeNAVFeed` directly. |
 | `SanctionsOracleMirror` | None | The platform sanctions oracle on **every** production EVM chain, Ethereum mainnet included (GYL-1051). A keeper bot syncs OFAC deltas into its local list; an optional gas-capped, fail-closed `forwardingOracle` can chain to a vendor oracle. |
 | `GyldAtomicSwap` | UUPS | Self-custodial atomic USDC⇄bond settlement against platform-signed EIP-712 quotes. **Holds its own inventory** — there is no vault, and it grants no standing outbound allowance. Taker binding, taker allowlist, single-use quotes, NAV sanity band. Net inventory leaves only via `withdraw()`, and only to the admin-fixed `withdrawalWallet`. |
@@ -63,7 +63,7 @@ GyldAtomicSwap
 SanctionsOracleMirror
   SANCTIONS_UPDATER_ROLE →  Keeper bot (add / remove sanctioned addresses)
 
-KaleidoscopeNAVFeed.owner       →  KMS signer (pushes NAV). The ONLY write path;
+KaleidoscopeNAVFeed.owner       →  KMS signer (pushes NAV). The ONLY price write path;
                                     no bypass exists, so this key's ceiling is
                                     genuinely 10%/hour. See ARCHITECTURE D-19
 NAVFeedForwarder.owner          →  TimelockController (oracle provider swaps)

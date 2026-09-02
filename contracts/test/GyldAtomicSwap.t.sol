@@ -28,6 +28,7 @@ contract GyldAtomicSwapTest is Test {
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
     event MaxQuoteTtlUpdated(uint64 newTtl);
+    event MaxNavAgeForSeriesUpdated(address indexed token, uint32 newSecs);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     GyldAtomicSwap swap;
@@ -1545,5 +1546,128 @@ contract GyldAtomicSwapTest is Test {
         swap.upgradeToAndCall(address(newImpl), "");
 
         assertEq(swap.maxQuoteTtl(), 5 minutes, "a configured TTL must survive the upgrade");
+    }
+
+    // ── Per-series maxNavAgeSecs (audit FIND-022) ─────────────────────────────
+
+    /// Unset means "follow the global", never "zero seconds". This is the property that
+    /// keeps a proxy upgraded across the mapping's addition working: every series reads
+    /// 0 from the fresh slot, and 0 must resolve to the pre-upgrade behaviour.
+    function test_maxNavAgeSecsFor_unsetFallsBackToGlobal() public view {
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), swap.maxNavAgeSecs());
+    }
+
+    /// An unregistered address has no override and no series, but the view must still
+    /// resolve rather than revert — it reports what the global would apply.
+    function test_maxNavAgeSecsFor_unknownTokenReportsGlobal() public view {
+        assertEq(swap.maxNavAgeSecsFor(address(0xDEAD)), MAX_NAV_AGE);
+    }
+
+    function test_setMaxNavAgeSecsFor_overridesOnlyThatSeries() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 3 hours, "series follows its override");
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE, "the global is untouched");
+    }
+
+    function test_setMaxNavAgeSecsFor_emits() public {
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit MaxNavAgeForSeriesUpdated(address(token), 3 hours);
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+    }
+
+    /// Zero is the CLEAR sentinel here, not a literal age — the one place this setter's
+    /// zero differs from setMaxNavAgeSecs, where zero is rejected.
+    function test_setMaxNavAgeSecsFor_zeroClearsBackToGlobal() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 3 hours);
+
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 0);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "cleared, not zero seconds");
+    }
+
+    /// The 72 h ceiling (D-16) must bind per-series too. An override that escaped it
+    /// would reopen exactly the no-op the global ceiling exists to prevent.
+    function test_setMaxNavAgeSecsFor_respectsGlobalCeiling() public {
+        uint32 over = uint32(72 hours) + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, over));
+        swap.setMaxNavAgeSecsFor(address(token), over);
+
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), uint32(72 hours));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 72 hours, "the ceiling itself is allowed");
+    }
+
+    function test_setMaxNavAgeSecsFor_unregisteredSeriesReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.UnregisteredSeries.selector, address(0xDEAD)));
+        swap.setMaxNavAgeSecsFor(address(0xDEAD), 3 hours);
+    }
+
+    function test_setMaxNavAgeSecsFor_nonAdminReverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+    }
+
+    /// The point of the whole change: the override must actually govern the hot path.
+    /// A feed age that clears the 24 h global must still fail a 3 h series override.
+    function test_executeSwap_perSeriesOverrideTightensStaleNav() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        uint256 age = block.timestamp - (3 hours + 1); // fine globally, stale for this series
+        navFeed.setUpdatedAt(age);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(91);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), age));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// And the converse: inside the override the same swap settles, so the override is
+    /// governing rather than merely being stored.
+    function test_executeSwap_withinPerSeriesOverrideSucceeds() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+        navFeed.setUpdatedAt(block.timestamp - 2 hours);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(92);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        uint256 before = token.balanceOf(taker);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertEq(token.balanceOf(taker) - before, 10e18, "the swap settled inside the override");
+    }
+
+    /// An override must not outlive its series: a re-registered token would otherwise
+    /// silently inherit a matured series' threshold.
+    function test_deregisterSeries_clearsPerSeriesOverride() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        // Drain inventory first — deregisterSeries refuses to orphan a balance.
+        vm.prank(treasurer);
+        swap.withdraw(address(token), 1_000e18);
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "override died with the series");
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(navFeed));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "re-registration does not resurrect it");
     }
 }

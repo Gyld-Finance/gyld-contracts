@@ -31,12 +31,16 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///          correction is reached by chaining updates (the band is relative to the
 ///          LAST price, so it moves with each push); pause the bond token meanwhile
 ///          if a wrong price must not be liquidated against. See ARCHITECTURE D-19.
-///        - MAX_STALENESS:           threshold for the isFresh() monitoring view;
+///        - stalenessThreshold:      threshold for the isFresh() monitoring view;
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
 ///                                   so DeFi integrations work over weekends and holidays.
 ///                                   Staleness is SURFACED (isFresh, stalenessSeconds),
 ///                                   never ENFORCED here — every consumer must age-check
 ///                                   `updatedAt` itself. See latestRoundData for why.
+///                                   Owner-settable and pinned to the strictest consumer
+///                                   threshold (audit FIND-022): this contract has no proxy,
+///                                   so a constant here could only be corrected by
+///                                   redeploying the feed and repointing every forwarder.
 ///
 
 contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
@@ -56,11 +60,29 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     /// Human-readable description (e.g. "TLT / USD NAV").
     string private _description;
 
+    /// Initial value written to `stalenessThreshold` by the constructor.
+    ///
+    /// 24 hours, matching GyldAtomicSwap's deployed `maxNavAgeSecs` (audit FIND-022).
+    /// The window is deliberately pinned to the strictest age any consumer enforces, so
+    /// `isFresh()` answers exactly one question: **will executeSwap accept this NAV right
+    /// now?** It goes false the moment settlement starts refusing, not a day later.
+    ///
+    /// It therefore reads false over weekends and market holidays, because the keeper
+    /// pushes once per market day and settlement genuinely is refusing then. That is
+    /// correct, not noise: `isFresh()` reports settlement availability, and nothing pages
+    /// on it. Distinguishing "the keeper died" from "the market is closed" is the job of
+    /// `stalenessSeconds()` plus a calendar-aware off-chain rule — no on-chain constant
+    /// can tell those apart, which is why this one does not try.
+    ///
+    /// Keep this equal to (or below) the tightest consumer threshold. If maxNavAgeSecs
+    /// is retuned, retune this with it via setStalenessThreshold.
+    uint256 public constant DEFAULT_STALENESS_THRESHOLD = 24 hours;
+
     /// Staleness threshold used by isFresh() for backend monitoring.
-    /// 96 hours: covers 3-day US holiday weekends (~87 h gap) with a buffer.
     /// latestRoundData() does NOT revert when this is exceeded — consumers
     /// receive the last known NAV, matching the Chainlink / Ondo Finance model.
-    uint256 public constant MAX_STALENESS = 96 hours;
+    /// Settable by the owner; see setStalenessThreshold (audit FIND-022).
+    uint256 public stalenessThreshold;
 
     /// Minimum time between consecutive updateAnswer() calls.
     /// Prevents rapid price oscillation from a compromised updater key.
@@ -85,11 +107,15 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     // never-thrown one used to live here and led readers (and two design docs) to
     // believe reads revert on staleness. They do not — see latestRoundData below.
     error CannotRenounceOwnership();
+    error InvalidStalenessThreshold(uint256 submitted);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
     /// Standard Chainlink event emitted on every price update.
     event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);
+
+    /// Emitted when the owner retunes the isFresh() monitoring window.
+    event StalenessThresholdUpdated(uint256 oldSeconds, uint256 newSeconds);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -97,6 +123,11 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     /// @param desc          Human-readable description, e.g. "TLT / USD NAV".
     constructor(address initialOwner, string memory desc) Ownable(initialOwner) {
         _description = desc;
+        stalenessThreshold = DEFAULT_STALENESS_THRESHOLD;
+        // oldSeconds = 0 is a "no previous value" sentinel the setter can never emit
+        // (it rejects zero), so an indexer can reconstruct the window from this log
+        // alone and tell the deployment apart from every later retune.
+        emit StalenessThresholdUpdated(0, DEFAULT_STALENESS_THRESHOLD);
     }
 
     // ── Ownership ─────────────────────────────────────────────────────────────
@@ -209,13 +240,59 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
 
     // ── Monitoring ────────────────────────────────────────────────────────────
 
-    /// @notice Returns true if the last price update is within MAX_STALENESS.
+    /// @notice Returns true if the last price update is within `stalenessThreshold`.
     ///         Use this in backend alerting to detect a stuck KMS signer.
     ///         DeFi read functions (latestRoundData, latestAnswer) never revert
     ///         on staleness — they always return the last known NAV.
+    /// @dev    Reads as "will executeSwap accept this NAV right now?" — the window is
+    ///         pinned to the strictest consumer threshold (FIND-022), so this goes false
+    ///         as settlement starts refusing rather than a day after. It is false over
+    ///         weekends by design, because settlement is refusing then too. It cannot
+    ///         tell "the keeper died" from "the market is closed"; that is the job of
+    ///         `stalenessSeconds()` plus a calendar-aware off-chain rule. Nothing pages
+    ///         on this boolean.
     function isFresh() external view returns (bool) {
         if (_updatedAt == 0) return false;
-        return block.timestamp - _updatedAt <= MAX_STALENESS;
+        return block.timestamp - _updatedAt <= stalenessThreshold;
+    }
+
+    /// @notice Retune the isFresh() monitoring window.
+    /// @param newSeconds New threshold in seconds. Must be non-zero.
+    ///
+    /// @dev    Exists because this contract has no proxy (audit FIND-022). As a
+    ///         `constant` the window could only be corrected by deploying a
+    ///         replacement feed and repointing every NAVFeedForwarder at it via
+    ///         setUpstreamOracle — so a value that turned out wrong after launch
+    ///         became permanent. A setter makes that a transaction instead.
+    ///
+    ///         Deliberately carries no structural ceiling, unlike
+    ///         GyldAtomicSwap.setMaxNavAgeSecs (D-16). That one bounds the ONLY
+    ///         staleness defence on the settlement path, so an admin must not be
+    ///         able to widen it into a no-op. This one gates a view and nothing
+    ///         else: no read reverts on it, no transfer depends on it, and no
+    ///         on-chain guarantee changes with it. A ceiling here would suggest
+    ///         a protection that does not exist. Zero is still rejected — it is
+    ///         never a deliberate choice, only a forgotten argument.
+    ///
+    ///         NOT retrofittable: feeds deployed before this setter hold the window
+    ///         as a `constant` and cannot be retuned at all — reaching them needs a
+    ///         replacement feed plus a setUpstreamOracle repoint on every forwarder.
+    ///
+    ///         Widening this is the one extra power a compromised owner key gains: it
+    ///         can hold isFresh() at `true` through an outage. It cannot touch
+    ///         `stalenessSeconds()`, which is the designated monitoring entrypoint for
+    ///         exactly that reason, and the change emits StalenessThresholdUpdated.
+    ///
+    ///         Keep this at or below the tightest age any consumer enforces — today
+    ///         GyldAtomicSwap.maxNavAgeSecs, and note that is now per-series
+    ///         (setMaxNavAgeSecsFor), so a series held to a tighter age wants this
+    ///         tightened with it. A window ABOVE the enforced age is the defect
+    ///         FIND-022 raised: the view would read healthy while settlement fails.
+    function setStalenessThreshold(uint256 newSeconds) external onlyOwner {
+        if (newSeconds == 0) revert InvalidStalenessThreshold(newSeconds);
+        uint256 old = stalenessThreshold;
+        stalenessThreshold = newSeconds;
+        emit StalenessThresholdUpdated(old, newSeconds);
     }
 
     /// @notice Seconds elapsed since the last price push; type(uint256).max if a price
@@ -224,7 +301,7 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     ///         design — see latestRoundData — so freshness must be surfaced, not
     ///         enforced. This returns a magnitude rather than the boolean `isFresh()`
     ///         gives, which lets an alerting rule pick its own threshold (page at 26 h,
-    ///         escalate at 96 h) instead of being pinned to MAX_STALENESS, and lets a
+    ///         escalate at 48 h) instead of being pinned to `stalenessThreshold`, and lets a
     ///         dashboard chart the gap. The sentinel for "never set" is
     ///         type(uint256).max rather than 0 so a never-initialised feed can never be
     ///         mistaken for a just-updated one.
