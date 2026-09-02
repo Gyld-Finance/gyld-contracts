@@ -2250,7 +2250,7 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **547 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **558 tests, 20 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
@@ -2259,7 +2259,7 @@ intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 | `GyldAtomicSwapTest` | 96 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts; per-series `maxNavAgeSecs` overrides (FIND-022) |
 | `KaleidoscopeNAVFeedTest` | 70 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`**, settable `stalenessThreshold` (FIND-022) |
 | `TokenFactoryTest` | 62 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
-| `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
+| `IssuanceManagerTest` | 62 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard, daily mint cap + mint-path pause (FIND-001) |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
 | `GyldAtomicSwapSpecTest` | 48 | The numbered invariant / finding catalogue below |
 | `GyldBondTokenTest` | 46 | Core token functions; ERC-1643 document set/remove and `DOCUMENT_ROLE` gating; fail-closed screening on an unset sanctions list |

@@ -3,6 +3,7 @@ pragma solidity =0.8.28;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
@@ -32,14 +33,35 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 ///   WHITELIST_ADMIN_ROLE — adds / removes APs from the whitelist
 ///   SUBSCRIBER_ROLE      — calls subscribe() (mint path); separate MPC wallet from redeemer
 ///   REDEEMER_ROLE        — calls redeem()    (burn path); separate MPC wallet from subscriber
+///   ISSUANCE_PAUSER_ROLE — halts the mint path; redeem stays open so APs are not trapped
 ///   DEFAULT_ADMIN_ROLE   — also authorizes UUPS upgrades (should be a TimelockController)
-contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
+///
+/// Issuance limit (audit FIND-001): subscribe() used to bound only "registered,
+/// whitelisted, non-zero", so one compromised online SUBSCRIBER_ROLE key could mint
+/// without limit — diluting every holder, since NAV is computed against total supply.
+/// Each series now has a daily mint cap (DEFAULT_DAILY_CAP unless the timelock sets
+/// another). Dual control above a threshold is a Fordefi approval policy rather than an
+/// on-chain check, the same split Ondo and Backed use.
+contract IssuanceManager is
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     // ── Roles ─────────────────────────────────────────────────────────────────
 
     bytes32 public constant WHITELIST_ADMIN_ROLE = keccak256("WHITELIST_ADMIN_ROLE");
     bytes32 public constant SUBSCRIBER_ROLE      = keccak256("SUBSCRIBER_ROLE");
     bytes32 public constant REDEEMER_ROLE        = keccak256("REDEEMER_ROLE");
     bytes32 public constant REGISTRAR_ROLE       = keccak256("REGISTRAR_ROLE");
+    bytes32 public constant ISSUANCE_PAUSER_ROLE = keccak256("ISSUANCE_PAUSER_ROLE");
+
+    /// Daily mint cap applied to a series with no explicit cap set.
+    uint256 public constant DEFAULT_DAILY_CAP = 10_000e18;
+
+    /// Cap window. Fixed and resetting, like Ondo's InstantMintTimeBasedRateLimiter.
+    uint256 public constant CAP_WINDOW = 1 days;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -47,6 +69,15 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     struct IssuanceManagerStorage {
         mapping(address => bool) whitelisted;
         mapping(address => bool) registeredTokens;
+        // APPEND-ONLY (ERC-7201): new fields go here, never insert/reorder above.
+        mapping(address => uint256) dailyCapOf; // 0 = use DEFAULT_DAILY_CAP
+        mapping(address => Usage) usageOf;
+    }
+
+    /// Mint usage for the current window. One slot: uint64 timestamp + uint192 amount.
+    struct Usage {
+        uint64 windowStart;
+        uint192 minted;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.IssuanceManager")) - 1)) & ~bytes32(uint256(0xff))
@@ -67,6 +98,8 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     error NotWhitelisted(address account);
     error NotValidTokenContract(address token);
     error CannotRenounceAdminRole();
+    error DailyCapExceeded(address token, uint256 requested, uint256 cap);
+    error InvalidCap(uint256 cap);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -76,6 +109,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     event AddressRemovedFromWhitelist(address indexed account);
     event TokenRegistered(address indexed token);
     event TokenDeregistered(address indexed token);
+    event DailyCapUpdated(address indexed token, uint256 cap);
 
     // ── Constructor / Initializer ─────────────────────────────────────────────
 
@@ -91,6 +125,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         if (defaultAdmin == address(0) || subscriber == address(0) || redeemer == address(0)) revert ZeroAddress();
         __AccessControl_init();
         __ReentrancyGuard_init();
+        __Pausable_init();
         __UUPSUpgradeable_init();
         _grantRole(DEFAULT_ADMIN_ROLE,  defaultAdmin);
         _grantRole(SUBSCRIBER_ROLE,     subscriber);
@@ -125,11 +160,25 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     function subscribe(address token, address recipient, uint256 amount)
         external
         nonReentrant
+        whenNotPaused
         onlyRole(SUBSCRIBER_ROLE)
     {
         if (!_getStorage().registeredTokens[token]) revert UnregisteredToken(token);
         if (!_getStorage().whitelisted[recipient])   revert NotWhitelisted(recipient);
         if (amount == 0)                             revert ZeroAmount();
+
+        // Daily cap (audit FIND-001). Roll the window if it has elapsed — or if this
+        // series has never minted, so the window anchors here rather than at epoch 0.
+        Usage storage u = _getStorage().usageOf[token];
+        if (u.windowStart == 0 || block.timestamp >= u.windowStart + CAP_WINDOW) {
+            u.windowStart = uint64(block.timestamp);
+            u.minted = 0;
+        }
+        uint256 cap = dailyCap(token);
+        uint256 used = u.minted + amount;
+        if (used > cap) revert DailyCapExceeded(token, amount, cap);
+        u.minted = uint192(used);
+
         // nonReentrant: defense-in-depth; mint/burn are role-gated with no untrusted callbacks
         IGyldBondToken(token).mint(recipient, amount);
         emit Subscribed(token, recipient, amount);
@@ -238,6 +287,43 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         if (token == address(0)) revert ZeroAddress();
         _getStorage().registeredTokens[token] = false;
         emit TokenDeregistered(token);
+    }
+
+    // ── Issuance limit + pause (audit FIND-001) ───────────────────────────────
+
+    /// @notice Set a series' daily mint cap. Zero restores DEFAULT_DAILY_CAP.
+    /// @dev    DEFAULT_ADMIN_ROLE (the timelock) only — a cap the online SUBSCRIBER key
+    ///         could raise would not be a cap.
+    ///
+    ///         Bounded by uint192 because `Usage.minted` is a uint192 and subscribe casts
+    ///         to it explicitly, which Solidity does not check. A cap above this range
+    ///         would let the running total truncate and silently reset the counter.
+    function setDailyCap(address token, uint256 cap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (cap > type(uint192).max) revert InvalidCap(cap);
+        _getStorage().dailyCapOf[token] = cap;
+        emit DailyCapUpdated(token, cap);
+    }
+
+    /// @notice The daily mint cap in force for `token`.
+    function dailyCap(address token) public view returns (uint256) {
+        uint256 cap = _getStorage().dailyCapOf[token];
+        return cap == 0 ? DEFAULT_DAILY_CAP : cap;
+    }
+
+    /// @notice Amount minted in the current window, and when that window started.
+    function mintedToday(address token) external view returns (uint256 minted, uint256 windowStart) {
+        Usage storage u = _getStorage().usageOf[token];
+        return (u.minted, u.windowStart);
+    }
+
+    /// @notice Halt the mint path. Redeem stays open so APs are not trapped mid-incident.
+    function pauseIssuance() external onlyRole(ISSUANCE_PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Resume issuance. Timelock only — asymmetric, like the swap (D-14).
+    function unpauseIssuance() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
     }
 
     // ── Role management overrides ─────────────────────────────────────────────
