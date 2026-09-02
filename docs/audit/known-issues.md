@@ -10,7 +10,7 @@ this document and `ci/slither-baseline.json` are kept in step by the build.
 | solc | 0.8.28, `via_ir = true`, `optimizer_runs = 200` |
 | Command | `slither .` (unfiltered — see *The `--filter-paths` trap* below) |
 | Results, whole tree | **1,956** |
-| Results touching `contracts/*.sol` | **48** (44 unique fingerprints) |
+| Results touching `contracts/*.sol` | **49** (45 unique fingerprints) |
 | Live defects found | **0** |
 
 The other ~1,908 results are in `lib/` — OpenZeppelin v5.3.0 and forge-std. They
@@ -115,15 +115,26 @@ bytecode the factory itself just wrote — not attacker-controlled. There is no
 untrusted re-entry point, and `deployToken` is `onlyOwner` (the timelock in
 production) and `nonReentrant` besides.
 
-### `timestamp` ×9 — **False positive**
+### `timestamp` ×10 — **False positive**
 
 `GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
-freshness), `NAVFeedForwarder` (future-date probe).
+freshness), `NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
+cap window, audit FIND-001).
 
 Every comparison is on an **hour-to-day** scale: `MIN_UPDATE_INTERVAL` is 1 hour,
-`maxNavAgeSecs` is ceilinged at 72 hours, quote TTL at 10 minutes. Proposer
-timestamp latitude is seconds. There is no threshold here a validator could
-straddle to gain anything.
+`maxNavAgeSecs` is ceilinged at 72 hours, quote TTL at 10 minutes, and the
+issuance `CAP_WINDOW` is 24 hours. Proposer timestamp latitude is seconds. There
+is no threshold here a validator could straddle to gain anything.
+
+The issuance window deserves the explicit version, because it is the one where
+straddling a boundary *does* buy something: a mint at the end of one window and
+another at the start of the next yields two daily budgets, so the real bound is
+2× the cap per rolling 24 h. That is a property of a fixed resetting window, not
+of timestamp latitude — it holds at any clock precision, and moving the boundary
+by a few seconds neither creates nor widens it. The same design ships in Ondo's
+`InstantMintTimeBasedRateLimiter`. It is documented on `CAP_WINDOW` and in the
+FIND-001 remediation; the answer if a hard 1× bound is ever required is to halve
+the cap, not to chase sub-second accuracy.
 
 ---
 

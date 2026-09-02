@@ -183,6 +183,11 @@
     },
     {
       "check": "timestamp",
+      "file": "contracts/IssuanceManager.sol",
+      "element": "subscribe"
+    },
+    {
+      "check": "timestamp",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
