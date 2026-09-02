@@ -500,6 +500,7 @@ evacuate funds, then fix under the timelock.
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
 | Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **A paused bond token blocks its own evacuation** — see "Evacuating a paused bond token" below |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
+| Correct a wrong NAV | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
 
 ### Evacuating a paused bond token
 

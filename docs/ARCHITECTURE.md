@@ -1269,7 +1269,7 @@ production. This is the table to read first if you are auditing the system.
 | `SUBSCRIBER_ROLE` | Mint arbitrary amounts of any registered token — but **only to a whitelisted AP** | Blast radius limited to KYC-approved addresses. Token pause stops it. Supply reconciliation should catch it. |
 | `REDEEMER_ROLE` | Burn the whole pooled `IssuanceManager` balance naming any whitelisted AP | Cannot redirect the off-chain USDC payment (a separate backend service keys off the `Redeemed` event's beneficiary). Cannot name a non-whitelisted address, so no payout results. Token pause stops it. |
 | `WHITELIST_ADMIN_ROLE` | Add an attacker-controlled address to the AP whitelist — which then makes it a legal mint target or redemption beneficiary | Needs `SUBSCRIBER_ROLE`/`REDEEMER_ROLE` as well to extract value. Whitelist events are cheap to monitor. |
-| `PAUSER_ROLE` (token) | Halt all token movement, including liquidations on Morpho and Euler | Denial of service, not theft. Note this **freezes DeFi liquidations** — undercollateralised positions cannot be closed until unpause. |
+| `PAUSER_ROLE` (token) | Halt all token movement, including liquidations on Morpho and Euler | Denial of service, not theft. Note this **freezes DeFi liquidations** — undercollateralised positions cannot be closed until unpause. It does **not** freeze `borrow`, which moves only the loan token, so a pause is containment only when the wrong price is in the borrower's disfavour; against an *overstated* NAV it disables the remedy and leaves the harm reachable ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure), FIND-004). |
 | `QUOTE_SIGNER_ROLE` | Sign quotes at any price | Bounded by `maxQuoteDeviationBps` (deployed 2 %) against the on-chain NAV, **per trade**. The feed is written by a *different* key and is itself capped at ±10 % per hour, so one stolen key cannot both move the reference and exploit the band. Contained by `bumpQuoteEpoch`. |
 | `ALLOWLIST_ADMIN_ROLE` | Allowlist an attacker address as a swap taker | Still needs a valid signed quote from `QUOTE_SIGNER_ROLE`, still bounded by the NAV band. No access to funds or upgrades. |
 | `TREASURER_ROLE` | Move all swap inventory out | **Only to the admin-fixed `withdrawalWallet`.** Cannot redirect. This is why the role is safe to keep live while paused — the swap's pause, that is; a paused bond token still blocks its own leg, by design — see §5.7 › *Treasury withdrawal*. |
@@ -1863,14 +1863,46 @@ part of any upstream migration**, before the timelock proposal, not after.
 ### 11.5 Correcting a wrong NAV — the incident procedure
 
 A wrong answer is on the feed. There is no bypass and there will not be one
-([D-19](#171-adopted-and-current)). The procedure is:
+([D-19](#171-adopted-and-current)).
+
+**Establish the direction of the error before touching anything.** The correct
+response is *opposite* in the two cases, and pausing the bond token is safe in only
+one of them. Reaching for the pause by reflex converts a recoverable pricing error
+into unrecoverable bad debt at an external lender (audit FIND-004).
+
+| Published answer is | Pause the bond token? |
+|---|---|
+| **Too high** — overstates the bond | **No. Do not pause.** |
+| **Too low** — understates the bond | **Yes.** |
+
+**Why the asymmetry.** Pausing `GyldBondToken` gates `transfer` / `transferFrom`, so
+on Morpho it blocks every operation that *moves* the token: `supplyCollateral`,
+`withdrawCollateral` and `liquidate`. It does **not** block `borrow`, which pays out
+the loan token and never touches the collateral. Against an **overstated** NAV a
+pause therefore leaves borrowing at the inflated valuation open while disabling the
+liquidations that would close those positions — the harm stays reachable and the
+remedy does not — and the walk-back in step 2 drives the positions further underwater
+with no operator action available. Against an **understated** NAV the same freeze is
+protective: the liquidations it blocks are the wrongful ones.
+
+#### Case A — the answer is too HIGH: do not pause
+
+1. **Leave the token unpaused.** Liquidations are the mechanism that closes positions
+   as the price returns to truth; the pause would be the one thing that stops them.
+2. **Chain `updateAnswer` back to the true NAV.** One call per hour, each at most
+   10 % from the *then*-current stored answer.
+3. **Nothing to unpause.** Watch Morpho and Euler health factors through the
+   walk-back and expect liquidations on the way down — they are the correct outcome,
+   not a second incident.
+
+#### Case B — the answer is too LOW: pause
 
 1. **`pause()` the bond token.** `PAUSER_ROLE`, held by the ops multisig, instant,
    **no timelock, no admin**. This freezes every transfer of the series, which per
-   [§6.3](#63-what-a-single-key-compromise-buys) also freezes DeFi liquidations —
-   nobody is liquidated against the wrong price while it is being walked back.
-2. **Chain `updateAnswer` back to the true NAV.** One call per hour, each at most
-   10 % from the *then*-current stored answer.
+   [§6.3](#63-what-a-single-key-compromise-buys) also freezes DeFi liquidations. Here
+   those liquidations are firing against a price wrong in the borrower's disfavour,
+   so blocking them is the point.
+2. **Chain `updateAnswer` back to the true NAV.** Same mechanics as Case A.
 3. **`unpause()`** once the feed reads correctly. The token's pause is **symmetric**
    ([§5.1 › Pause semantics](#pause-semantics)) — the same `PAUSER_ROLE` resumes, so
    step 3 does not wait on governance. (The *swap's* pause is asymmetric; this
@@ -1896,12 +1928,26 @@ Two calls, two hours. This generalises: any answer that *passed* the band is wit
 genuine large market move needs more steps (15 % in 2, 25 % in 3, 40 % in 4) but the
 same mechanism.
 
-**The honest cost.** `pause()` is a blunt instrument. It halts **all** transfers for
-**all** holders — not just liquidations — for the couple of hours the walk-back
-takes. Secondary trading, redemptions and atomic swaps stop with it. That is a real
+**The honest cost of Case B.** `pause()` is a blunt instrument. It halts **all**
+transfers for **all** holders — not just liquidations — for the couple of hours the
+walk-back takes. Secondary trading, redemptions and atomic swaps stop with it. That is a real
 cost, and it is the cost this design deliberately accepts in exchange for the feed
 having no unbounded instant-price primitive at all. Pausing also adds **no new
 privilege**: `PAUSER_ROLE` already exists for exactly this class of incident.
+
+**What this procedure cannot reach, and why no contract change fixes it.** In Case A
+the damage accrues inside Morpho, which prices from the last pushed answer and checks
+no timestamp ([§11.3](#113-reads-never-revert-on-staleness--the-deliberate-choice)).
+Nothing we can do to `KaleidoscopeNAVFeed` or `NAVFeedForwarder` reaches it. Audit
+FIND-004 proposed a governance-set fault flag on the forwarder that serves a
+deliberately stale `updatedAt`; that is **declined** — it is a signal, and only a
+consumer that age-checks can act on it, which is precisely the set of consumers
+(Euler, `GyldAtomicSwap`) that already fail closed without it. See
+[D-26](#171-adopted-and-current). Containment for Case A is upstream of the feed: the
+±10 %/hour band and the absence of any bypass (D-19, FIND-020) bound how wrong a
+single push can be, and `stalenessSeconds()` monitoring bounds how long it stays
+wrong. The runbook's job is to make sure the operator does not enlarge the loss while
+that plays out.
 
 ---
 
@@ -2272,14 +2318,18 @@ and the two upstream properties a vault builder must document are in
 
 ### 15.5 Cross-cutting notes
 
-- **Pause freezes DeFi positions, liquidations included.** When `GyldBondToken` is
-  paused, every Morpho and Euler interaction reverts — including liquidations, so an
-  undercollateralised position cannot be closed until unpause. The ops multisig must
-  weigh that before triggering a pause; it is the same tension as
-  [§18](#18-known-gaps-and-open-decisions) gap 10. It is also the tension the NAV
-  walk-back procedure ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure))
-  deliberately accepts: freezing liquidations is the point, and freezing everyone
-  else's transfers alongside them is the price.
+- **Pause freezes DeFi positions, liquidations included — but not borrowing.** When
+  `GyldBondToken` is paused, every Morpho and Euler operation that *moves the token*
+  reverts: `supplyCollateral`, `withdrawCollateral` and `liquidate`, so an
+  undercollateralised position cannot be closed until unpause. `borrow` is **not**
+  blocked — it pays out the loan token and never touches the collateral. The ops
+  multisig must weigh both halves before triggering a pause; it is the same tension as
+  [§18](#18-known-gaps-and-open-decisions) gap 10. The NAV walk-back procedure
+  ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure)) accepts that cost
+  **only when the published answer is too low**, where the frozen liquidations are the
+  wrongful ones. Against an answer that is too high the same freeze is harmful — it
+  stops the liquidations that should fire while leaving borrowing at the inflated
+  valuation open — and the procedure directs the operator not to pause (FIND-004).
 - **Protocol addresses are screened as spenders.** Morpho's and Euler's contract
   addresses go through the sanctions oracle on every collateral deposit and
   withdrawal — as `to`, as `from`, and as the `transferFrom` spender. A protocol
@@ -2435,6 +2485,7 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-22 | **The `isFresh()` window is owner-settable and pinned to the strictest enforced age (24 h)** (audit FIND-022) | Two halves. **Settable:** `KaleidoscopeNAVFeed` has no proxy, so a `constant` window could only be corrected by deploying a replacement feed and repointing every `NAVFeedForwarder.setUpstreamOracle()` — a migration to fix a monitoring number. `setStalenessThreshold` makes it a transaction. It carries no ceiling (unlike D-16) because it gates a view and no on-chain guarantee; a ceiling would imply a protection that does not exist. Zero is rejected. **Pinned to 24 h, matching `maxNavAgeSecs`:** the defect was a monitoring view sitting ABOVE the age its consumer enforces — settlement began failing at +24 h while `isFresh()` read healthy to +96 h, a three-day blind spot on a weekday keeper failure. `isFresh()` now answers exactly one question, "will `executeSwap` accept this NAV right now?", and flips as settlement starts refusing. **We considered and rejected keeping it at 96 h** to avoid a false signal over weekends: the keeper pushes once per market day, so a normal weekend is a ~65 h gap and the view is false all weekend. That is correct rather than noisy — settlement genuinely is refusing then, nothing pages on this boolean, and a window above the enforced age is precisely the defect. What `isFresh()` cannot do is separate "the keeper died" from "the market is closed"; no on-chain constant can, which is why the operator signal is `stalenessSeconds()` under a **calendar-aware off-chain rule** (page ~26 h on a market day) and this boolean is the coarse backstop. Retune both together: if `maxNavAgeSecs` moves — including per-series, D-23 — move this with it. **Not retrofittable, and the deployed feed is not remediated:** the contract is immutable, so the live Sepolia feed (`0x4266a4A4…`, [DEPLOYMENTS](../DEPLOYMENTS.md)) keeps its hardcoded window and cannot be retuned. Reaching it means deploying a replacement feed and repointing `setUpstreamOracle()` — exactly the migration the setter exists to avoid *next* time. This lands before the production deployment, which is why the audit flagged it as pre-deployment work. [§11](#11-oracle-design) |
 | D-24 | **`deregisterSeries` sweeps residual inventory instead of requiring a zero balance** (audit FIND-024) | The old guard demanded `balanceOf(swap) == 0` *at execution time*, but clearing the balance is a separate `withdraw` (`TREASURER_ROLE`) and the deregistration itself waits on the 48 h timelock — the two were never atomic. `GyldBondToken._update` carries only a sanctions screen and **no transfer allowlist**, so any unsanctioned holder could re-seed **one wei** in that window and cost the operator a fresh withdrawal plus a fresh 48 h cycle, for the price of one ERC-20 transfer. The asymmetry ran strongly against the defender and required no privilege. The sweep makes clearing and retiring one call, leaving no gap to race. **A dust threshold was rejected:** an attacker sends `threshold + 1`, and a threshold additionally licenses orphaning real inventory — the very thing the original guard existed to prevent. Fail-closed on an unset `withdrawalWallet` (`ZeroAddress`), matching `withdraw`, so residual inventory is never burned to `address(0)`; a zero balance needs no destination and retires regardless. `nonReentrant` was added with the external call and registry writes precede it (CEI). This does hand `DEFAULT_ADMIN_ROLE` a token-moving path that skips `TREASURER_ROLE` — no new trust assumption, since the admin also sets that wallet and `_authorizeUpgrade` is already `DEFAULT_ADMIN_ROLE` — but it does skip the upgrade ceremony and its storage-layout review gate, which is the honest delta. **The zero-code half of the remedy stands too:** `deregisterSeries` only *reads* the balance, so withdraw → **pause the token** → execute blocks the dust refill outright and needs no upgrade. [§9](#9-gyldatomicswap) |
 | D-25 | **`maturityTimestamp` stays off-chain metadata; it is validated at deploy and never enforced** (audit FIND-009) | The field was stored and exposed but read by nothing, so a matured series minted and traded exactly like a live one — an implied control that did not exist. **We rejected enforcing it in `mint()`.** Series lifecycle is an operational process, not a contract state machine: coupon handling, extensions and early calls are all decided off-chain, and a hard on-chain cutoff would need an upgrade to correct a date entered wrong at deploy — a governance cycle to fix a typo. Primary issuance is fully permissioned (`SUBSCRIBER_ROLE` only), so a matured series stops minting when operations stop submitting, and the audit's own recommendation offers documentation as an accepted remedy. **What we did instead:** `deployToken` rejects a maturity already in the past (`MaturityInPast`), keeping `0` as the open-ended sentinel, so a bad date is caught once at the only point it can be corrected for free; and the NatSpec on `maturityTimestamp()` states plainly that nothing enforces it, so no integrator infers a gate. **The honest residual:** a compromised or careless `SUBSCRIBER_ROLE` key can still mint a matured series, and the per-series levers for stopping it are weak — `deregisterToken` has no live `REGISTRAR_ROLE` holder (D-21) and would block `redeem` as well as `subscribe`, `setDailyCap(token, 0)` *restores* the 10,000e18 default rather than disabling minting, and `pauseIssuance()` is global. Retiring a matured series today therefore means pausing that bond token. **Validating the field surfaced the reason it matters:** all three devnet maturity literals disagreed with their own comments — Caterpillar and Citigroup were each ~2 years early, Citigroup landing 8 months in the *past* — drift that went unnoticed precisely because nothing read the value. [§3](#3-gyldbondtoken) |
+| D-26 | **The wrong-NAV procedure branches on the direction of the error, and no fault flag is added to `NAVFeedForwarder`** (audit FIND-004) | The old §11.5 opened with an unconditional `pause()` of the bond token, justified as "nobody is liquidated against the wrong price while it is being walked back". That holds in one direction only. A pause gates `transfer`/`transferFrom`, so on Morpho it blocks `supplyCollateral`, `withdrawCollateral` and `liquidate` — but **not** `borrow`, which pays out the loan token and never touches the collateral. Against an **overstated** NAV the pause therefore leaves the harm reachable and disables the remedy, and the hourly walk-back drives positions further underwater while nothing can close them: a recoverable pricing error turned into unrecoverable bad debt at an external lender, by an operator following our own runbook. §11.5 now branches — Case A (too high) does not pause, Case B (too low) does — and the two other places that asserted freezing liquidations "is the point" (§6.3, §15.5) are qualified to the borrower's-disfavour case. **The audit's second recommendation — a governance-set flag on the forwarder serving a deliberately stale `updatedAt` — is declined.** It is a *signal*: only a consumer that age-checks can act on it, and that is exactly the set (Euler, `GyldAtomicSwap`) that already fails closed without it, while Morpho — the sole consumer this finding is about — checks no timestamp and would price identically through the flag ([§11.3](#113-reads-never-revert-on-staleness--the-deliberate-choice)). The only read that reaches Morpho is a reverting one, already rejected as D-6 for the stronger version of this same failure. The cost is not zero either: the forwarder's owner is the 48 h timelock, so a flag usable in an incident needs a new hot role on the one address baked immutably into Morpho market params, and it forfeits the "no local state, pure delegation" property integrators are told to rely on. Recorded rather than deferred because `NAVFeedForwarder` is not upgradeable: once the first Morpho market fixes its address, the option is gone. The audit's third recommendation — confirm and record per-integration whether the consumer age-checks — shipped earlier under FIND-022 as the `INTEGRATION PRECONDITION` block. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
 
 ### 17.2 Deferred
 
