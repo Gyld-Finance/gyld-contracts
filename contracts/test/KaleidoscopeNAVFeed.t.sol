@@ -214,14 +214,83 @@ contract KaleidoscopeNAVFeedTest is Test {
 
     function test_updateAnswer_zeroReverts() public {
         vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(0)));
         feed.updateAnswer(0);
     }
 
     function test_updateAnswer_negativeReverts() public {
         vm.prank(owner);
-        vm.expectRevert(KaleidoscopeNAVFeed.AnswerMustBePositive.selector);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(-1)));
         feed.updateAnswer(-1);
+    }
+
+    // ── Absolute answer range (audit FIND-020) ────────────────────────────────
+
+    /// The trap: the first push skips the deviation guard entirely, so a placeholder of 1
+    /// used to be storable — and a stored value of 9 or less can never move again, because
+    /// the smallest change gives 1 * 10_000 against at most 9 * 1_000. The feed is not
+    /// upgradeable and has no reset, so that state was permanent.
+    function test_updateAnswer_firstPushBelowFloorReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(1)));
+        feed.updateAnswer(1);
+    }
+
+    /// 9 was the highest value that bricked the feed; the floor sits far above it.
+    function test_updateAnswer_firstPushAtTheBrickingBoundaryReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(9)));
+        feed.updateAnswer(9);
+    }
+
+    /// The other end: above ~int256.max / BPS_DENOMINATOR the deviation arithmetic
+    /// overflows and every later push panics. The ceiling keeps it unreachable.
+    function test_updateAnswer_firstPushAboveCeilingReverts() public {
+        int256 tooBig = int256(feed.MAX_ANSWER()) + 1; // cached before the prank
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, tooBig));
+        feed.updateAnswer(tooBig);
+    }
+
+    function test_updateAnswer_rangeBoundariesAreInclusive() public {
+        // Cache before pranking — the getter would otherwise consume it (see setUp).
+        int256 floor_ = int256(feed.MIN_ANSWER());
+        int256 ceiling = int256(feed.MAX_ANSWER());
+
+        vm.prank(owner);
+        feed.updateAnswer(floor_);
+        assertEq(feed.latestAnswer(), floor_);
+
+        KaleidoscopeNAVFeed f2 = new KaleidoscopeNAVFeed(owner, "ceiling");
+        vm.prank(owner);
+        f2.updateAnswer(ceiling);
+        assertEq(f2.latestAnswer(), ceiling);
+    }
+
+    /// The range binds every push, not just the first — a healthy feed cannot be walked
+    /// down below the floor either.
+    function test_updateAnswer_rangeAppliesToLaterPushesToo() public {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+
+        vm.warp(block.timestamp + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(5)));
+        feed.updateAnswer(5);
+    }
+
+    /// A feed at the floor must still be able to move — proving the floor is above the
+    /// stuck region rather than merely inside a legal-looking range.
+    function test_updateAnswer_feedAtTheFloorCanStillMove() public {
+        int256 floor_ = int256(feed.MIN_ANSWER());
+
+        vm.prank(owner);
+        feed.updateAnswer(floor_);
+
+        vm.warp(block.timestamp + ONE_HOUR);
+        vm.prank(owner);
+        feed.updateAnswer(floor_ + 1); // 1 unit is well inside 10%
+        assertEq(feed.latestAnswer(), floor_ + 1, "the floor is recoverable");
     }
 
     // ── latestRoundData ───────────────────────────────────────────────────────

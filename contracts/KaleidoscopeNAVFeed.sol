@@ -25,6 +25,9 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///      e.g. TLT at $95.42 → answer = 9_542_000_000
 ///
 ///      Safety constraints:
+///        - MIN_ANSWER / MAX_ANSWER: absolute range, enforced on EVERY push including
+///          the first. Below 10 the deviation guard can never pass again and the feed is
+///          permanently stuck; far above, its arithmetic overflows. See MIN_ANSWER.
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
 ///          Both guards are unconditional — there is no privileged bypass. A larger
@@ -96,9 +99,35 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     /// Denominator for basis-point arithmetic (1 bps = 1 / 10_000).
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
+    /// Absolute floor for any published answer, first push included (audit FIND-020).
+    /// 1e6 at 8 decimals = $0.01 per token.
+    ///
+    /// The floor is a correctness guard, not a taste guard. The deviation check is
+    /// `diff * BPS_DENOMINATOR > last * MAX_PRICE_DEVIATION_BPS`, so a stored `last` of 9
+    /// or less can never move again: the smallest possible change gives 1 * 10_000 = 10_000
+    /// against at most 9 * 1_000 = 9_000, and every later push reverts
+    /// PriceDeviationTooLarge. 10 is the lowest recoverable value. Since the first push
+    /// skips the deviation check entirely (there is no `last` to compare against), a
+    /// placeholder first answer of 1 would brick the feed permanently — it is not
+    /// upgradeable, has no pause or reset, and `_updatedAt` never returns to zero.
+    uint256 public constant MIN_ANSWER = 1e6;
+
+    /// Absolute ceiling for any published answer. 1e18 at 8 decimals = $10bn per token.
+    ///
+    /// The mirror of MIN_ANSWER: above roughly int256.max / BPS_DENOMINATOR (~5.8e72) the
+    /// deviation check's own arithmetic overflows and every later push reverts with a
+    /// panic instead of a named error. This ceiling sits ~54 orders of magnitude below
+    /// that, so the multiplication cannot overflow for any accepted answer.
+    ///
+    /// NOT fixed by reordering the deviation arithmetic to divide first: that removes the
+    /// overflow at the top while making the bottom strictly worse, because
+    /// `last / BPS_DENOMINATOR` truncates to zero for any realistic price and would then
+    /// reject every push (audit FIND-020).
+    uint256 public constant MAX_ANSWER = 1e18;
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
-    error AnswerMustBePositive();
+    error AnswerOutOfRange(int256 answer);
     error UpdateTooSoon(uint256 nextAllowedAt);
     error PriceDeviationTooLarge(int256 submitted, int256 previous);
     error HistoricalRoundsNotStored(uint80 requested, uint80 current);
@@ -155,7 +184,11 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     ///   - less than MIN_UPDATE_INTERVAL has elapsed since the last update
     ///   - price deviates more than MAX_PRICE_DEVIATION_BPS from the previous price
     function updateAnswer(int256 answer) external onlyOwner {
-        if (answer <= 0) revert AnswerMustBePositive();
+        // Applies to EVERY push, the first included — that is the point (FIND-020).
+        // Also subsumes the old positivity check: a negative answer is below MIN_ANSWER.
+        if (answer < int256(MIN_ANSWER) || answer > int256(MAX_ANSWER)) {
+            revert AnswerOutOfRange(answer);
+        }
 
         if (_updatedAt > 0) {
             if (block.timestamp < _updatedAt + MIN_UPDATE_INTERVAL)
