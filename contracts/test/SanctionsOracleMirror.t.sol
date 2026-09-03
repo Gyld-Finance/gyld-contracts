@@ -418,6 +418,32 @@ contract SanctionsOracleMirrorTest is Test {
         assertFalse(oracle.hasRole(updaterRole, updater));
     }
 
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = oracle.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(oracle.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(SanctionsOracleMirror.CannotRemoveLastAdmin.selector);
+        oracle.revokeRole(adminRole, admin);
+        assertTrue(oracle.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = oracle.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); oracle.grantRole(adminRole, timelock);
+        vm.prank(admin); oracle.revokeRole(adminRole, admin);
+        assertFalse(oracle.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(SanctionsOracleMirror.CannotRemoveLastAdmin.selector);
+        oracle.revokeRole(adminRole, timelock);
+    }
+
     // ── forwarding oracle failure paths ───────────────────────────────────────
 
     // Forwarding oracle reverts at lookup time → isSanctioned reverts (fail-closed).

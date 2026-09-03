@@ -494,6 +494,32 @@ contract IssuanceManagerTest is Test {
         assertFalse(mgr.hasRole(whitelistAdminRole, admin));
     }
 
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(mgr.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, admin);
+        assertTrue(mgr.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); mgr.grantRole(adminRole, timelock);
+        vm.prank(admin); mgr.revokeRole(adminRole, admin);
+        assertFalse(mgr.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, timelock);
+    }
+
     // ── registerToken interface validation (GYL-298) ──────────────────────────
 
     function test_registerToken_nonContractAddress_reverts() public {
