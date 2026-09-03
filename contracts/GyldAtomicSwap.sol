@@ -205,7 +205,7 @@ contract GyldAtomicSwap is
         address withdrawalWallet; // fixed treasury destination for withdraw()
         address usdc; // cash leg discriminator (6 decimals)
         mapping(uint256 => uint256) usedQuoteWords; // quoteId >> 8 → 256-bit usage word
-        address[] seriesList; // registered series, for clean deregister
+        address[] seriesList; // registered series; read via registeredSeriesList()
         mapping(address => bool) registeredSeries; // bond token → enabled
         mapping(address => address) navForwarderOf; // bond token → NAVFeedForwarder (stable addr)
         mapping(address => bool) allowed; // executeSwap taker allowlist
@@ -421,6 +421,32 @@ contract GyldAtomicSwap is
     /// @notice NAVFeedForwarder paired with `token`; address(0) if unregistered.
     function navForwarderOf(address token) external view returns (address) {
         return _getStorage().navForwarderOf[token];
+    }
+
+    /// @notice Every registered bond series, in registry order (audit FIND-017).
+    /// @dev    The set previously had no reader at all. `seriesList` is a field inside the
+    ///         ERC-7201 struct, so Solidity generates no getter for it, and while any
+    ///         OFFCHAIN caller can hand-compute the slot and eth_getStorageAt it, no
+    ///         CONTRACT can — SLOAD reads only its own storage. Replaying
+    ///         SeriesRegistered / SeriesDeregistered has the same limitation. So an
+    ///         integrator could not enumerate the set at all; `registeredSeries(token)`
+    ///         answers only for an address you already hold.
+    ///
+    ///         Returns the whole array rather than offering a count/index pair to page
+    ///         it: registration is DEFAULT_ADMIN_ROLE behind the timelock, so the set is
+    ///         operator-sized and the return is bounded in practice. A Solidity caller
+    ///         reads `.length` off the result.
+    ///
+    ///         ORDER IS ARBITRARY AND NOT STABLE. `deregisterSeries` removes by
+    ///         swap-and-pop, so retiring any series moves the last element into the hole
+    ///         it left. A caller that remembers a position rather than an address will
+    ///         silently read a DIFFERENT series after any deregistration, with no revert
+    ///         and no event to distinguish it. Key off the address, and re-read the set
+    ///         rather than a cached index. `registeredSeries(token)` stays the membership
+    ///         test; this is enumeration only.
+    /// @return The registered bond tokens.
+    function registeredSeriesList() external view returns (address[] memory) {
+        return _getStorage().seriesList;
     }
 
     /// @notice Whether `account` is allowed to be the taker on executeSwap.
@@ -682,6 +708,11 @@ contract GyldAtomicSwap is
     ///
     ///         CEI: registry writes precede the transfer, covered by `nonReentrant`
     ///         (shared with executeSwap and withdraw, I-17).
+    ///
+    ///         Removal is swap-and-pop, so this REORDERS the enumeration exposed by
+    ///         `registeredSeriesList`: the last series takes the retired one's index.
+    ///         That reordering is observable to integrators (audit FIND-017) — see
+    ///         `registeredSeriesList` for why a position must never be cached across it.
     /// @param token Registered bond series to remove.
     function deregisterSeries(address token) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();

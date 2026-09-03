@@ -1005,6 +1005,143 @@ contract GyldAtomicSwapTest is Test {
         swap.deregisterSeries(address(0xD00D));
     }
 
+    // ── FIND-017: the registered series set is readable ──────────────────────
+
+    /// A second/third 18dp series, distinct from setUp's `token`. Nothing is minted, so
+    /// these retire through the empty branch of deregisterSeries' sweep.
+    function _newSeries(string memory symbol) internal returns (GyldBondToken) {
+        GyldBondToken impl = new GyldBondToken();
+        return GyldBondToken(
+            address(
+                new ERC1967Proxy(
+                    address(impl),
+                    abi.encodeCall(
+                        GyldBondToken.initialize,
+                        (symbol, symbol, "US912797KR72", 1_780_000_000, admin, pauser, address(mockSanctions))
+                    )
+                )
+            )
+        );
+    }
+
+    /// True if `needle` appears in the registry enumeration.
+    function _listed(address needle) internal view returns (bool) {
+        address[] memory all = swap.registeredSeriesList();
+        for (uint256 i = 0; i < all.length; i++) {
+            if (all[i] == needle) return true;
+        }
+        return false;
+    }
+
+    /// The whole point of the finding: before this, the set could only be recovered by
+    /// replaying SeriesRegistered/SeriesDeregistered or hand-computing the ERC-7201 slot
+    /// for eth_getStorageAt — both offchain-only, so no contract could enumerate it.
+    function test_seriesEnumeration_exposesRegisteredSet() public {
+        // setUp registered exactly one series.
+        address[] memory one = swap.registeredSeriesList();
+        assertEq(one.length, 1, "setUp registers one series");
+        assertEq(one[0], address(token), "the setUp series must be listed");
+
+        GyldBondToken b = _newSeries("GYLD-B");
+        GyldBondToken c = _newSeries("GYLD-C");
+        vm.startPrank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+        swap.registerSeries(address(c), address(navFeed));
+        vm.stopPrank();
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 3, "three series registered");
+        assertEq(all[0], address(token), "registration order is append");
+        assertEq(all[1], address(b));
+        assertEq(all[2], address(c));
+
+        // Enumeration and the membership mapping must agree in both directions.
+        for (uint256 i = 0; i < all.length; i++) {
+            assertTrue(swap.registeredSeries(all[i]), "every enumerated entry must be registered");
+        }
+        assertFalse(swap.registeredSeries(address(usdc)), "control: a non-series must not be registered");
+        assertFalse(_listed(address(usdc)), "control: a non-series must not be listed");
+    }
+
+    /// Re-registering a live series (the documented forwarder-rotation path) must update
+    /// the forwarder WITHOUT appending a second array entry — otherwise deregistration
+    /// leaves a phantom behind, since the swap-and-pop scan breaks on the first match.
+    function test_registerSeries_reRegisterLive_doesNotDuplicateEntry() public {
+        MockNavForwarder rotated = new MockNavForwarder(NAV);
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(rotated));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "re-registration must not append a duplicate");
+        assertEq(all[0], address(token));
+        assertEq(swap.navForwarderOf(address(token)), address(rotated), "forwarder must be rotated");
+    }
+
+    /// Deregistering a MIDDLE entry is swap-and-pop: the tail moves into the hole. This
+    /// is exactly the position instability registeredSeriesList's NatSpec warns about,
+    /// so pin it rather than leave it to be discovered against a live proxy.
+    function test_deregisterSeries_middleEntry_swapAndPopReorders() public {
+        GyldBondToken b = _newSeries("GYLD-B");
+        GyldBondToken c = _newSeries("GYLD-C");
+        vm.startPrank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+        swap.registerSeries(address(c), address(navFeed));
+        vm.stopPrank();
+        assertEq(swap.registeredSeriesList()[1], address(b), "precondition: b sits at position 1");
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(b));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 2, "one entry removed");
+        assertFalse(swap.registeredSeries(address(b)), "b must be deregistered");
+        assertFalse(_listed(address(b)), "the retired series must not appear in the list");
+        // The tail (c) took b's position — a caller that cached position 1 now reads a
+        // DIFFERENT series, with no revert to signal it.
+        assertEq(all[1], address(c), "swap-and-pop moves the tail into the hole");
+        assertEq(all[0], address(token), "untouched entries keep their position");
+    }
+
+    /// Removing the TAIL is a plain pop: nothing else moves.
+    function test_deregisterSeries_lastEntry_popsWithoutReordering() public {
+        GyldBondToken b = _newSeries("GYLD-B");
+        vm.prank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(b));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "tail pop leaves one entry");
+        assertEq(all[0], address(token), "the head must not move");
+    }
+
+    /// Retiring every series empties the enumeration rather than leaving stale entries.
+    function test_seriesEnumeration_emptyAfterAllDeregistered() public {
+        // setUp's series still holds inventory; the sweep carries it out.
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+
+        assertEq(swap.registeredSeriesList().length, 0, "list must be empty");
+        assertFalse(_listed(address(token)), "the retired series must not appear in the list");
+    }
+
+    /// Deregister then re-register appends exactly one entry — the push guard keys off
+    /// the mapping, which deregisterSeries cleared.
+    function test_deregisterSeries_thenReregister_appendsOnce() public {
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertEq(swap.registeredSeriesList().length, 0, "precondition: registry emptied");
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(navFeed));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "re-registration must append exactly one entry");
+        assertEq(all[0], address(token));
+        assertTrue(swap.registeredSeries(address(token)));
+    }
+
     // ── Pause ─────────────────────────────────────────────────────────────────
 
     function test_executeSwap_whenPaused_reverts() public {
