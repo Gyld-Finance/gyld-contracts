@@ -85,6 +85,20 @@
       "offset": 0,
       "slot": 9,
       "type": "mapping(address => uint32)"
+    },
+    {
+      "bytes": 32,
+      "name": "maxNavRoundNotionalOf",
+      "offset": 0,
+      "slot": 10,
+      "type": "mapping(address => uint256)"
+    },
+    {
+      "bytes": 32,
+      "name": "navRoundDrawOf",
+      "offset": 0,
+      "slot": 11,
+      "type": "mapping(address => struct GyldAtomicSwap.NavRoundDraw)"
     }
   ],
   "namespace": "gyld.GyldAtomicSwap",

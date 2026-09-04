@@ -253,6 +253,15 @@ GYL-1050 — ordering is load-bearing, see script lines 168–177) → allowlist
 `ALLOWED_TAKERS` → hand `DEFAULT_ADMIN_ROLE` to `TIMELOCK_ADDRESS` and revoke the
 deployer.
 
+> **Set each series' notional cap before it trades (D-28).** The script does not do
+> this: a freshly registered series falls back to `DEFAULT_MAX_NAV_ROUND_NOTIONAL`
+> ($1M per NAV push), which is a conservative floor, not the operating value. Policy
+> today is **$10M per series**, set with `setMaxNavRoundNotionalFor(token, 10_000_000e6)`.
+> Do it while the deployer still holds `DEFAULT_ADMIN_ROLE` — afterwards it is a 48 h
+> timelock proposal, and there is no same-day path to raise a cap that turns out to be
+> too tight. Size it to the series' busiest expected day, not its typical one; $50M
+> (`MAX_NAV_ROUND_NOTIONAL_CEILING`) is the hard limit no admin call can exceed.
+
 ```bash
 export USDC_ADDRESS=$USDC                 # Circle Sepolia USDC
 export EVM_ISSUANCE_MANAGER=<issuance_manager_proxy>
@@ -637,7 +646,10 @@ step 3 is the belt to this braces — either alone is sufficient.
 
 **On success** the series is gone from `registeredSeries`, `navForwarderOf` and
 `maxNavAgeSecsOf` (the per-series age override, D-23, is cleared so it cannot
-outlive the series). A sweep emits `Withdrawn(token, withdrawalWallet, amount)` —
+outlive the series), plus `maxNavRoundNotionalOf` and `navRoundDrawOf` (the
+per-series notional cap and its spent-this-round counter, D-28 — cleared for the
+same reason, and so a re-registered token does not inherit a retired series'
+already-spent budget). A sweep emits `Withdrawn(token, withdrawalWallet, amount)` —
 the same event the withdrawal path emits, so existing log indexing picks it up with
 no change. Re-registering the same token later is supported and restores
 tradability from a clean slate.

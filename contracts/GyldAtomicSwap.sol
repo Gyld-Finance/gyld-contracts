@@ -195,7 +195,31 @@ contract GyldAtomicSwap is
     ///         does not retro-narrow a value an earlier initializer already wrote.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 10 minutes;
 
+    /// @notice Fallback per-series notional cap per NAV round, USDC 6dp (audit FIND-021).
+    /// @dev    Every guard in executeSwap is per-fill; this is the only one that relates
+    ///         fills to each other. A fallback rather than a seed, for the reason on
+    ///         DEFAULT_MAX_QUOTE_TTL. Read only via `_effectiveMaxNavRoundNotional`.
+    ///
+    ///         $1M is the CONSERVATIVE floor a series gets when nobody has configured it,
+    ///         not the operating value: each series is set to its own cap at deploy
+    ///         (policy today is $10M) via setMaxNavRoundNotionalFor. Sizing this knob is
+    ///         two-sided — too low reverts legitimate flow, and because the setter is
+    ///         behind the 48 h timelock there is no same-day remedy, so a series' own cap
+    ///         must carry headroom over its busiest expected day, not its typical one.
+    uint256 public constant DEFAULT_MAX_NAV_ROUND_NOTIONAL = 1_000_000e6;
+
+    /// @dev Structural upper bound on `maxNavRoundNotionalOf`. The permissive end of this
+    ///      knob is "settle unbounded notional against one NAV price" — the guard as a
+    ///      no-op — so it is bounded like the band, the age and the TTL are.
+    uint256 public constant MAX_NAV_ROUND_NOTIONAL_CEILING = 50_000_000e6;
+
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
+
+    /// @dev One slot: the NAV round a counter belongs to, and the notional spent on it.
+    struct NavRoundDraw {
+        uint64 round; // the feed's `updatedAt` these draws were validated against
+        uint192 drawn; // cumulative USDC (6dp) settled against `round`
+    }
 
     /// @custom:storage-location erc7201:gyld.GyldAtomicSwap
     struct GyldAtomicSwapStorage {
@@ -223,6 +247,17 @@ contract GyldAtomicSwap is
         // would revert StaleNav on every swap. Unset means "follow the global
         // maxNavAgeSecs", which is exactly the pre-upgrade behaviour.
         mapping(address => uint32) maxNavAgeSecsOf;
+        // Per-series notional cap per NAV round (audit FIND-021). ZERO MEANS UNSET, not
+        // "zero notional" — always read via _effectiveMaxNavRoundNotional(). A proxy
+        // upgraded across this addition reads 0 for every series; as a literal cap that
+        // would revert every swap, and as "unlimited" it would ship the guard disarmed.
+        // Unset therefore resolves to DEFAULT_MAX_NAV_ROUND_NOTIONAL.
+        mapping(address => uint256) maxNavRoundNotionalOf;
+        // Running notional per series, scoped to ONE NAV round. Keyed on the feed's
+        // `updatedAt` — the value the band already validated against — not `roundId`,
+        // which is not guaranteed monotone across a forwarder repoint. Only a STRICTLY
+        // NEWER round resets the counter — see _drawNavRoundNotional.
+        mapping(address => NavRoundDraw) navRoundDrawOf;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -258,6 +293,17 @@ contract GyldAtomicSwap is
         return perSeries == 0 ? $.maxNavAgeSecs : perSeries;
     }
 
+    /// @dev The per-NAV-round notional cap in force for one series (audit FIND-021). The
+    ///      ONLY permitted read path for `maxNavRoundNotionalOf` — see the field's note.
+    function _effectiveMaxNavRoundNotional(GyldAtomicSwapStorage storage $, address bondToken)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 cap = $.maxNavRoundNotionalOf[bondToken];
+        return cap == 0 ? DEFAULT_MAX_NAV_ROUND_NOTIONAL : cap;
+    }
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error ZeroAddress();
@@ -290,6 +336,17 @@ contract GyldAtomicSwap is
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
     error InvalidTokenDecimals(address token, uint8 decimals);
     error QuoteExpiryTooFar(uint64 expiry, uint64 maxAllowed);
+    /// @dev FIND-021: this fill would push notional settled against ONE NAV round past
+    ///      the series' cap. The quoteId is NOT consumed — the revert unwinds it — but
+    ///      that is bookkeeping hygiene, NOT a retry path: rounds are >= 1 h apart
+    ///      (MIN_UPDATE_INTERVAL) and a quote lives at most MAX_QUOTE_TTL_CEILING, so a
+    ///      refused quote expires long before the budget resets. `remaining` is carried
+    ///      for the quote service to re-issue against, and note MIN_DRAW_BPS can leave a
+    ///      non-zero `remaining` that no draw of this quote is small enough to fit.
+    error NavRoundNotionalExceeded(address token, uint256 requested, uint256 remaining, uint256 cap);
+    /// @dev Above MAX_NAV_ROUND_NOTIONAL_CEILING. Zero is legal and means "unset — fall
+    ///      back to DEFAULT_MAX_NAV_ROUND_NOTIONAL", not zero notional.
+    error InvalidNavRoundNotional(uint256 notional);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -308,6 +365,8 @@ contract GyldAtomicSwap is
     event MaxNavAgeUpdated(uint32 newSecs);
     /// newSecs == 0 means the override was CLEARED and the series follows the global value.
     event MaxNavAgeForSeriesUpdated(address indexed token, uint32 newSecs);
+    /// newCap == 0 means the override was CLEARED and the series follows the default.
+    event MaxNavRoundNotionalForSeriesUpdated(address indexed token, uint256 newCap);
     event MaxQuoteTtlUpdated(uint64 newTtl);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
@@ -479,7 +538,8 @@ contract GyldAtomicSwap is
     ///         binding → allowlist → price sanity → requested-amount range → expiry →
     ///         expiry-within-TTL → epoch → EIP-712 signature against QUOTE_SIGNER_ROLE →
     ///         single-use quoteId consumption (state effect) → derived-amount sanity →
-    ///         NAV band + leg classification → optional permit → PULL tokenIn →
+    ///         NAV band + leg classification → per-NAV-round notional cap (FIND-021, the
+    ///         second and last state effect) → optional permit → PULL tokenIn →
     ///         inventory check + PUSH tokenOut. The quoteId is burned in full regardless
     ///         of how much of `maxAmountIn` is drawn — single-shot-capped sizing, not
     ///         multi-draw (see docs/ARCHITECTURE.md). The optional permit is applied
@@ -536,7 +596,12 @@ contract GyldAtomicSwap is
         // Classify buy vs redeem, read NAV, and enforce the quote is within the NAV
         // band and the feed is fresh (reverts NotOneBondLeg / InvalidNav / StaleNav /
         // QuotePriceOutOfBand). The signed quote is the price; the feed only bounds it.
-        _checkQuoteBand($, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
+        (address bondToken, uint256 usdcNotional, uint64 navRound) =
+            _checkQuoteBand($, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
+
+        // FIND-021: the only guard here that relates fills to one another. Last check and
+        // last state write before any transfer, so CEI is unchanged.
+        _drawNavRoundNotional($, bondToken, usdcNotional, navRound);
 
         // Optional EIP-2612 permit; try/catch so a front-run permit() cannot brick the
         // swap — safeTransferFrom below still enforces the allowance.
@@ -602,14 +667,14 @@ contract GyldAtomicSwap is
         uint256 amountIn,
         address tokenOut,
         uint256 amountOut
-    ) private view {
+    ) private view returns (address bondToken, uint256 usdcAmount, uint64 navRound) {
         bool buy = $.registeredSeries[tokenOut] && tokenIn == $.usdc;
         bool redeem = $.registeredSeries[tokenIn] && tokenOut == $.usdc;
         if (buy == redeem) revert NotOneBondLeg(tokenIn, tokenOut);
 
-        address bondToken = buy ? tokenOut : tokenIn;
+        bondToken = buy ? tokenOut : tokenIn;
         uint256 tokenAmount = buy ? amountOut : amountIn;
-        uint256 usdcAmount = buy ? amountIn : amountOut;
+        usdcAmount = buy ? amountIn : amountOut;
 
         // navForwarderOf[bondToken] is guaranteed non-zero (set atomically in registerSeries).
         // roundId/startedAt/answeredInRound are deliberately discarded. Chainlink deprecated
@@ -629,6 +694,36 @@ contract GyldAtomicSwap is
         if (usdcAmount > navValue + band || usdcAmount + band < navValue) {
             revert QuotePriceOutOfBand(usdcAmount, navValue);
         }
+
+        // Safe: `updatedAt <= block.timestamp` was enforced above.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        navRound = uint64(updatedAt);
+    }
+
+    /// @dev Charge one fill against its NAV round's budget (audit FIND-021). The counter
+    ///      resets whenever the round differs, so each NAV push opens a fresh budget.
+    function _drawNavRoundNotional(
+        GyldAtomicSwapStorage storage $,
+        address bondToken,
+        uint256 usdcAmount,
+        uint64 navRound
+    ) private {
+        uint256 cap = _effectiveMaxNavRoundNotional($, bondToken);
+        NavRoundDraw memory d = $.navRoundDrawOf[bondToken];
+        // Reset only on a STRICTLY NEWER round. A plain inequality would let a feed whose
+        // updatedAt moves backwards re-open an already-spent budget (A -> B -> A settles
+        // 2x the cap against A), so the counter stays pinned to the highest round seen.
+        bool newRound = navRound > d.round;
+        uint256 drawn = newRound ? 0 : d.drawn;
+        // Saturating: an admin may lower the cap mid-round below what is already drawn.
+        uint256 remaining = drawn >= cap ? 0 : cap - drawn;
+        if (usdcAmount > remaining) {
+            revert NavRoundNotionalExceeded(bondToken, usdcAmount, remaining, cap);
+        }
+        // Safe: drawn + usdcAmount <= cap <= MAX_NAV_ROUND_NOTIONAL_CEILING << 2**192.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        $.navRoundDrawOf[bondToken] =
+            NavRoundDraw(newRound ? navRound : d.round, uint192(drawn + usdcAmount));
     }
 
     // ── Quote invalidation ────────────────────────────────────────────────────
@@ -738,6 +833,10 @@ contract GyldAtomicSwap is
         // Clear the per-series age override too (FIND-022). Leaving it would silently
         // re-apply a matured series' threshold if the same token were ever re-registered.
         delete $.maxNavAgeSecsOf[token];
+        // Same for the FIND-021 cap and its counter: a re-registered token must not
+        // inherit a retired series' budget, nor its already-spent notional.
+        delete $.maxNavRoundNotionalOf[token];
+        delete $.navRoundDrawOf[token];
         emit SeriesDeregistered(token);
 
         // Interaction last (CEI). Withdrawn keeps the sweep in the log stream ops index.
@@ -813,12 +912,42 @@ contract GyldAtomicSwap is
         emit MaxNavAgeForSeriesUpdated(token, newSecs);
     }
 
+    /// @notice Cap the USDC notional one series may settle against a single NAV round.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE (audit FIND-021). Bounded by
+    ///         MAX_NAV_ROUND_NOTIONAL_CEILING; the permissive end is the guard as a no-op.
+    ///         PASSING ZERO DOES NOT PAUSE ANYTHING — zero clears the override and the
+    ///         series follows DEFAULT_MAX_NAV_ROUND_NOTIONAL. To halt swaps use `pause()`.
+    /// @param token  Registered series to bound.
+    /// @param newCap USDC (6dp) per NAV round. 0 clears; otherwise <= the ceiling.
+    function setMaxNavRoundNotionalFor(address token, uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!_getStorage().registeredSeries[token]) revert UnregisteredSeries(token);
+        if (newCap > MAX_NAV_ROUND_NOTIONAL_CEILING) revert InvalidNavRoundNotional(newCap);
+        _getStorage().maxNavRoundNotionalOf[token] = newCap;
+        emit MaxNavRoundNotionalForSeriesUpdated(token, newCap);
+    }
+
     /// @notice The max NAV age actually enforced for `token` by executeSwap.
     /// @dev    Resolves the override against the global fallback, so this is what the
     ///         StaleNav check will use — read this rather than `maxNavAgeSecs()` when
     ///         reasoning about one series (audit FIND-022).
     function maxNavAgeSecsFor(address token) external view returns (uint32) {
         return _effectiveMaxNavAge(_getStorage(), token);
+    }
+
+    /// @notice The per-NAV-round notional cap actually enforced for `token` (FIND-021).
+    /// @dev    Resolves the override against the default, so this is what executeSwap
+    ///         will enforce — integrators must not read the raw slot.
+    function maxNavRoundNotionalFor(address token) external view returns (uint256) {
+        return _effectiveMaxNavRoundNotional(_getStorage(), token);
+    }
+
+    /// @notice Notional already settled against `token`'s current NAV round (FIND-021).
+    /// @dev    `round` is the feed `updatedAt` the counter belongs to. Callers must
+    ///         compare it against the feed's live `updatedAt`: a stale `round` means the
+    ///         budget has since reset and `drawn` no longer applies.
+    function navRoundNotionalDrawn(address token) external view returns (uint64 round, uint256 drawn) {
+        NavRoundDraw memory d = _getStorage().navRoundDrawOf[token];
+        return (d.round, d.drawn);
     }
 
     /// @notice Set the upper bound on quote lifetime (seconds).
