@@ -154,6 +154,11 @@ Config that must still be added even for Sepolia:
 `OPS_MULTISIG`, `SUBSCRIBER_ADDRESS`, `REDEEMER_ADDRESS`, `WHITELIST_ADMIN`,
 `NAV_FEED_OWNER` — all **required on any production chain** and each asserted
 `!= deployer` there; on Anvil/Sepolia they still fall back to the deployer.
+`NAV_FEED_OWNER` is additionally asserted `!= OPS_MULTISIG` on production, and is
+given a derived dev address if the two would collide on Anvil: the two form the
+**2-of-2 quorum** on the feed's emergency correction path, and one address holding
+both collapses it to a single key (audit FIND-003). `TokenFactory.deployToken`
+enforces the same rule on-chain with `NavFeedOwnerIsOperator`.
 `SANCTIONS_LIST` is required on production, must be a deployed **contract**, and is
 rejected if its bytecode matches this repo's `MockSanctionsList`; on a dev chain,
 unset still deploys the mock. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
@@ -185,7 +190,7 @@ CLI-level (from `.env.example` — all still placeholders there): `PRIVKEY`
 
 ```bash
 forge build            # must compile clean at solc 0.8.28
-forge test             # 524 tests must pass
+forge test             # 646 tests must pass
 python3 ci/check_chain_guards.py      # every deploy script carries an allowlist guard
 cast chain-id --rpc-url $RPC          # expect 11155111
 cast balance $WALLET --rpc-url $RPC   # expect enough for ~15–20 txs
@@ -231,8 +236,8 @@ a fresh positive answer (`AtomicSettlementFlow.s.sol` lines 34–37 document thi
 enforcement is `GyldAtomicSwap._checkQuoteBand`). Push before registering/settling:
 
 ```bash
-# $100.00 at 8 decimals; sender must be the NAV feed owner (NAV_FEED_OWNER key)
-cast send $NAVFEED_CAT "updateAnswer(int256)" 10000000000 \
+# $1.00 at 8 decimals — the NAV-per-token standard; sender must be the NAV feed owner (NAV_FEED_OWNER key)
+cast send $NAVFEED_CAT "updateAnswer(int256)" 100000000 \
   --rpc-url $RPC --private-key $NAV_FEED_OWNER_KEY
 ```
 
@@ -240,7 +245,7 @@ Verify:
 
 ```bash
 cast call $FORWARDER_CAT "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
-# expected: second value 10000000000, fourth value = recent unix timestamp
+# expected: second value 100000000, fourth value = recent unix timestamp
 ```
 
 ### Step 2 — deploy the swap (`DeployAtomicSettlement.s.sol`)
@@ -329,7 +334,7 @@ deposit function; the contract prices whatever it holds):
 
 ```bash
 # 10,000 USDC (6 decimals) — sourced from the Circle faucet to the funding wallet
-cast send $USDC_ADDRESS "transfer(address,uint256)" $SWAP 10000000000 \
+cast send $USDC_ADDRESS "transfer(address,uint256)" $SWAP 100000000 \
   --rpc-url $RPC --private-key $FUNDING_KEY
 ```
 
@@ -339,7 +344,7 @@ Verify:
 cast call $TOKEN_CAT "balanceOf(address)(uint256)" $SWAP --rpc-url $RPC
 # expected: 100000000000000000000
 cast call $USDC_ADDRESS "balanceOf(address)(uint256)" $SWAP --rpc-url $RPC
-# expected: 10000000000
+# expected: 100000000
 ```
 
 ---
@@ -373,9 +378,9 @@ manual `cast` flow below. Do not simply delete the `require`.
 raw 32-byte digest:
 
 ```bash
-# BUY example at NAV $100: taker pays up to 1,000 USDC for 10 CAT.
-# price = amountOut per 1e18 tokenIn = 10e18 * 1e18 / 1000e6 = 1e28
-QUOTE="(1,$TAKER,$USDC_ADDRESS,1000000000,$TOKEN_CAT,10000000000000000000000000000,$EXPIRY,0)"
+# BUY example at NAV $1.00: taker pays up to 10 USDC for 10 CAT.
+# price = amountOut per 1e18 tokenIn = 10e18 * 1e18 / 10e6 = 1e30
+QUOTE="(1,$TAKER,$USDC_ADDRESS,10000000,$TOKEN_CAT,1000000000000000000000000000000,$EXPIRY,0)"
 # EXPIRY = unix now + 900; final 0 = epoch (must equal cast call $SWAP "quoteEpoch()")
 
 DIGEST=$(cast call $SWAP \
@@ -413,7 +418,7 @@ cast send $SWAP \
   --rpc-url $RPC --private-key $TAKER_KEY
 ```
 
-Expected after the buy: taker `TOKEN_CAT` balance `+10e18`; swap USDC `+1000e6`; swap
+Expected after the buy: taker `TOKEN_CAT` balance `+10e18`; swap USDC `+10e6`; swap
 `TOKEN_CAT` `-10e18`; `cast call $SWAP "isQuoteUsed(uint256)(bool)" 1` → `true`;
 `totalSupply` of the token unchanged (settlement moves inventory, never mints).
 Note `requestedAmountIn` may be less than `maxAmountIn` but at least 1% of it
@@ -422,8 +427,8 @@ Note `requestedAmountIn` may be less than `maxAmountIn` but at least 1% of it
 **Execute the REDEEM** (mirror direction, fresh `quoteId`):
 
 ```bash
-# price = 1000e6 * 1e18 / 10e18 = 1e8 (USDC out per 1e18 token in, at NAV $100)
-REDEEM="(2,$TAKER,$TOKEN_CAT,10000000000000000000,$USDC_ADDRESS,100000000,$EXPIRY,0)"
+# price = 10e6 * 1e18 / 10e18 = 1e6 (USDC out per 1e18 token in, at NAV $1.00)
+REDEEM="(2,$TAKER,$TOKEN_CAT,10000000000000000000,$USDC_ADDRESS,1000000,$EXPIRY,0)"
 # sign as above; then:
 cast send $TOKEN_CAT "approve(address,uint256)" $SWAP 10000000000000000000 \
   --rpc-url $RPC --private-key $TAKER_KEY
@@ -431,7 +436,7 @@ cast send $SWAP "executeSwap(...)" "$REDEEM" $SIG2 "(0,0,0,0x00...,0x00...)" 100
   --rpc-url $RPC --private-key $TAKER_KEY   # same full signature string as the buy
 ```
 
-Expected: taker made whole in USDC (`+1000e6`), tokens back in the swap,
+Expected: taker made whole in USDC (`+10e6`), tokens back in the swap,
 `isQuoteUsed(2)` → `true`. Both legs settle within the 2% NAV band or revert
 `QuotePriceOutOfBand`; if the NAV push is older than `MAX_NAV_AGE_SECS`, expect
 `StaleNav` — push NAV again (step 1) and retry.
@@ -496,6 +501,92 @@ $TREASURER_KEY` → funds land at `withdrawalWallet()`, nowhere else.
 
 ---
 
+### 6.9 Signing an emergency NAV correction (audit FIND-003)
+
+`emergencyUpdateAnswer` is a **2-of-2**, and the split is the same one the swap already
+runs every trade:
+
+| | Swap (today, in production) | NAV emergency correction |
+|---|---|---|
+| **Signs** the EIP-712 message | Quote-service **KMS** key | Feed-owner **KMS** key (`NAV_FEED_OWNER`) |
+| **Submits** the transaction | The taker | **Fordefi MPC ops wallet** (`emergencyUpdater`) |
+| Sets the expiry | Quote service, via `expiry` | KMS signer, via `deadline` |
+
+Keeping the signing on KMS is deliberate: it reuses machinery already proven on every
+swap, and it means the submitter never needs to produce an EIP-712 signature at all.
+
+> **Roadmap conflict — decide before Phase 2.** ARCHITECTURE §6.1 currently plans to
+> migrate the *feed owner* from KMS to Fordefi MPC. If that happens, **signing moves to
+> Fordefi** and the split above no longer holds. To keep signing on KMS, leave the feed
+> owner on KMS and use Fordefi only as the `emergencyUpdater`. That choice also removes
+> the one unverified item below (Fordefi's `v`/low-`s` encoding), because a submitter
+> never signs.
+
+Full incident context is ARCHITECTURE.md §11.5 Case C.
+
+**Step 1 — ask the contract for the digest.** Never rebuild the EIP-712 domain by hand;
+`hashEmergencyUpdate` reads the live `emergencyNonce` itself, so a stale nonce, wrong
+`chainId` or wrong `verifyingContract` is impossible. Same contract as
+`hashSwapMessage` in §5.2, and the same reason.
+
+```bash
+ANSWER=60000000                      # $0.60 at 8dp — must be within $0.50-$2.00
+DEADLINE=$(( $(date +%s) + 1800 ))   # 30 min. Keep it SHORT: an unused signature
+                                     # stands until it expires (D-29 residual (d)).
+DIGEST=$(cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)(bytes32)" \
+  $ANSWER $DEADLINE --rpc-url $RPC)
+```
+
+**Step 2 — sign the raw 32 bytes.** No EIP-191 prefix, no second hash.
+
+| Signer | How |
+|---|---|
+| Local key (testnet) | `cast wallet sign --no-hash $DIGEST --private-key $NAV_FEED_OWNER_KEY` |
+| **AWS KMS** (Phase 1) | `kms:Sign` with `MessageType=DIGEST`. Then **DER-decode** to `(r,s)`, **normalise `s` to the low half** — KMS can return high-s and OZ's `ECDSA` rejects it as malleable — and recover `v` by trying `27` then `28` against the known owner address. |
+| **Fordefi MPC** (Phase 2) | Use `eth_signTypedData_v4` via the official `@fordefi/web3-provider` (EIP-1193) and hand it the typed-data JSON — this skips the digest/DER/`v` work entirely. Or `POST /api/v1/transactions` with `type: "evm_message"`, `details.type: "typed_message_type"`; that returns `signatures[0].data` **base64**, not hex. |
+
+**Fordefi specifics, verified.** An EVM vault is a **Standard EOA**, so `ecrecover`
+works and no ERC-1271 is involved. Two cautions: **do not enable EIP-7702 Smart Account
+mode on the feed-owner vault** — the address would gain code and flip
+`SignatureChecker` onto the ERC-1271 branch; and signing is **asynchronous**
+(`waiting_for_approval` → `approved` → `signed`), so if your policy requires a human
+approver you have added a second quorum ahead of the Safe's. Scope a narrow
+auto-approve rule to `domain.name == "KaleidoscopeNAVFeed"` + `primaryType ==
+"EmergencyUpdate"` rather than blanket-approving message signing.
+
+**Two things about Fordefi output are UNCONFIRMED**: whether `v` is `27/28` or `0/1`
+(OZ rejects `0/1` — fix is `v += 27`), and whether `s` is normalised low. Both present
+as the same opaque `EmergencySignerNotOwner`. **Rehearse once before Phase 2 cutover,
+not during an incident**: have the vault sign a throwaway payload, inspect the last byte
+and `s`, and run step 3 against a testnet feed.
+
+**Step 3 — dry-run BEFORE spending the Safe quorum.** This is the highest-value step
+here: it verifies the signature without a transaction that could revert after m-of-n
+signers have already approved it.
+
+```bash
+cast call $NAVFEED "emergencyUpdateAnswer(int256,uint256,bytes)" \
+  $ANSWER $DEADLINE $SIG --from $OPS_MULTISIG --rpc-url $RPC
+# silence = it would succeed. Any revert here is the real reason it would fail.
+```
+
+**Step 4 — submit as a Safe transaction** from `$OPS_MULTISIG` (the immutable
+`emergencyUpdater`) and collect its own m-of-n. The signature is **inert in transit** —
+only the guardian can submit it — so it is safe to paste into an ops channel.
+
+**Reading the revert:**
+
+| Revert | Cause |
+|---|---|
+| `NotEmergencyUpdater` | Not sent from the ops multisig |
+| `EmergencySignerNotOwner` | Wrong signer, stale nonce, signature over a different `answer`, wrong chain/feed, high-`s`, `v` not 27/28, or owner rotated after signing |
+| `EmergencySignatureExpired` | `deadline` passed — re-sign |
+| `EmergencyAnswerOutOfRange` | Outside $0.50-$2.00; use the ±10 %/h path |
+| `EmergencyCooldownActive` | Within `EMERGENCY_COOLDOWN` (1 h) of the last one |
+| `NoPriceSet` | Feed never initialised; the first push must be `updateAnswer` |
+
+---
+
 ## 7. Rollback / incident procedure
 
 There is no "undeploy". Incident response is: stop the hot path, invalidate paper,
@@ -509,7 +600,8 @@ evacuate funds, then fix under the timelock.
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
 | Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **A paused bond token blocks its own evacuation** — see "Evacuating a paused bond token" below |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
-| Correct a wrong NAV | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
+| Correct a NAV that has **gapped >10 %** | **Two keys**: ops multisig (`emergencyUpdater`, immutable) **calls**; KMS signer **signs** | Full procedure in [§6.9](#69-signing-an-emergency-nav-correction-audit-find-003): `cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)"` for the digest, owner signs it raw, **dry-run with `cast call` before spending the Safe quorum**, then submit from the ops multisig | **Verify the true NAV from two sources first — this path skips the deviation cap, which is what normally catches a bad number.** Answer must land in **$0.50-$2.00** (`5e7`-`2e8`); outside that it reverts `EmergencyAnswerOutOfRange` and the ±10 %/h walk-back is the only route. Locks for `EMERGENCY_COOLDOWN` (1 h) afterwards — the same cadence as the routine path, so a cascading event can be corrected again within the hour. Full procedure: ARCHITECTURE.md §11.5 Case C (audit FIND-003) |
+| Correct a wrong NAV **within 10 %** (fat-finger) | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
 
 ### Evacuating a paused bond token
 

@@ -61,6 +61,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error ZeroAddress();
+    /// audit FIND-003 — navFeedOwner (KMS signer) must differ from operator (NAV guardian).
+    error NavFeedOwnerIsOperator();
     error EmptyIsin();
     error IsinAlreadyDeployed(string isin);
     error MaturityInPast(uint256 maturityTimestamp, uint256 nowTs);
@@ -156,6 +158,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (operator == address(0) || operator == address(this)) revert ZeroAddress();
         if (issuanceManager == address(0)) revert ZeroAddress();
         if (navFeedOwner == address(0))    revert ZeroAddress();
+        // The feed enforces this too; failing here names the variable to fix.
+        if (navFeedOwner == operator)      revert NavFeedOwnerIsOperator();
         if (bytes(isin).length == 0)       revert EmptyIsin();
 
         // A maturity already in the past has no legitimate use and signals a bad payload
@@ -194,10 +198,11 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
 
         _wireRoles(token, issuanceManager, operator);
 
-        navFeed = address(new KaleidoscopeNAVFeed(
-            navFeedOwner,
-            string(abi.encodePacked(symbol, " / USD NAV"))
-        ));
+        // NAV emergency guardian = `operator`, the ops wallet that already holds
+        // PAUSER_ROLE. Deliberately not the 48 h timelock: a correction that waits two
+        // days is not a correction. See ARCHITECTURE D-29.
+        navFeed =
+            address(new KaleidoscopeNAVFeed(navFeedOwner, string(abi.encodePacked(symbol, " / USD NAV")), operator));
 
         // Forwarder is the stable address for DeFi integrations (Morpho Blue, Aave).
         // Owner = factory.owner() (TimelockController in prod) so oracle provider swaps

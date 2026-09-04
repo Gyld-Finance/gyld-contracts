@@ -10,16 +10,23 @@ contract KaleidoscopeNAVFeedTest is Test {
     event StalenessThresholdUpdated(uint256 oldSeconds, uint256 newSeconds);
 
     KaleidoscopeNAVFeed feed;
-    address owner            = address(0xA1);
+    // The owner must be able to produce EIP-712 signatures for the emergency path, so it
+    // is a derived key rather than a bare literal (audit FIND-003).
+    uint256 constant OWNER_PK = 0xA11CE;
+    address owner            = vm.addr(OWNER_PK);
     address stranger         = address(0xB2);
     address newOwner         = address(0xC3);
+    address guardian         = address(0xD4);
 
     uint256 constant ONE_HOUR          = 1 hours;
-    int256  constant ANSWER            = 9_542_000_000; // $95.42
-    int256  constant ANSWER_PLUS_SMALL = 9_542_000_100; // tiny move, well within 10%
+    // Rescaled from $0.9542 by /100 when FIND-003 tightened MIN/MAX_ANSWER to $0.10-$5.00
+    // for the $1.00 NAV standard. The deviation guard is multiplicative, so every band
+    // relationship below is preserved exactly by the rescale.
+    int256  constant ANSWER            = 95_420_000; // $0.9542
+    int256  constant ANSWER_PLUS_SMALL = 95_420_001; // tiny move, well within 10%
 
     function setUp() public {
-        feed = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV");
+        feed = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian);
     }
 
     // ── decimals ──────────────────────────────────────────────────────────────
@@ -157,17 +164,17 @@ contract KaleidoscopeNAVFeedTest is Test {
     function test_updateAnswer_deviationCheckSkippedOnFirstUpdate() public {
         // Even a big price on first update is fine — no previous to compare
         vm.prank(owner);
-        feed.updateAnswer(999_999_999_999); // some big number
+        feed.updateAnswer(499_000_000); // $4.99 — 5x ANSWER, far beyond the 10% band
         (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, 999_999_999_999);
+        assertEq(answer, 499_000_000);
     }
 
     function test_updateAnswer_within10PercentAllowed() public {
         vm.prank(owner);
-        feed.updateAnswer(ANSWER); // 9_542_000_000
+        feed.updateAnswer(ANSWER); // 95_420_000
 
         vm.warp(block.timestamp + ONE_HOUR);
-        // 9% move up: 9_542_000_000 * 1.09 = 10_400_780_000
+        // 9% move up: 95_420_000 * 1.09 = 104_007_800
         int256 ninePercentUp = (ANSWER * 109) / 100;
         vm.prank(owner);
         feed.updateAnswer(ninePercentUp);
@@ -261,7 +268,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.updateAnswer(floor_);
         assertEq(feed.latestAnswer(), floor_);
 
-        KaleidoscopeNAVFeed f2 = new KaleidoscopeNAVFeed(owner, "ceiling");
+        KaleidoscopeNAVFeed f2 = new KaleidoscopeNAVFeed(owner, "ceiling", guardian);
         vm.prank(owner);
         f2.updateAnswer(ceiling);
         assertEq(f2.latestAnswer(), ceiling);
@@ -645,7 +652,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// ever swapped for a custom initialiser.
     function test_constructor_zeroOwnerReverts() public {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new KaleidoscopeNAVFeed(address(0), "TLT / USD NAV");
+        new KaleidoscopeNAVFeed(address(0), "TLT / USD NAV", guardian);
     }
 
     /// The other premise: transferOwnership(address(0)) cancels a pending transfer
@@ -674,14 +681,15 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.renounceOwnership();
 
         vm.prank(owner);
-        feed.updateAnswer(9_542_000_000);
-        assertEq(feed.latestAnswer(), 9_542_000_000);
+        feed.updateAnswer(95_420_000);
+        assertEq(feed.latestAnswer(), 95_420_000);
     }
 
-    /// Accepting must clear `pendingOwner` and fully revoke the old key. Previously the
-    /// only place `_transferOwnership` (the completion funnel) was exercised beyond a
-    /// happy-path `owner()` read was the key-separation test that has been removed with
-    /// the emergency path; this pins the funnel's real post-conditions directly.
+    /// Accepting must clear `pendingOwner` and fully revoke the old key. This pins the
+    /// completion funnel's real post-conditions directly rather than leaning on a
+    /// happy-path `owner()` read. Its emergency-path counterpart is
+    /// test_emergency_signatureIsCheckedAgainstTheOwnerAtExecutionTime, which proves the
+    /// same revocation reaches the co-signing authority in the same instant.
     function test_acceptOwnership_clearsPendingOwnerAndRevokesOldOwner() public {
         vm.prank(owner);
         feed.transferOwnership(newOwner);
@@ -704,43 +712,802 @@ contract KaleidoscopeNAVFeedTest is Test {
         feed.acceptOwnership();
     }
 
-    // ── The emergency path is gone (audit §4.11) ─────────────────────────────
+    // ── Emergency correction path — fixtures and helpers (audit FIND-003) ─────
 
-    /// LOAD-BEARING. `updateAnswer` is now the ONLY way a price reaches this feed, and
-    /// its interval + deviation guards have no privileged bypass. This asserts the
-    /// removal at the ABI level rather than trusting that the source no longer mentions
-    /// it: the contract declares no fallback, so a call carrying a selector it does not
-    /// implement reverts, and `success` is false.
+    event EmergencyAnswerUpdated(int256 indexed answer, uint256 indexed roundId, int256 previousAnswer, uint256 nonce);
+
+    /// A second keypair, used to prove the signature is recovered against `owner()` at
+    /// EXECUTION time rather than against whoever owned the feed when it was signed.
+    uint256 constant ROTATED_PK = 0xB0B;
+    address rotatedOwner = vm.addr(ROTATED_PK);
+    /// Any key that is not the owner's. Used for the wrong-signer case.
+    uint256 constant IMPOSTOR_PK = 0xBAD;
+
+    /// $1.50 — +57% from ANSWER ($0.9542), far outside the 10% band, and inside
+    /// [EMERGENCY_MIN_ANSWER, EMERGENCY_MAX_ANSWER].
+    int256 constant EMERGENCY_ANSWER = 150_000_000;
+    /// $1.20 — a second in-band emergency target, for the tests that need two.
+    int256 constant EMERGENCY_ANSWER_2 = 120_000_000;
+    /// A deadline that cannot expire, for the tests that are not about deadlines.
+    uint256 constant FAR_FUTURE = type(uint256).max;
+
+    /// Restated literally rather than read from the getter, so a silent change to the
+    /// signed struct breaks these tests instead of being followed along.
+    /// test_emergency_typehashAndDomainMatchTheContract pins the two together.
+    bytes32 constant EMERGENCY_TYPEHASH_LOCAL =
+        keccak256("EmergencyUpdate(int256 answer,uint256 nonce,uint256 deadline)");
+    bytes32 constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    /// Rebuilt from the spec rather than read off the contract: the domain binds chainid
+    /// and the feed address, and that binding is half the replay defence.
+    function _domainSeparator(address feedAddr) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH,
+                keccak256(bytes("KaleidoscopeNAVFeed")),
+                keccak256(bytes("1")),
+                block.chainid,
+                feedAddr
+            )
+        );
+    }
+
+    function _emergencyDigest(address feedAddr, int256 answer, uint256 nonce, uint256 deadline)
+        internal
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked(
+                hex"1901",
+                _domainSeparator(feedAddr),
+                keccak256(abi.encode(EMERGENCY_TYPEHASH_LOCAL, answer, nonce, deadline))
+            )
+        );
+    }
+
+    function _sign(uint256 pk, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// A signature by `pk` over the feed's CURRENT nonce.
     ///
-    /// If any of these three ever starts returning true, a bypass has been reintroduced
-    /// and `test_chainedUpdates_escapeTheBand` below no longer describes the system.
-    function test_emergencyPathSurfaceIsGone() public {
+    /// ALWAYS call this BEFORE `vm.prank(guardian)`: it makes an external call
+    /// (`emergencyNonce()`), and a prank is consumed by the next external call whatever
+    /// that call is. Computing a signature after the prank silently spends it and the
+    /// emergency call then arrives from the test contract, failing with
+    /// NotEmergencyUpdater for a reason that has nothing to do with the test.
+    function _sigBy(uint256 pk, int256 answer, uint256 deadline) internal view returns (bytes memory) {
+        return _sign(pk, _emergencyDigest(address(feed), answer, feed.emergencyNonce(), deadline));
+    }
+
+    function _ownerSig(int256 answer, uint256 deadline) internal view returns (bytes memory) {
+        return _sigBy(OWNER_PK, answer, deadline);
+    }
+
+    /// The normal first push. The emergency path is a CORRECTION, so every test below
+    /// that expects it to get past `NoPriceSet` needs this first.
+    function _seedPrice() internal {
+        vm.prank(owner);
+        feed.updateAnswer(ANSWER);
+    }
+
+    // ── The emergency key has no appointment surface (audit FIND-003 / D-7) ───
+
+    /// LOAD-BEARING. FIND-003 reinstated an emergency correction path, so
+    /// `emergencyUpdateAnswer` and the `emergencyUpdater()` getter DO now exist. The thing
+    /// D-7 actually died on must not: an APPOINTMENT surface. `setEmergencyUpdater` was
+    /// `onlyOwner`, and this feed's owner is the KMS signer rather than a timelock, so one
+    /// compromised key could appoint a second address it also controlled and then hold the
+    /// whole bypass alone — a 2-of-2 on paper, a 1-of-1 in practice.
+    ///
+    /// What replaces it: `emergencyUpdater` is `immutable` with no setter at all, and
+    /// `transferOwnership` refuses to hand ownership to it (see
+    /// test_transferOwnership_toTheGuardianReverts), so no transaction can collapse the
+    /// two roles onto one address.
+    ///
+    /// This asserts the absence at the ABI level rather than trusting that the source
+    /// never grows a setter back: the contract declares no fallback, so a call carrying a
+    /// selector it does not implement reverts and `success` is false. If `setOk` ever
+    /// returns true, D-7 is back and the entire FIND-003 security argument collapses with
+    /// it — the emergency band being a strict subset of the normal one
+    /// (test_emergencyRangeIsStrictSubsetOfNormalRange) only buys anything while the
+    /// second key is genuinely a second key.
+    function test_emergencyKeyIsImmutableAndUnappointable() public {
         vm.startPrank(owner);
 
-        (bool setOk,) = address(feed).call(
-            abi.encodeWithSignature("setEmergencyUpdater(address)", stranger)
-        );
-        assertFalse(setOk, "setEmergencyUpdater(address) must no longer exist");
+        (bool setOk,) = address(feed).call(abi.encodeWithSignature("setEmergencyUpdater(address)", stranger));
+        assertFalse(setOk, "setEmergencyUpdater(address) must never exist");
 
-        (bool updOk,) = address(feed).call(
-            abi.encodeWithSignature("emergencyUpdateAnswer(int256)", ANSWER)
-        );
-        assertFalse(updOk, "emergencyUpdateAnswer(int256) must no longer exist");
+        (bool setOk2,) = address(feed).call(abi.encodeWithSignature("setGuardian(address)", stranger));
+        assertFalse(setOk2, "nor under any other name");
 
-        (bool getOk,) = address(feed).call(abi.encodeWithSignature("emergencyUpdater()"));
-        assertFalse(getOk, "the emergencyUpdater() getter must no longer exist");
+        // The D-19 shape — an unbounded, single-argument, owner-only instant price
+        // primitive — must also stay gone. What exists is the co-signed three-argument
+        // form, and nothing else.
+        (bool oldShapeOk,) = address(feed).call(abi.encodeWithSignature("emergencyUpdateAnswer(int256)", ANSWER));
+        assertFalse(oldShapeOk, "the unsigned one-argument emergency setter must never exist");
 
-        // Control: the same low-level call shape DOES succeed against a selector the
-        // feed implements, so the three assertions above are about the missing
-        // functions and not about a malformed call or a blanket-reverting contract.
+        // Positive control 1: the selector that DOES exist is dispatched. The owner is not
+        // the guardian, so it reverts — but with NotEmergencyUpdater, which only the
+        // function body can produce. A missing selector would revert with empty data.
+        bytes memory emergencyCall =
+            abi.encodeWithSignature("emergencyUpdateAnswer(int256,uint256,bytes)", ANSWER, FAR_FUTURE, "");
+        (bool updOk, bytes memory ret) = address(feed).call(emergencyCall);
+        assertFalse(updOk, "the owner is not the guardian");
+        assertEq(bytes4(ret), KaleidoscopeNAVFeed.NotEmergencyUpdater.selector, "the function exists and ran");
+
+        // Positive control 2: the same low-level call shape succeeds against a selector
+        // the feed implements, so the assertions above are about missing functions and
+        // not about a malformed call or a blanket-reverting contract.
         (bool ctrlOk,) = address(feed).call(abi.encodeWithSignature("updateAnswer(int256)", ANSWER));
         assertTrue(ctrlOk, "control: updateAnswer(int256) still exists and is callable");
 
         vm.stopPrank();
+
+        // And the guardian is readable, fixed at construction, and is the address setUp
+        // passed — an immutable with a getter, not a mutable slot.
+        assertEq(feed.emergencyUpdater(), guardian, "the guardian is the constructor argument");
     }
 
-    /// Every price push emits exactly one event, and it is always `AnswerUpdated` —
-    /// there is no second, privileged price event for monitoring to have to watch.
+    /// Guards every other test in this file: the helpers above rebuild the EIP-712 domain
+    /// and struct from the spec, so if the contract's domain or type hash ever moved, the
+    /// signatures would stop verifying and every positive test here would fail for an
+    /// unrelated reason. This pins the two representations together directly.
+    function test_emergency_typehashAndDomainMatchTheContract() public view {
+        assertEq(feed.EMERGENCY_TYPEHASH(), EMERGENCY_TYPEHASH_LOCAL, "type hash");
+
+        (, string memory name, string memory version_, uint256 chainId, address verifying,,) = feed.eip712Domain();
+        assertEq(name, "KaleidoscopeNAVFeed");
+        assertEq(version_, "1");
+        assertEq(chainId, block.chainid, "the domain binds the chain - a fork cannot replay");
+        assertEq(verifying, address(feed), "and binds this feed - a sibling feed cannot replay");
+    }
+
+    /// SIGNER PARITY. `hashEmergencyUpdate` is the operator's entry point: it is what a
+    /// KMS/Fordefi signer is handed, so it must equal an independently-built EIP-712
+    /// digest, and it must track `emergencyNonce` as that nonce advances. The helper
+    /// existing is the whole reason an operator never rebuilds the domain by hand — the
+    /// same contract `GyldAtomicSwap.hashSwapMessage` provides.
+    function test_emergency_hashHelperMatchesAnIndependentDigest() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        uint256 deadline = T0 + 10 minutes;
+        assertEq(
+            feed.hashEmergencyUpdate(EMERGENCY_ANSWER, deadline),
+            _emergencyDigest(address(feed), EMERGENCY_ANSWER, feed.emergencyNonce(), deadline),
+            "helper must equal the independently-computed digest"
+        );
+
+        // It is nonce-sensitive: after a correction the SAME arguments hash differently,
+        // which is what makes a consumed signature unusable.
+        bytes32 before = feed.hashEmergencyUpdate(EMERGENCY_ANSWER, deadline);
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, deadline);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, deadline, sig);
+        assertEq(feed.emergencyNonce(), 1, "nonce advanced");
+        assertTrue(feed.hashEmergencyUpdate(EMERGENCY_ANSWER, deadline) != before, "digest must follow the nonce");
+    }
+
+    // ── Emergency path — access control and key separation ────────────────────
+
+    /// The happy path, and the shape of the 2-of-2: the guardian CALLS, the owner SIGNS.
+    function test_emergency_guardianWithOwnerSignatureSucceeds() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the correction landed");
+        assertEq(feed.emergencyNonce(), 1, "the signature is spent");
+        assertEq(feed.lastEmergencyAt(), T0, "the cooldown clock started");
+    }
+
+    /// A stolen guardian key is worth nothing on its own: it cannot forge the owner's
+    /// signature, and it holds no other power on this contract
+    /// (test_emergency_guardianHoldsNoOtherPower).
+    function test_emergency_missingSignatureReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, "");
+    }
+
+    function test_emergency_garbageSignatureReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        // 65 bytes of the right shape and none of the right content.
+        bytes memory garbage = new bytes(65);
+        for (uint256 i = 0; i < 65; i++) {
+            garbage[i] = 0xab;
+        }
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, garbage);
+    }
+
+    /// A well-formed signature over the correct digest, by the wrong key.
+    function test_emergency_wrongSignerReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory impostorSig = _sigBy(IMPOSTOR_PK, EMERGENCY_ANSWER, FAR_FUTURE);
+        bytes memory ownerSig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, impostorSig);
+
+        // Control: the identical call with the OWNER's signature over the same digest
+        // succeeds at this instant, so the rejection above is the signer and nothing else.
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, ownerSig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+    }
+
+    /// THE point of the two-key split. A compromised owner key gains nothing here beyond
+    /// what it already has (+/-10 %/h): it can sign, but it cannot make the call, even
+    /// holding a perfectly valid signature of its own.
+    function test_emergency_ownerCannotCallItEvenWithAValidSignature() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector, owner));
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), ANSWER, "the price must be untouched");
+
+        // Control: the same signature, submitted by the guardian, is accepted.
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+    }
+
+    /// The owner's signature is inert in the mempool: anyone can see it, nobody but the
+    /// guardian can use it.
+    function test_emergency_strangerCannotCallItEvenWithAValidSignature() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.NotEmergencyUpdater.selector, stranger));
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "control: the guardian may use it");
+    }
+
+    /// The other half of the split. The guardian is not a second owner: it holds exactly
+    /// one capability, and only jointly with the owner's signature.
+    function test_emergency_guardianHoldsNoOtherPower() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        bytes memory unauthorised = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, guardian);
+
+        vm.prank(guardian);
+        vm.expectRevert(unauthorised);
+        feed.updateAnswer(ANSWER_PLUS_SMALL);
+
+        vm.prank(guardian);
+        vm.expectRevert(unauthorised);
+        feed.setStalenessThreshold(20 hours);
+
+        // `stranger`, not `guardian`, as the target: OwnerCannotBeEmergencyUpdater is
+        // checked before the ownership modifier, and this test is about the modifier.
+        vm.prank(guardian);
+        vm.expectRevert(unauthorised);
+        feed.transferOwnership(stranger);
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.CannotRenounceOwnership.selector);
+        feed.renounceOwnership();
+
+        // Control: the one thing it CAN do, it can do — so the four rejections above are
+        // about those functions and not about a guardian that is somehow inert.
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+        assertEq(feed.owner(), owner, "and it is still not the owner");
+    }
+
+    /// If one address ever held both roles the 2-of-2 would be a 1-of-1 — D-7 reached by
+    /// a different route. `transferOwnership` is the only writer of `pendingOwner`, so
+    /// guarding it is sufficient: `acceptOwnership` can never see the guardian.
+    function test_transferOwnership_toTheGuardianReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnerCannotBeEmergencyUpdater.selector);
+        feed.transferOwnership(guardian);
+        assertEq(feed.pendingOwner(), address(0), "no pending transfer may be recorded");
+
+        // Control: the same call to any other address still works, so the guard is
+        // specific to the guardian and has not simply broken ownership transfer.
+        vm.prank(owner);
+        feed.transferOwnership(newOwner);
+        assertEq(feed.pendingOwner(), newOwner);
+    }
+
+    function test_constructor_rejectsZeroGuardian() public {
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, address(0)));
+        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", address(0));
+    }
+
+    /// The 1-of-1 collapse, blocked at birth rather than only at transfer.
+    function test_constructor_rejectsGuardianEqualToOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, owner));
+        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", owner);
+    }
+
+    /// The third constructor case IS testable: the feed's own address is a pure function
+    /// of (deployer, nonce), so it can be computed before the CREATE that produces it.
+    function test_constructor_rejectsGuardianEqualToTheFeedItself() public {
+        // Control first — prove the prediction is exact, otherwise the assertion below
+        // would pass for any address that merely happens not to be a valid guardian.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        KaleidoscopeNAVFeed control = new KaleidoscopeNAVFeed(owner, "control", guardian);
+        assertEq(address(control), predicted, "the CREATE address is predictable");
+
+        // A reverted CREATE still consumes the deployer's nonce, so re-predict.
+        address self = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, self));
+        new KaleidoscopeNAVFeed(owner, "self-guardian", self);
+    }
+
+    /// The signature is recovered against `owner()` AT EXECUTION TIME, not against a
+    /// snapshot taken at construction. A rotation therefore revokes the old key's ability
+    /// to authorise emergencies in the same instant it revokes everything else — there is
+    /// no window in which a retired key can still co-sign.
+    function test_emergency_signatureIsCheckedAgainstTheOwnerAtExecutionTime() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        vm.prank(owner);
+        feed.transferOwnership(rotatedOwner);
+        vm.prank(rotatedOwner);
+        feed.acceptOwnership();
+        assertEq(feed.owner(), rotatedOwner);
+
+        uint256 nonce = feed.emergencyNonce();
+        bytes memory oldOwnerSig = _sign(OWNER_PK, _emergencyDigest(address(feed), EMERGENCY_ANSWER, nonce, FAR_FUTURE));
+        bytes memory newOwnerSig =
+            _sign(ROTATED_PK, _emergencyDigest(address(feed), EMERGENCY_ANSWER, nonce, FAR_FUTURE));
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, oldOwnerSig);
+
+        // The failed call consumed no nonce, so the new owner's signature over the SAME
+        // nonce is still the right one.
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, newOwnerSig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the current owner's signature works");
+    }
+
+    // ── Emergency path — replay and signature binding ─────────────────────────
+
+    /// The nonce is consumed, so a signature is worth exactly one correction.
+    ///
+    /// The warp is load-bearing: replayed inside EMERGENCY_COOLDOWN the call would be
+    /// refused by the cooldown and this test would prove nothing about the nonce. Asserting
+    /// the specific error — and re-succeeding with a fresh signature at the same
+    /// timestamp — makes the distinction real.
+    function test_emergency_replayOfAConsumedNonceReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.emergencyNonce(), 1, "the nonce advanced");
+
+        vm.warp(T0 + feed.EMERGENCY_COOLDOWN());
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        // Control: a signature over the NEW nonce is accepted at this very timestamp, so
+        // the rejection above is the consumed nonce and not the cooldown.
+        bytes memory fresh = _ownerSig(EMERGENCY_ANSWER_2, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER_2, FAR_FUTURE, fresh);
+        assertEq(feed.emergencyNonce(), 2);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER_2);
+    }
+
+    /// The deadline bounds how long a co-signature sits usable. The comparison is
+    /// `block.timestamp > deadline`, so the deadline second itself is still valid.
+    function test_emergency_expiredDeadlineReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        uint256 deadline = T0 + 10 minutes;
+        bytes memory expiring = _ownerSig(EMERGENCY_ANSWER, deadline);
+
+        vm.warp(deadline + 1);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencySignatureExpired.selector, deadline));
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, deadline, expiring);
+
+        // Control: an otherwise identical signature whose deadline is exactly NOW is
+        // accepted, so the rejection above is the deadline and the boundary is inclusive.
+        bytes memory live = _ownerSig(EMERGENCY_ANSWER, deadline + 1);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, deadline + 1, live);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+    }
+
+    /// `answer` is inside the signed struct, so a co-signature authorising $1.50 cannot be
+    /// re-aimed at $1.20 by the guardian alone. Without this the guardian would hold a
+    /// unilateral in-band price primitive on the strength of one owner approval.
+    function test_emergency_signatureIsBoundToTheAnswer() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sigForA = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER_2, FAR_FUTURE, sigForA);
+        assertEq(feed.latestAnswer(), ANSWER, "no price moved");
+
+        // Control: the same signature against the answer it actually authorises.
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sigForA);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+    }
+
+    /// The reviewer's question in code: `deadline` is a plain calldata argument, so can
+    /// the SUBMITTER simply pass a later one and keep a dead signature alive? No — the
+    /// deadline is inside the signed struct, so changing it changes the digest and the
+    /// signature stops recovering to the owner. The expiry is therefore chosen by the
+    /// SIGNER and is not forgeable by the guardian, which is what makes the
+    /// `block.timestamp > deadline` check meaningful rather than advisory.
+    function test_emergency_signatureIsBoundToTheDeadline() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        uint256 signedDeadline = T0 + 10 minutes;
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, signedDeadline);
+
+        // Past the signed deadline, the guardian tries to buy itself another hour by
+        // passing a later value than the owner ever authorised.
+        vm.warp(signedDeadline + 1);
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.EmergencySignerNotOwner.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, signedDeadline + 3600, sig);
+        assertEq(feed.latestAnswer(), ANSWER, "no price moved");
+
+        // Passing the HONEST deadline does not rescue it either — that is the time check.
+        vm.prank(guardian);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencySignatureExpired.selector, signedDeadline)
+        );
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, signedDeadline, sig);
+
+        // Control: the identical call one second before expiry succeeds, so the two
+        // rejections above are the deadline and not some other guard.
+        vm.warp(signedDeadline);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, signedDeadline, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the boundary second is still valid");
+    }
+
+    // ── Emergency path — the bypass, and the band that bounds it ──────────────
+
+    /// The whole point: one transaction, no chained walk, no hourly waits.
+    function test_emergency_bypassesTheDeviationCap() public {
+        vm.warp(T0);
+        _seedPrice(); // $0.9542
+
+        // Control: the identical jump through the normal path, a full hour later and
+        // therefore past MIN_UPDATE_INTERVAL, is refused — +57% against a 10% cap.
+        vm.warp(T0 + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, EMERGENCY_ANSWER, ANSWER)
+        );
+        feed.updateAnswer(EMERGENCY_ANSWER);
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the emergency path takes it in one step");
+        (uint80 roundId,,,,) = feed.latestRoundData();
+        assertEq(roundId, 2, "one round, not the several a chained walk would cost");
+    }
+
+    /// The other guard it skips. This runs in the SAME block as the normal push, the
+    /// hardest case for the interval check.
+    function test_emergency_bypassesTheMinUpdateInterval() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+
+        // Control: the owner's own path is refused at this instant, zero seconds in.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.UpdateTooSoon.selector, T0 + ONE_HOUR));
+        feed.updateAnswer(ANSWER_PLUS_SMALL);
+
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "no interval applies to a correction");
+        assertEq(feed.stalenessSeconds(), 0);
+    }
+
+    /// LOAD-BEARING. This pins the entire security argument for FIND-003 in one place:
+    /// the emergency band is a STRICT SUBSET of the normal one, so the guardian pair buys
+    /// LATENCY, not REACH. Every price the two keys can reach instantly, the owner key
+    /// could already reach alone by chaining +/-10% hourly pushes
+    /// (test_chainedUpdates_escapeTheBand shows the mechanism); worst case $0.10 -> $2.00
+    /// is 32 pushes. That is what separates this path from the unbounded one deleted as
+    /// D-19.
+    ///
+    /// The shipped values are asserted alongside the inequality on purpose. The inequality
+    /// alone would still hold if someone widened BOTH bands together, which would silently
+    /// grow the reach of the emergency path while this test kept passing. Retuning one
+    /// bound must break this test loudly and force the argument to be re-made.
+    function test_emergencyRangeIsStrictSubsetOfNormalRange() public view {
+        assertEq(feed.MIN_ANSWER(), 1e7, "MIN_ANSWER = $0.10");
+        assertEq(feed.MAX_ANSWER(), 5e8, "MAX_ANSWER = $5.00");
+        assertEq(feed.EMERGENCY_MIN_ANSWER(), 5e7, "EMERGENCY_MIN_ANSWER = $0.50");
+        assertEq(feed.EMERGENCY_MAX_ANSWER(), 2e8, "EMERGENCY_MAX_ANSWER = $2.00");
+
+        assertLt(feed.MIN_ANSWER(), feed.EMERGENCY_MIN_ANSWER(), "the emergency floor must sit ABOVE the normal one");
+        assertLt(feed.EMERGENCY_MAX_ANSWER(), feed.MAX_ANSWER(), "the emergency ceiling must sit BELOW the normal one");
+
+        // And the rate limit. Parity with MIN_UPDATE_INTERVAL is the claim: the emergency
+        // path buys reach-within-band and freedom from intermediate prices, but NOT
+        // frequency. A cooldown longer than the routine interval would rate-limit the
+        // operator rather than an attacker, who holds the hourly owner key anyway.
+        assertEq(feed.EMERGENCY_COOLDOWN(), 1 hours);
+        assertEq(feed.EMERGENCY_COOLDOWN(), feed.MIN_UPDATE_INTERVAL(), "no path writes faster than hourly");
+    }
+
+    /// Both emergency bounds are inclusive, matching the normal path's
+    /// (test_updateAnswer_rangeBoundariesAreInclusive).
+    function test_emergency_bandBoundariesAreInclusive() public {
+        int256 floor_ = int256(feed.EMERGENCY_MIN_ANSWER());
+        int256 ceiling = int256(feed.EMERGENCY_MAX_ANSWER());
+
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sigLo = _ownerSig(floor_, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(floor_, FAR_FUTURE, sigLo);
+        assertEq(feed.latestAnswer(), floor_, "$0.50 exactly is accepted");
+
+        vm.warp(T0 + feed.EMERGENCY_COOLDOWN());
+        bytes memory sigHi = _ownerSig(ceiling, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(ceiling, FAR_FUTURE, sigHi);
+        assertEq(feed.latestAnswer(), ceiling, "$2.00 exactly is accepted");
+    }
+
+    /// One unit below the floor. $0.4999... is a perfectly legal answer for the NORMAL
+    /// path — that is exactly the point of a narrower emergency band.
+    function test_emergency_belowTheBandReverts() public {
+        int256 tooLow = int256(feed.EMERGENCY_MIN_ANSWER()) - 1;
+        assertGt(tooLow, int256(feed.MIN_ANSWER()), "the rejected value is legal for updateAnswer");
+
+        vm.warp(T0);
+        _seedPrice();
+
+        // A fully valid signature, so the range guard is the only thing that can fire.
+        bytes memory sig = _ownerSig(tooLow, FAR_FUTURE);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencyAnswerOutOfRange.selector, tooLow));
+        feed.emergencyUpdateAnswer(tooLow, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), ANSWER, "nothing moved");
+        assertEq(feed.emergencyNonce(), 0, "and nothing was consumed");
+    }
+
+    function test_emergency_aboveTheBandReverts() public {
+        int256 tooHigh = int256(feed.EMERGENCY_MAX_ANSWER()) + 1;
+        assertLt(tooHigh, int256(feed.MAX_ANSWER()), "the rejected value is legal for updateAnswer");
+
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(tooHigh, FAR_FUTURE);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencyAnswerOutOfRange.selector, tooHigh));
+        feed.emergencyUpdateAnswer(tooHigh, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), ANSWER, "nothing moved");
+    }
+
+    /// A correction, never an initialisation. The first price must come through
+    /// `updateAnswer`, so it is subject to the wider band and leaves a normal trail —
+    /// otherwise the guardian pair could seed the feed inside a band nobody audited.
+    function test_emergency_beforeAnyPriceReverts() public {
+        vm.warp(T0);
+
+        // A fully valid signature, so this isolates the NoPriceSet rule.
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        vm.expectRevert(KaleidoscopeNAVFeed.NoPriceSet.selector);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        // Control: the identical call, after a normal first push, succeeds. The failure
+        // above was the missing price and nothing about the signature.
+        _seedPrice();
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
+    }
+
+    // ── Emergency path — cooldown and resulting state ─────────────────────────
+
+    /// Without the cooldown the two keys would hold a $0.50 <-> $2.00 oscillation
+    /// primitive every block. With it they hold one arbitrary in-band jump per hour.
+    function test_emergency_secondCorrectionWithinCooldownReverts() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory first = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, first);
+
+        // One second short of the cooldown, with a freshly signed, in-band, unexpired sig:
+        // the cooldown is the only guard left that can fire.
+        uint256 nextAllowedAt = T0 + feed.EMERGENCY_COOLDOWN();
+        vm.warp(nextAllowedAt - 1);
+        bytes memory second = _ownerSig(EMERGENCY_ANSWER_2, FAR_FUTURE);
+        // nextAllowedAt is read BEFORE the prank: a getter call here would consume it.
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencyCooldownActive.selector, nextAllowedAt));
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER_2, FAR_FUTURE, second);
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the second correction did not land");
+        assertEq(feed.emergencyNonce(), 1, "and its signature was not consumed");
+    }
+
+    function test_emergency_exactlyAtTheCooldownSucceeds() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory first = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, first);
+
+        vm.warp(T0 + feed.EMERGENCY_COOLDOWN());
+        bytes memory second = _ownerSig(EMERGENCY_ANSWER_2, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER_2, FAR_FUTURE, second);
+
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER_2, "the boundary is inclusive");
+        assertEq(feed.lastEmergencyAt(), T0 + feed.EMERGENCY_COOLDOWN(), "and the clock restarts from here");
+        assertEq(feed.emergencyNonce(), 2);
+    }
+
+    /// An emergency push is a round like any other: consumers reading latestRoundData see
+    /// a normal, fresh, advancing feed and need no awareness of this path at all.
+    function test_emergency_advancesRoundIdAndUpdatedAt() public {
+        vm.warp(T0);
+        _seedPrice();
+        (uint80 roundBefore,,, uint256 updatedBefore,) = feed.latestRoundData();
+        assertEq(roundBefore, 1);
+        assertEq(updatedBefore, T0);
+
+        vm.warp(T0 + 3 hours);
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            feed.latestRoundData();
+        assertEq(roundId, 2, "the round advanced");
+        assertEq(answer, EMERGENCY_ANSWER);
+        assertEq(updatedAt, T0 + 3 hours, "updatedAt is the correction's own timestamp");
+        assertEq(startedAt, updatedAt);
+        assertEq(answeredInRound, roundId);
+
+        assertEq(feed.latestAnswer(), EMERGENCY_ANSWER, "the Aave V3 read agrees");
+        (, int256 histAnswer,,,) = feed.getRoundData(2);
+        assertEq(histAnswer, EMERGENCY_ANSWER, "and so does getRoundData");
+        assertEq(feed.stalenessSeconds(), 0, "an emergency push refreshes the feed");
+        assertTrue(feed.isFresh());
+    }
+
+    /// AnswerUpdated is emitted FIRST and ALWAYS, so an emergency push is indistinguishable
+    /// from a normal one to every existing consumer and indexer. EmergencyAnswerUpdated is
+    /// the extra signal monitoring watches for, never a replacement — the counterpart to
+    /// test_updateAnswer_emitsOnlyAnswerUpdated, which pins the normal path at exactly one.
+    function test_emergency_emitsBothAnswerUpdatedAndEmergencyAnswerUpdated() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE);
+        vm.recordLogs();
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2, "exactly two events, no more and no fewer");
+
+        assertEq(
+            logs[0].topics[0],
+            keccak256("AnswerUpdated(int256,uint256,uint256)"),
+            "AnswerUpdated must come first, so a naive indexer sees the price move"
+        );
+        assertEq(logs[0].emitter, address(feed));
+        assertEq(logs[0].topics[1], bytes32(uint256(EMERGENCY_ANSWER)));
+        assertEq(uint256(logs[0].topics[2]), 2, "round 2");
+        assertEq(abi.decode(logs[0].data, (uint256)), T0);
+
+        assertEq(
+            logs[1].topics[0],
+            keccak256("EmergencyAnswerUpdated(int256,uint256,int256,uint256)"),
+            "and the extra signal second"
+        );
+        assertEq(logs[1].emitter, address(feed));
+        assertEq(logs[1].topics[1], bytes32(uint256(EMERGENCY_ANSWER)));
+        assertEq(uint256(logs[1].topics[2]), 2);
+        (int256 previousAnswer, uint256 usedNonce) = abi.decode(logs[1].data, (int256, uint256));
+        assertEq(previousAnswer, ANSWER, "the log carries the price that was overwritten");
+        assertEq(usedNonce, 0, "and the nonce the signature actually consumed");
+    }
+
+    /// The correction leaves NORMAL state, not a special state: the next `updateAnswer`
+    /// measures its 10% band against the emergency answer and its 1 h interval against the
+    /// emergency timestamp. If either were still anchored to the last normal push, the
+    /// owner could immediately undo a correction, or would be blocked from following it.
+    function test_emergency_nextNormalUpdateIsMeasuredAgainstTheEmergencyState() public {
+        vm.warp(T0);
+        _seedPrice(); // $0.9542
+
+        vm.warp(T0 + 3 hours);
+        bytes memory sig = _ownerSig(EMERGENCY_ANSWER, FAR_FUTURE); // $1.50
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(EMERGENCY_ANSWER, FAR_FUTURE, sig);
+
+        // The interval runs from the correction, not from the last normal push — which was
+        // three hours ago and would otherwise have made this legal.
+        vm.warp(T0 + 4 hours - 1);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.UpdateTooSoon.selector, T0 + 4 hours));
+        feed.updateAnswer(EMERGENCY_ANSWER_2);
+
+        // And the band is centred on $1.50: the pre-correction price is 36% away and can
+        // no longer be pushed back in one step.
+        vm.warp(T0 + 4 hours);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, ANSWER, EMERGENCY_ANSWER)
+        );
+        feed.updateAnswer(ANSWER);
+
+        // Control: +10% of the NEW answer is accepted at that same instant.
+        int256 tenPercentUp = (EMERGENCY_ANSWER * 110) / 100; // $1.65
+        vm.prank(owner);
+        feed.updateAnswer(tenPercentUp);
+        assertEq(feed.latestAnswer(), tenPercentUp);
+
+        (uint80 roundId,,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(roundId, 3, "normal push, emergency push, normal push");
+        assertEq(updatedAt, T0 + 4 hours);
+    }
+
+    /// A NORMAL push emits exactly one event, and it is always `AnswerUpdated`. The
+    /// emergency path adds a second log on top of this one, never instead of it — see
+    /// test_emergency_emitsBothAnswerUpdatedAndEmergencyAnswerUpdated. If this test ever
+    /// starts seeing two events, the privileged signal has leaked onto the ordinary path.
     function test_updateAnswer_emitsOnlyAnswerUpdated() public {
         vm.warp(1000);
         vm.recordLogs();
@@ -774,11 +1541,17 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// always correctable in exactly two chained pushes, at a cost of one extra
     /// MIN_UPDATE_INTERVAL. An unconditional guard plus a 1 h wait is strictly safer than
     /// a second key with uncapped, un-rate-limited price authority — which is why the
-    /// emergency path was removed (audit §4.11). If the bad price must not be liquidated
-    /// against during that hour, pause the bond token; do not weaken the feed.
+    /// D-19 emergency path was removed (audit §4.11). If the bad price must not be
+    /// liquidated against during that hour, pause the bond token; do not weaken the feed.
+    ///
+    /// This mechanism is also what bounds the emergency path FIND-003 later reinstated.
+    /// Because chaining reaches any price in [MIN_ANSWER, MAX_ANSWER] given enough hours,
+    /// and the emergency band is a strict subset of that range
+    /// (test_emergencyRangeIsStrictSubsetOfNormalRange), the guardian pair can reach no
+    /// price the owner key could not already reach alone. It buys latency, not reach.
     function test_chainedUpdates_escapeTheBand() public {
-        int256 correctPrice = 9_500_000_000; // $95.00
-        int256 wrongPrice   = 8_560_000_000; // $85.60 — 9.89% below $95.00
+        int256 correctPrice = 95_000_000; // $0.95
+        int256 wrongPrice   = 85_600_000; // $0.8560 — 9.89% below $0.95
 
         // Step 1 — the correct NAV. First update: no interval or deviation check.
         vm.warp(1000);
@@ -793,7 +1566,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.latestAnswer(), wrongPrice, "the wrong price is now live");
 
         // Step 3 — the single-step correction, +1 h. Measured from the WRONG baseline,
-        // $95.00 is 10.98% up: beyond the band, so it reverts. The old test stopped here
+        // $0.95 is 10.98% up: beyond the band, so it reverts. The old test stopped here
         // and concluded the feed was trapped.
         vm.warp(8200);
         vm.prank(owner);
@@ -809,14 +1582,14 @@ contract KaleidoscopeNAVFeedTest is Test {
         // Step 4 — it is not trapped. Push the +10% ceiling from the wrong price
         // instead. The guard is `diff * 10_000 > last * 1000`, a strict `>`, so exactly
         // +10% is accepted. The revert above consumed no time, so we are still at t=8200,
-        // a full hour after step 2. $85.60 → $94.16.
+        // a full hour after step 2. $0.8560 → $94.16.
         int256 ceiling = wrongPrice + (wrongPrice * 1000) / 10_000;
-        assertEq(ceiling, 9_416_000_000, "the +10% ceiling from $85.60 is $94.16");
+        assertEq(ceiling, 94_160_000, "the +10% ceiling from $0.8560 is $94.16");
         vm.prank(owner);
         feed.updateAnswer(ceiling);
         assertEq(feed.latestAnswer(), ceiling, "the inclusive boundary is accepted");
 
-        // Step 5 — the band has moved with the price. From $94.16, the correct $95.00 is
+        // Step 5 — the band has moved with the price. From $94.16, the correct $0.95 is
         // only 0.89% away, comfortably inside the band. +1 h and the feed is corrected.
         vm.warp(11_800);
         vm.prank(owner);
@@ -934,7 +1707,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// detail. oldSeconds = 0 is a sentinel the setter can never produce.
     function test_constructor_emitsInitialStalenessThreshold() public {
         vm.recordLogs();
-        KaleidoscopeNAVFeed fresh = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV");
+        KaleidoscopeNAVFeed fresh = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian);
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bool found;

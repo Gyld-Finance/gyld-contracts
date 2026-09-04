@@ -2,6 +2,8 @@
 pragma solidity =0.8.28;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @title KaleidoscopeNAVFeed
@@ -10,9 +12,12 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///         Chainlink-compatible DeFi protocol read collateral prices without
 ///         needing to trust off-chain API calls.
 ///
-/// @dev Trust model: only the owner (a KMS signer or Gnosis Safe) can push
+/// @dev Trust model: the owner (a KMS signer or Gnosis Safe) pushes routine
 ///      price updates via `updateAnswer`. Ownership is transferred via the
 ///      two-step OZ Ownable2Step pattern to prevent accidental handoffs.
+///
+///      A second write path, `emergencyUpdateAnswer`, is a 2-of-2 between the immutable
+///      `emergencyUpdater` (ops multisig) and an owner signature (FIND-003, D-29).
 ///
 ///      Phase 3 migration: transfer ownership to a Chainlink Automation node
 ///      or RedStone oracle updater; the ABI remains identical so Morpho
@@ -22,18 +27,21 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///        NAV per token = (bonds_held × bond_price_usd) / tokens_outstanding
 ///
 ///      Scaling: 8 decimal places, matching standard Chainlink USD price feeds.
-///      e.g. TLT at $95.42 → answer = 9_542_000_000
+///      This feed serves the $1.00 NAV standard: $1.00 → 1e8, and the absolute range
+///      below is sized for it. A $95 instrument needs its own feed (audit FIND-003).
 ///
 ///      Safety constraints:
-///        - MIN_ANSWER / MAX_ANSWER: absolute range, enforced on EVERY push including
+///        - MIN_ANSWER / MAX_ANSWER: $0.10-$5.00, on BOTH paths and EVERY push including
 ///          the first. Below 10 the deviation guard can never pass again and the feed is
 ///          permanently stuck; far above, its arithmetic overflows. See MIN_ANSWER.
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
-///          Both guards are unconditional — there is no privileged bypass. A larger
+///          Both bind `updateAnswer` unconditionally; no key skips them. A larger
 ///          correction is reached by chaining updates (the band is relative to the
 ///          LAST price, so it moves with each push); pause the bond token meanwhile
-///          if a wrong price must not be liquidated against. See ARCHITECTURE D-19.
+///          if a wrong price must not be liquidated against. See ARCHITECTURE §11.5.
+///        - EMERGENCY_MIN_ANSWER / EMERGENCY_MAX_ANSWER: $0.50-$2.00, the band the 2-of-2
+///          `emergencyUpdateAnswer` may land in; it skips both guards above (FIND-003).
 ///        - stalenessThreshold:      threshold for the isFresh() monitoring view;
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
 ///                                   so DeFi integrations work over weekends and holidays.
@@ -46,7 +54,7 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///                                   redeploying the feed and repointing every forwarder.
 ///
 
-contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
+contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     // ── Price state ───────────────────────────────────────────────────────────
 
     /// Latest NAV per token, 8 decimal places.
@@ -100,7 +108,8 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     /// Absolute floor for any published answer, first push included (audit FIND-020).
-    /// 1e6 at 8 decimals = $0.01 per token.
+    /// 1e7 at 8 decimals = $0.10 per token. Retuned from $0.01 by audit FIND-003: the band
+    /// now also bounds how far a compromised owner key can walk the price given hours.
     ///
     /// The floor is a correctness guard, not a taste guard. The deviation check is
     /// `diff * BPS_DENOMINATOR > last * MAX_PRICE_DEVIATION_BPS`, so a stored `last` of 9
@@ -110,20 +119,67 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     /// skips the deviation check entirely (there is no `last` to compare against), a
     /// placeholder first answer of 1 would brick the feed permanently — it is not
     /// upgradeable, has no pause or reset, and `_updatedAt` never returns to zero.
-    uint256 public constant MIN_ANSWER = 1e6;
+    uint256 public constant MIN_ANSWER = 1e7;
 
-    /// Absolute ceiling for any published answer. 1e18 at 8 decimals = $10bn per token.
+    /// Absolute ceiling for any published answer. 5e8 at 8 decimals = $5.00 per token,
+    /// retuned from $10bn by audit FIND-003 (this feed serves the $1.00 NAV standard).
     ///
     /// The mirror of MIN_ANSWER: above roughly int256.max / BPS_DENOMINATOR (~5.8e72) the
     /// deviation check's own arithmetic overflows and every later push reverts with a
-    /// panic instead of a named error. This ceiling sits ~54 orders of magnitude below
+    /// panic instead of a named error. This ceiling sits ~64 orders of magnitude below
     /// that, so the multiplication cannot overflow for any accepted answer.
     ///
     /// NOT fixed by reordering the deviation arithmetic to divide first: that removes the
     /// overflow at the top while making the bottom strictly worse, because
     /// `last / BPS_DENOMINATOR` truncates to zero for any realistic price and would then
     /// reject every push (audit FIND-020).
-    uint256 public constant MAX_ANSWER = 1e18;
+    uint256 public constant MAX_ANSWER = 5e8;
+
+    // ── Emergency correction path (audit FIND-003) ────────────────────────────
+
+    /// Absolute floor for an EMERGENCY answer. 5e7 at 8 decimals = $0.50 per token.
+    uint256 public constant EMERGENCY_MIN_ANSWER = 5e7;
+
+    /// Absolute ceiling for an EMERGENCY answer. 2e8 at 8 decimals = $2.00 per token.
+    /// This band is a STRICT SUBSET of [MIN_ANSWER, MAX_ANSWER] — the relation is the
+    /// security argument, and both are `constant` so it is checkable from source. The
+    /// emergency path skips the interval and deviation guards but reaches no price
+    /// chaining already reaches: it buys latency, not reach (audit FIND-003, D-29).
+    /// The one thing the pair does gain is arriving without the intermediate prices, so
+    /// without the liquidations each would have fired — hence two keys, not one.
+    uint256 public constant EMERGENCY_MAX_ANSWER = 2e8;
+
+    /// Minimum time between consecutive emergency corrections. Deliberately EQUAL to
+    /// MIN_UPDATE_INTERVAL, so the invariant is uniform: no path writes this feed more
+    /// than once an hour.
+    /// @dev Without a cooldown the two keys hold a $0.50 <-> $2.00 oscillation primitive
+    ///      every block. Parity rather than something longer, because a longer lock rate-
+    ///      limits OPERATIONS, not an attacker: whoever holds both keys also holds the
+    ///      owner key, which already writes hourly. A cascading credit event can need a
+    ///      second correction the same day, and locking it out puts the operator back on
+    ///      the ramp this path exists to avoid (audit FIND-003, D-29).
+    uint256 public constant EMERGENCY_COOLDOWN = 1 hours;
+
+    /// EIP-712 type hash for the owner's co-signature over an emergency correction.
+    bytes32 public constant EMERGENCY_TYPEHASH =
+        keccak256("EmergencyUpdate(int256 answer,uint256 nonce,uint256 deadline)");
+
+    /// @notice The only address that may CALL emergencyUpdateAnswer. Production: the
+    ///         Fordefi MPC ops wallet. It submits; it never signs.
+    /// @dev    `immutable`, with deliberately NO setter: the absence of any appointment
+    ///         surface is what makes this not the D-7 bypass. See ARCHITECTURE D-29.
+    ///
+    ///         The split mirrors GyldAtomicSwap exactly: there the quote-service KMS key
+    ///         SIGNS an EIP-712 message and the taker SUBMITS it; here the KMS feed owner
+    ///         SIGNS and this address SUBMITS. Putting the EIP-712 signing on KMS reuses
+    ///         machinery already proven in production on every swap.
+    address public immutable emergencyUpdater;
+
+    /// @notice Consumed on every emergency correction; binds each owner signature to one use.
+    uint256 public emergencyNonce;
+
+    /// @notice Timestamp of the last emergency correction; gates EMERGENCY_COOLDOWN.
+    uint256 public lastEmergencyAt;
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -137,6 +193,14 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     // believe reads revert on staleness. They do not — see latestRoundData below.
     error CannotRenounceOwnership();
     error InvalidStalenessThreshold(uint256 submitted);
+    // audit FIND-003 — the emergency correction path.
+    error NotEmergencyUpdater(address caller);
+    error EmergencyAnswerOutOfRange(int256 answer);
+    error EmergencySignatureExpired(uint256 deadline);
+    error EmergencySignerNotOwner();
+    error EmergencyCooldownActive(uint256 nextAllowedAt);
+    error InvalidEmergencyUpdater(address candidate);
+    error OwnerCannotBeEmergencyUpdater();
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -146,11 +210,24 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
     /// Emitted when the owner retunes the isFresh() monitoring window.
     event StalenessThresholdUpdated(uint256 oldSeconds, uint256 newSeconds);
 
+    /// Emitted IN ADDITION TO AnswerUpdated on an emergency correction, never instead of it.
+    event EmergencyAnswerUpdated(int256 indexed answer, uint256 indexed roundId, int256 previousAnswer, uint256 nonce);
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     /// @param initialOwner  Address that may call updateAnswer (KMS signer or Safe).
     /// @param desc          Human-readable description, e.g. "TLT / USD NAV".
-    constructor(address initialOwner, string memory desc) Ownable(initialOwner) {
+    /// @param guardian      The ops multisig: the ONLY address that may call
+    ///                      emergencyUpdateAnswer, and only with the owner's signature.
+    constructor(address initialOwner, string memory desc, address guardian)
+        Ownable(initialOwner)
+        EIP712("KaleidoscopeNAVFeed", "1")
+    {
+        // guardian == owner would collapse the 2-of-2 into a 1-of-1 and re-create D-7.
+        if (guardian == address(0) || guardian == initialOwner || guardian == address(this)) {
+            revert InvalidEmergencyUpdater(guardian);
+        }
+        emergencyUpdater = guardian;
         _description = desc;
         stalenessThreshold = DEFAULT_STALENESS_THRESHOLD;
         // oldSeconds = 0 is a "no previous value" sentinel the setter can never emit
@@ -173,14 +250,24 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
         revert CannotRenounceOwnership();
     }
 
+    /// @notice Ownership may never be handed to the emergency updater: one address in both
+    ///         roles collapses the 2-of-2 into a 1-of-1 (audit FIND-003).
+    /// @dev    Guarding the public setter suffices — `pendingOwner` is written nowhere else.
+    ///         `_transferOwnership` is deliberately NOT overridden: `Ownable`'s constructor
+    ///         calls it before `emergencyUpdater` is initialised, which does not compile.
+    function transferOwnership(address newOwner) public virtual override {
+        if (newOwner == emergencyUpdater) revert OwnerCannotBeEmergencyUpdater();
+        super.transferOwnership(newOwner);
+    }
+
     // ── Price update ──────────────────────────────────────────────────────────
 
     /// @notice Push a new NAV price on-chain.
-    /// @param answer NAV per token, 8 decimal places (e.g. 9_542_000_000 = $95.42).
+    /// @param answer NAV per token, 8 decimal places (e.g. 100_000_000 = $1.00).
     ///
     /// Reverts if:
     ///   - caller is not the owner
-    ///   - answer is not positive
+    ///   - answer is outside MIN_ANSWER..MAX_ANSWER, first push included
     ///   - less than MIN_UPDATE_INTERVAL has elapsed since the last update
     ///   - price deviates more than MAX_PRICE_DEVIATION_BPS from the previous price
     function updateAnswer(int256 answer) external onlyOwner {
@@ -206,6 +293,63 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step {
         _latestAnswer = answer;
         _updatedAt = block.timestamp;
         emit AnswerUpdated(answer, _roundId, block.timestamp);
+    }
+
+    /// @notice The exact EIP-712 digest the owner must sign to authorise `answer`, at the
+    ///         CURRENT `emergencyNonce`.
+    /// @dev    Signer parity by construction: an operator asks the contract for the digest
+    ///         instead of rebuilding the domain off-chain, so a wrong chainId, wrong
+    ///         verifyingContract, stale nonce or mis-encoded struct cannot happen. Same
+    ///         contract as `GyldAtomicSwap.hashSwapMessage`, and the same reason.
+    ///         Sign the returned 32 bytes RAW — no EIP-191 prefix, no second hash
+    ///         (`cast wallet sign --no-hash`, or KMS `MessageType=DIGEST`).
+    function hashEmergencyUpdate(int256 answer, uint256 deadline) public view returns (bytes32) {
+        return _hashTypedDataV4(keccak256(abi.encode(EMERGENCY_TYPEHASH, answer, emergencyNonce, deadline)));
+    }
+
+    /// @notice Correct the NAV in ONE transaction, skipping the interval and deviation
+    ///         guards, when the true price has gapped out of reach of a chained walk-back.
+    /// @param  answer    The true NAV, 8dp. Must land in [EMERGENCY_MIN, EMERGENCY_MAX].
+    /// @param  deadline  Unix time after which the owner's signature is void.
+    /// @param  sig       Owner's EIP-712 signature over (answer, emergencyNonce, deadline).
+    /// @dev    2-of-2 (audit FIND-003): the guardian is the only permitted CALLER, and the
+    ///         signature must recover to `owner()` at execution time, so neither key acts
+    ///         alone. Replay protection is nonce + deadline + signed `answer` + EIP-712
+    ///         domain. OPERATIONAL RULE: sign with a SHORT `deadline` — there is no
+    ///         on-chain cap, so an unused signature stands until it expires or the nonce
+    ///         moves (residual D-29 (d)). Why this is not the D-7 bypass: see
+    ///         `emergencyUpdater` above.
+    function emergencyUpdateAnswer(int256 answer, uint256 deadline, bytes calldata sig) external {
+        if (msg.sender != emergencyUpdater) revert NotEmergencyUpdater(msg.sender);
+        // A correction, never an initialisation: the first push must go via updateAnswer.
+        if (_updatedAt == 0) revert NoPriceSet();
+        if (block.timestamp > deadline) revert EmergencySignatureExpired(deadline);
+        if (lastEmergencyAt != 0 && block.timestamp < lastEmergencyAt + EMERGENCY_COOLDOWN) {
+            revert EmergencyCooldownActive(lastEmergencyAt + EMERGENCY_COOLDOWN);
+        }
+        if (answer < int256(EMERGENCY_MIN_ANSWER) || answer > int256(EMERGENCY_MAX_ANSWER)) {
+            revert EmergencyAnswerOutOfRange(answer);
+        }
+
+        address owner_ = owner();
+        // Defence in depth behind the constructor and transferOwnership guards.
+        if (owner_ == emergencyUpdater) revert OwnerCannotBeEmergencyUpdater();
+
+        // Same helper the signer used, so on-chain and off-chain digests cannot diverge.
+        bytes32 digest = hashEmergencyUpdate(answer, deadline);
+        // SignatureChecker, not raw ECDSA: the owner may later be an ERC-1271 Safe.
+        if (!SignatureChecker.isValidSignatureNow(owner_, digest, sig)) {
+            revert EmergencySignerNotOwner();
+        }
+
+        int256 previous = _latestAnswer;
+        unchecked { emergencyNonce += 1; }
+        lastEmergencyAt = block.timestamp;
+        _roundId += 1;
+        _latestAnswer = answer;
+        _updatedAt = block.timestamp;
+        emit AnswerUpdated(answer, _roundId, block.timestamp);
+        emit EmergencyAnswerUpdated(answer, _roundId, previous, emergencyNonce - 1);
     }
 
     // ── AggregatorV3Interface ─────────────────────────────────────────────────

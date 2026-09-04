@@ -44,7 +44,9 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                           In prod: platform MPC wallet / Fordefi — burn quorum (separate)
 ///   WHITELIST_ADMIN      →  IssuanceManager WHITELIST_ADMIN_ROLE (AP whitelist mgmt)
 ///                           In prod: ops Gnosis Safe
-///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls)
+///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls). MUST differ
+///                            from OPS_MULTISIG: the two form the 2-of-2 quorum on the
+///                            feed's emergency correction path (audit FIND-003).
 ///                           In prod: KMS signer
 ///   SANCTIONS_LIST       →  SanctionsOracleMirror (prod) / MockSanctionsList (dev)
 ///
@@ -157,6 +159,16 @@ contract DeployDevNet is Script {
         c.whitelistAdmin = DeployGuards.envAddressProdRequired("WHITELIST_ADMIN", c.deployer);
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
 
+        // audit FIND-003. The NAV feed's emergency path is a 2-of-2: navFeedOwner SIGNS,
+        // the ops multisig (passed to deployToken as `operator`) CALLS. The feed's
+        // constructor refuses a guardian equal to its owner, so on a dev chain — where
+        // BOTH of the above default to the deployer — deployToken would revert. Derive a
+        // distinct dev NAV owner instead. Production is unaffected: envAddressProdRequired
+        // ignores the fallback there and requireDistinct below is the real guard.
+        if (DeployGuards.isDevChain() && c.navFeedOwner == c.opsMultisig) {
+            c.navFeedOwner = vm.addr(uint256(keccak256("DeployDevNet:dev-nav-feed-owner")));
+        }
+
         // On production none of these may be the broadcasting EOA — that is precisely
         // the shape of the GYL-1135 incident, where "handover complete" meant nothing moved.
         DeployGuards.requireNotDeployer(c.governanceMultisig, c.deployer, "GOVERNANCE_MULTISIG");
@@ -169,6 +181,10 @@ contract DeployDevNet is Script {
         // Mint and burn are a deliberate two-key quorum; one address holding both
         // collapses it back into a single point of compromise.
         DeployGuards.requireDistinct(c.subscriber, c.redeemer, "SUBSCRIBER_ADDRESS", "REDEEMER_ADDRESS");
+
+        // Same reasoning for the NAV emergency quorum (audit FIND-003): the key that signs
+        // a correction must not be the key that submits it.
+        DeployGuards.requireDistinct(c.opsMultisig, c.navFeedOwner, "OPS_MULTISIG", "NAV_FEED_OWNER");
 
         // Delay: required on production and never below 48h. On Anvil it defaults to 0
         // (instant schedule+execute for dev convenience); on any other dev chain, 48h.

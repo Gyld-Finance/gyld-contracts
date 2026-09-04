@@ -63,7 +63,7 @@ Two generations coexist. **Do not mix them.**
 |---|---|---|---|---|---|
 | GyldBondToken implementation (ERC-8056) | `0x72FAE4fa227e7E28BF315BA363dE39E371a49C52` | **46050ea** | — | Yes (Blockscout) | live (test) |
 | GTB8056 "Gyld Test Bond 8056" (ERC1967 proxy, CREATE2) | `0xE1C0a83Ab03e4498Fad1f833fA484E2cfc68dE7b` | **46050ea** | DEFAULT_ADMIN_ROLE = timelock `0xf803…ef72` (deployer-controlled, zero delay) | Yes (Blockscout) | **do-not-reuse** — experimental ERC-8056 proxy; wired to the ungated MockSanctionsList lineage and to source that is not on `main` |
-| — KaleidoscopeNAVFeed / NAVFeedForwarder | `0x4266a4A43Db435056f60C02b37fA8586E58597Fa` / `0x49be531A7C48077483997d92D7BeF759dd7b2b53` | 46050ea | — | — | live (test) |
+| — KaleidoscopeNAVFeed / NAVFeedForwarder | `0x4266a4A43Db435056f60C02b37fA8586E58597Fa` / `0x49be531A7C48077483997d92D7BeF759dd7b2b53` | 46050ea | — | — | live (test) — **not remediated for FIND-003 and cannot be**: the feed has no proxy, so it keeps the old `$0.01-$10bn` range and has no `emergencyUpdateAnswer`. A gapped price there is still a five-hour ramp. Reaching it needs a replacement feed plus `setUpstreamOracle` on the forwarder — the same limitation already recorded for FIND-022 / D-22. |
 | GyldAtomicSwap (implementation) | `0x287edc0d5F6d3D07beBD0390509C88Fc50a8f79b` | 46050ea | — | Yes (Blockscout) | live (test) |
 | GyldAtomicSwap (ERC1967 proxy, CREATE2) | `0x7036206Fc1eBDF8917836b67375E6D49Bc02aBE8` | 46050ea | DEFAULT_ADMIN_ROLE = deployer EOA (all init roles set to deployer) | Yes (Blockscout) | live (test) — settlement asset is Circle Sepolia USDC `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
 

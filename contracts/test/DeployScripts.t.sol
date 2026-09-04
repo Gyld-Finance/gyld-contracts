@@ -210,6 +210,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         // ── DeployNAVFeed ─────────────────────────────────────────────────────
         _run(this.reject_navFeed_forwarderOwnerIsAnEoa);
         _run(this.reject_navFeed_unsetForwarderOwnerOnProd);
+        _run(this.reject_navFeed_unsetGuardianOnProd);
+        _run(this.reject_navFeed_guardianIsTheOperator);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -580,6 +582,30 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _expectRunRevert(address(new DeployNAVFeed()), "env var FORWARDER_OWNER is required on chainId 8453");
     }
 
+    /// Catches: NAV_GUARDIAN unset on production and silently defaulting. The feed's
+    /// emergency correction path is a 2-of-2, and a defaulted guardian is the D-7 defect
+    /// (audit FIND-003) — one key holding both halves of the quorum.
+    function reject_navFeed_unsetGuardianOnProd() external {
+        vm.chainId(PROD_L2);
+        _navFeedEnv();
+        _setAddr("FORWARDER_OWNER", address(_timelock(48 hours, GOVERNANCE)));
+        vm.setEnv("NAV_GUARDIAN", "");
+        _expectRunRevert(address(new DeployNAVFeed()), "env var NAV_GUARDIAN is required on chainId 8453");
+    }
+
+    /// Catches: the guardian and the feed owner set to the SAME address on production,
+    /// which collapses the 2-of-2 into a 1-of-1. `KaleidoscopeNAVFeed`'s constructor
+    /// refuses it on-chain too; this fails earlier, naming the variable to fix.
+    function reject_navFeed_guardianIsTheOperator() external {
+        vm.chainId(PROD_L2);
+        _navFeedEnv();
+        _setAddr("FORWARDER_OWNER", address(_timelock(48 hours, GOVERNANCE)));
+        _setAddr("NAV_GUARDIAN", NAV_OWNER); // == OPERATOR_ADDRESS
+        _expectRunRevert(
+            address(new DeployNAVFeed()), "OPERATOR_ADDRESS and NAV_GUARDIAN must be different addresses"
+        );
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  Fixtures
     // ══════════════════════════════════════════════════════════════════════════
@@ -646,6 +672,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     function _navFeedEnv() internal {
         _clearEnv();
         _setAddr("OPERATOR_ADDRESS", NAV_OWNER);
+        // Distinct from OPERATOR_ADDRESS by construction: the feed's emergency path is a
+        // 2-of-2 and its constructor rejects a guardian equal to the owner (FIND-003).
+        _setAddr("NAV_GUARDIAN", OPS);
         vm.setEnv("FEED_DESCRIPTION", "TBA / USD NAV");
     }
 
@@ -672,7 +701,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// from the project root, and an empty value makes `vm.envAddress` / `vm.envUint`
     /// revert — exactly how an unset variable behaves.
     function _clearEnv() internal {
-        string[24] memory keys = [
+        string[25] memory keys = [
             "GOVERNANCE_MULTISIG",
             "OPS_MULTISIG",
             "SUBSCRIBER_ADDRESS",
@@ -696,7 +725,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
             "SERIES_TOKENS",
             "ALLOWED_TAKERS",
             "OPERATOR_ADDRESS",
-            "FORWARDER_OWNER"
+            "FORWARDER_OWNER",
+            "NAV_GUARDIAN"
         ];
         for (uint256 i = 0; i < keys.length; i++) {
             vm.setEnv(keys[i], "");

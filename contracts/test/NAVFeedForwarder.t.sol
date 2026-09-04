@@ -16,13 +16,16 @@ contract NAVFeedForwarderTest is Test {
     address forwarderOwner = address(0xA2);
     address stranger       = address(0xB1);
     address newOwner       = address(0xC1);
+    address guardian       = address(0xD1); // emergency NAV updater (audit FIND-003)
 
-    int256 constant ANSWER_V1 = 9_542_000_000; // $95.42
-    int256 constant ANSWER_V2 = 9_900_000_000; // $99.00  (new oracle, within 10% of V1)
+    // Rescaled /100 onto the $1.00 NAV standard when FIND-003 tightened the feed's
+    // absolute range to $0.10-$5.00.
+    int256 constant ANSWER_V1 = 95_420_000; // $0.9542
+    int256 constant ANSWER_V2 = 99_000_000; // $0.9900  (new oracle, within 10% of V1)
 
     function setUp() public {
-        feedV1    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV");
-        feedV2    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV v2");
+        feedV1    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV", guardian);
+        feedV2    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV v2", guardian);
         forwarder = new NAVFeedForwarder(address(feedV1), forwarderOwner);
 
         vm.prank(feedOwner);

@@ -34,6 +34,11 @@
     {
       "check": "incorrect-equality",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
     {
@@ -185,6 +190,11 @@
       "check": "timestamp",
       "file": "contracts/IssuanceManager.sol",
       "element": "subscribe"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
     },
     {
       "check": "timestamp",

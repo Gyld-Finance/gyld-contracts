@@ -35,6 +35,12 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 ///                                           with USDC.
 ///   non-allowlisted taker  = account[3]  — funded, deliberately NOT allowlisted
 ///                                           (allowlist-revert proof).
+///   token operator/pauser  = account[4]  — MUST differ from the NAV feed owner
+///                                           (= the deployer): the feed's emergency
+///                                           path is a 2-of-2 and TokenFactory
+///                                           reverts NavFeedOwnerIsOperator if the
+///                                           guardian and the KMS signer collapse
+///                                           into one key.
 ///   withdrawalWallet       = account[5]  — a FIXED destination distinct from the
 ///                                           treasurer, so the withdraw proof shows
 ///                                           funds landing at the admin-fixed wallet.
@@ -50,9 +56,12 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 contract DeployAtomicSettlementE2E is Script {
     address constant TAKER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8; // acct[1]
     address constant BOB = 0x90F79bf6EB2c4f870365E785982E1f101E93b906; // acct[3] (not allowlisted)
+    address constant OPERATOR = 0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65; // acct[4]
     address constant WITHDRAWAL_WALLET = 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc; // acct[5]
 
-    int256 constant NAV = 100e8; // $100.00 per token, 8dp — matches the Rust market-data mid
+    // $1.00 per token, 8dp — the product's NAV-per-token standard, and the mid the Rust
+    // market-data fixture quotes against. 1e18 bond token <-> 1e6 USDC.
+    int256 constant NAV = 1e8;
     uint16 constant MAX_BPS = 200; // 2% NAV band
     uint32 constant MAX_NAV_AGE = 86400; // 1 day
 
@@ -86,9 +95,9 @@ contract DeployAtomicSettlementE2E is Script {
             "14913UBF6",
             "US14913UBF62",
             1_851_811_200,
-            deployer, // token operator / pauser
+            OPERATOR, // token operator / pauser (acct[4]; must differ from the NAV feed owner)
             address(issuanceMgr),
-            deployer // NAV feed owner
+            deployer // NAV feed owner — the broadcaster, so it can push NAV below
         );
         GyldBondToken token = GyldBondToken(token_);
         KaleidoscopeNAVFeed navFeed = KaleidoscopeNAVFeed(navFeed_);
@@ -118,6 +127,9 @@ contract DeployAtomicSettlementE2E is Script {
         swap.setAllowed(TAKER, true); // acct[1] may be an executeSwap taker
 
         // ── 4. Seed the swap's OWN inventory + USDC liquidity ─────────────────
+        // At NAV $1.00 the swap's 100-token inventory is only 100 USDC of notional; the
+        // USDC faucet amounts below are deliberate headroom for the Rust test, not a
+        // priced quantity, so they are left generous rather than rescaled with the NAV.
         issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens minted DIRECTLY to the swap
         usdc.mint(address(swap), 100_000e6); // redeem-leg liquidity
         usdc.mint(TAKER, 1_000_000e6); // taker buys with this

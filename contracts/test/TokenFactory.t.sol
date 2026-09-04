@@ -298,6 +298,34 @@ contract TokenFactoryTest is Test {
         assertEq(feed.owner(), navFeedOwner);
     }
 
+    /// audit FIND-003. The factory is what wires the feed's emergency guardian, and it
+    /// wires it to `operator` — the ops wallet that already holds PAUSER_ROLE. Nothing
+    /// else asserted this, so the whole 2-of-2 could have been mis-wired at deploy while
+    /// every feed-level test kept passing.
+    function test_deployToken_wiresOperatorAsTheNavEmergencyGuardian() public {
+        (address token,,) = _deploy();
+        KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
+
+        assertEq(feed.emergencyUpdater(), operator, "guardian must be the ops operator");
+        assertEq(feed.owner(), navFeedOwner, "and the signer must be the KMS feed owner");
+        assertTrue(feed.emergencyUpdater() != feed.owner(), "the 2-of-2 must not collapse");
+    }
+
+    /// The same address in both roles would make the emergency path a 1-of-1. The feed's
+    /// constructor refuses it too; the factory refuses it FIRST so the revert names the
+    /// parameter a deployer has to fix (audit FIND-003).
+    function test_deployToken_rejectsNavFeedOwnerEqualToOperator() public {
+        vm.expectRevert(TokenFactory.NavFeedOwnerIsOperator.selector);
+        factory.deployToken(
+            "Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY, operator, address(issuanceMgr), operator
+        );
+
+        // Control: the identical call with a distinct feed owner succeeds, so the revert
+        // above is the collision guard and not some unrelated input check.
+        (address token,,) = _deploy();
+        assertTrue(token != address(0));
+    }
+
     function test_deployToken_navFeedDescriptionMatchesSymbol() public {
         (address token,,) = _deploy();
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
@@ -308,9 +336,9 @@ contract TokenFactoryTest is Test {
         (address token,,) = _deploy();
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
         vm.prank(navFeedOwner);
-        feed.updateAnswer(9_542_000_000);
+        feed.updateAnswer(95_420_000);
         (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, 9_542_000_000);
+        assertEq(answer, 95_420_000);
     }
 
     function test_deployToken_operatorCannotPushPrice() public {
@@ -318,7 +346,7 @@ contract TokenFactoryTest is Test {
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
         vm.prank(operator);
         vm.expectRevert();
-        feed.updateAnswer(9_542_000_000);
+        feed.updateAnswer(95_420_000);
     }
 
     // ── role assignment ───────────────────────────────────────────────────────
