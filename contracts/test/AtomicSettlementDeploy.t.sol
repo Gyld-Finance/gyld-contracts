@@ -54,9 +54,9 @@ contract AtomicSettlementDeployTest is Test {
     address signer;
     address taker;
 
-    // NAV $100.00 per token (8dp): 1e18 token ⇔ 100e6 USDC. Quotes below sit
+    // NAV $1.00 per token (8dp): 1e18 token ⇔ 1e6 USDC. Quotes below sit
     // exactly on NAV — inside the swap's 2% band.
-    int256 constant NAV = 100e8;
+    int256 constant NAV = 1e8;
     uint16 constant MAX_BPS = 200; // 2% band
     uint32 constant MAX_NAV_AGE = 1 days;
 
@@ -88,7 +88,7 @@ contract AtomicSettlementDeployTest is Test {
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
             "US14913UBF62",
-            1_788_739_200,
+            1_851_811_200,
             pauser,
             address(issuanceMgr),
             navFeedOwner
@@ -146,27 +146,27 @@ contract AtomicSettlementDeployTest is Test {
     /// funded directly into the swap.
     function _seedInventoryAndLiquidity() internal {
         vm.prank(subscriber);
-        issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens @ $100 minted to the swap
+        issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens @ $1.00 minted to the swap
 
-        usdc.mint(address(swap), 10_000e6); // USDC liquidity for the redeem leg
-        usdc.mint(taker, 100_000e6);
+        usdc.mint(address(swap), 100e6); // USDC liquidity for the redeem leg
+        usdc.mint(taker, 1_000e6);
     }
 
-    /// BUY: taker pays up to 1_000 USDC, receives bond tokens at 1:100 (exactly at NAV).
+    /// BUY: taker pays up to 10 USDC, receives bond tokens at 1:1 (exactly at NAV).
     function _buyQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
             quoteId: quoteId,
             taker: taker,
             tokenIn: address(usdc),
-            maxAmountIn: 1_000e6,
+            maxAmountIn: 10e6,
             tokenOut: address(token),
-            price: 10e18 * 1e18 / 1_000e6, // 10e18 tokenOut per 1_000e6 tokenIn
+            price: 10e18 * 1e18 / 10e6, // 10e18 tokenOut per 10e6 tokenIn
             expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
     }
 
-    /// REDEEM: taker pays up to 10 bond tokens, receives USDC at 100:1 (exactly at NAV).
+    /// REDEEM: taker pays up to 10 bond tokens, receives USDC at 1:1 (exactly at NAV).
     function _redeemQuote(uint256 quoteId) internal view returns (GyldAtomicSwap.SwapMessage memory) {
         return GyldAtomicSwap.SwapMessage({
             quoteId: quoteId,
@@ -174,7 +174,7 @@ contract AtomicSettlementDeployTest is Test {
             tokenIn: address(token),
             maxAmountIn: 10e18,
             tokenOut: address(usdc),
-            price: 1_000e6 * 1e18 / 10e18, // 1_000e6 tokenOut per 10e18 tokenIn
+            price: 10e6 * 1e18 / 10e18, // 10e6 tokenOut per 10e18 tokenIn
             expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
         });
@@ -325,14 +325,14 @@ contract AtomicSettlementDeployTest is Test {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(1);
         bytes memory sig = _sign(m);
         vm.prank(taker);
-        usdc.approve(address(swap), 1_000e6);
+        usdc.approve(address(swap), 10e6);
         vm.prank(taker);
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
 
         assertEq(token.balanceOf(taker), 10e18, "taker did not receive tokens");
         assertEq(token.balanceOf(address(swap)), 90e18, "swap inventory not debited");
-        assertEq(usdc.balanceOf(taker), 100_000e6 - 1_000e6, "taker USDC not debited");
-        assertEq(usdc.balanceOf(address(swap)), swapUsdcBefore + 1_000e6, "swap USDC not credited");
+        assertEq(usdc.balanceOf(taker), 1_000e6 - 10e6, "taker USDC not debited");
+        assertEq(usdc.balanceOf(address(swap)), swapUsdcBefore + 10e6, "swap USDC not credited");
         assertEq(token.totalSupply(), 100e18, "buy must not mint or burn");
         assertTrue(swap.isQuoteUsed(1), "quoteId not consumed");
     }
@@ -354,7 +354,7 @@ contract AtomicSettlementDeployTest is Test {
 
         assertEq(token.balanceOf(taker), 0, "taker tokens not debited");
         assertEq(token.balanceOf(address(swap)), 100e18, "collateral not back in inventory");
-        assertEq(usdc.balanceOf(taker), 100_000e6, "taker did not get full round trip");
+        assertEq(usdc.balanceOf(taker), 1_000e6, "taker did not get full round trip");
 
         // 2. Treasurer evacuates the returned NET collateral out to the fixed
         //    withdrawalWallet — off-chain ops then bridges it to the IssuanceManager
@@ -388,7 +388,7 @@ contract AtomicSettlementDeployTest is Test {
         GyldAtomicSwap.SwapMessage memory m = _buyQuote(1);
         bytes memory sig = _sign(m);
         vm.prank(taker);
-        usdc.approve(address(swap), 1_000e6);
+        usdc.approve(address(swap), 10e6);
 
         // The USDC leg has no screen; the bond token's _update on the swap → taker
         // push must revert AccountSanctioned (bubbled through SafeERC20). The taker is

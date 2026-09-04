@@ -41,7 +41,7 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 /// ── What it proves ──────────────────────────────────────────────────────────
 ///   1. Minimal base wired: IssuanceManager + TokenFactory + a real CAT-style
 ///      GyldBondToken/NAVFeed/forwarder + MockSanctionsList + MockUSDC.
-///   2. NAV pushed first ($100, 8dp).
+///   2. NAV pushed first ($1.00, 8dp).
 ///   3. Self-custodial swap deployed, whitelisted as AP, series registered,
 ///      withdrawal wallet set, taker allowlisted.
 ///   4. Inventory seeded DIRECTLY into the swap via IssuanceManager.subscribe(token,
@@ -60,9 +60,13 @@ contract AtomicSettlementFlow is Script {
     uint256 immutable DEPLOYER_PK = vm.deriveKey(ANVIL_MNEMONIC, 0); // acct[0]
     uint256 immutable TAKER_PK    = vm.deriveKey(ANVIL_MNEMONIC, 1); // acct[1]
     uint256 immutable SIGNER_PK   = vm.deriveKey(ANVIL_MNEMONIC, 2); // acct[2]
+    // Token operator / pauser. MUST be distinct from the NAV feed owner: the feed's
+    // emergency path is a 2-of-2 (guardian = operator, signer = navFeedOwner) and
+    // TokenFactory.deployToken reverts NavFeedOwnerIsOperator if they collapse into one.
+    uint256 immutable OPERATOR_PK = vm.deriveKey(ANVIL_MNEMONIC, 3); // acct[3]
 
-    // NAV $100.00 per token (8dp): 1e18 token <-> 100e6 USDC. 8 decimals.
-    int256 constant NAV = 100e8; // 10000000000
+    // NAV $1.00 per token (8dp): 1e18 token <-> 1e6 USDC. 8 decimals.
+    int256 constant NAV = 1e8; // 100000000
     uint16 constant MAX_BPS = 200; // 2% NAV band
     uint32 constant MAX_NAV_AGE = 86400; // 1 day
 
@@ -71,12 +75,14 @@ contract AtomicSettlementFlow is Script {
 
         address taker = vm.addr(TAKER_PK);
         address signer = vm.addr(SIGNER_PK);
+        address operator = vm.addr(OPERATOR_PK);
         address deployer = msg.sender; // broadcaster = deployer = every admin/ops role (dev)
 
         console2.log("=== AtomicSettlementFlow (LOCAL DEV, self-custodial) ===");
         console2.log("deployer/broadcaster: %s", deployer);
         console2.log("taker (acct[1]):      %s", taker);
         console2.log("quote signer (acct[2]): %s", signer);
+        console2.log("token operator (acct[3]): %s", operator);
 
         vm.startBroadcast();
 
@@ -103,10 +109,10 @@ contract AtomicSettlementFlow is Script {
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
             "US14913UBF62",
-            1_788_739_200,
-            deployer, // token operator / pauser
+            1_851_811_200,
+            operator, // token operator / pauser (acct[3]; must differ from the NAV feed owner)
             address(issuanceMgr),
-            deployer // NAV feed owner
+            deployer // NAV feed owner — the broadcaster, so it can push NAV below
         );
         GyldBondToken token = GyldBondToken(token_);
         KaleidoscopeNAVFeed navFeed = KaleidoscopeNAVFeed(navFeed_);
@@ -121,7 +127,7 @@ contract AtomicSettlementFlow is Script {
 
         // ── Step 2: NAV FIRST (the gotcha) ───────────────────────────────────
         navFeed.updateAnswer(NAV);
-        console2.log("[2] NAV pushed FIRST: %d (8dp = $100.00)", uint256(NAV));
+        console2.log("[2] NAV pushed FIRST: %d (8dp = $1.00)", uint256(NAV));
 
         // ── Step 3: self-custodial swap + wiring ─────────────────────────────
         GyldAtomicSwap swap = GyldAtomicSwap(
@@ -152,15 +158,15 @@ contract AtomicSettlementFlow is Script {
         console2.log("    Swap:  %s", address(swap));
 
         // ── Step 4: seed the swap's OWN inventory + USDC liquidity ───────────
-        issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens @ $100 minted to the swap
+        issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens @ $1.00 minted to the swap
         require(token.balanceOf(address(swap)) == 100e18, "subscribe mint did not land in swap");
         require(token.totalSupply() == 100e18, "unexpected supply after subscribe");
 
         // USDC for the redeem leg goes directly to the swap; fund the taker for buying.
-        usdc.mint(address(swap), 10_000e6);
-        usdc.mint(taker, 100_000e6);
+        usdc.mint(address(swap), 100e6);
+        usdc.mint(taker, 1_000e6);
         console2.log("[4] inventory seeded: 100 tokens minted to swap; supply=%d", token.totalSupply());
-        console2.log("    swap USDC liquidity=%d; taker funded with 100000 USDC", usdc.balanceOf(address(swap)));
+        console2.log("    swap USDC liquidity=%d; taker funded with 1000 USDC", usdc.balanceOf(address(swap)));
 
         vm.stopBroadcast();
 
@@ -173,9 +179,9 @@ contract AtomicSettlementFlow is Script {
             quoteId: 1,
             taker: taker,
             tokenIn: address(usdc),
-            maxAmountIn: 1_000e6, // pays up to 1,000 USDC
+            maxAmountIn: 10e6, // pays up to 10 USDC
             tokenOut: address(token),
-            price: 10e18 * 1e18 / 1_000e6, // 10 bond tokens per 1,000 USDC (exactly at NAV)
+            price: 10e18 * 1e18 / 10e6, // 10 bond tokens per 10 USDC (exactly at NAV)
             // Inside GyldAtomicSwap.DEFAULT_MAX_QUOTE_TTL (90s), with slack to spare.
             expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
@@ -190,13 +196,13 @@ contract AtomicSettlementFlow is Script {
 
         require(token.balanceOf(taker) == 10e18, "BUY: taker did not receive 10 tokens");
         require(token.balanceOf(address(swap)) == swapTokensBeforeBuy - 10e18, "BUY: swap inventory not debited");
-        require(usdc.balanceOf(address(swap)) == swapUsdcBeforeBuy + 1_000e6, "BUY: swap USDC not credited");
-        require(usdc.balanceOf(taker) == 100_000e6 - 1_000e6, "BUY: taker USDC not debited");
+        require(usdc.balanceOf(address(swap)) == swapUsdcBeforeBuy + 10e6, "BUY: swap USDC not credited");
+        require(usdc.balanceOf(taker) == 1_000e6 - 10e6, "BUY: taker USDC not debited");
         require(token.totalSupply() == supplyBeforeBuy, "BUY: totalSupply changed (must not mint/burn)");
         require(swap.isQuoteUsed(1), "BUY: quoteId 1 not consumed");
         console2.log("[5] BUY executed at NAV");
         console2.log("    taker tokens: %d (10e18)", token.balanceOf(taker));
-        console2.log("    swap USDC:    %d (+1000 USDC)", usdc.balanceOf(address(swap)));
+        console2.log("    swap USDC:    %d (+10 USDC)", usdc.balanceOf(address(swap)));
         console2.log("    totalSupply:  %d (unchanged)", token.totalSupply());
 
         // ── Step 6: REDEEM leg ───────────────────────────────────────────────
@@ -209,7 +215,7 @@ contract AtomicSettlementFlow is Script {
             tokenIn: address(token),
             maxAmountIn: 10e18, // pays back up to 10 bond tokens
             tokenOut: address(usdc),
-            price: 1_000e6 * 1e18 / 10e18, // 1,000 USDC per 10 bond tokens (exactly at NAV)
+            price: 10e6 * 1e18 / 10e18, // 10 USDC per 10 bond tokens (exactly at NAV)
             // Inside GyldAtomicSwap.DEFAULT_MAX_QUOTE_TTL (90s), with slack to spare.
             expiry: uint64(block.timestamp + 60 seconds),
             epoch: 0
@@ -223,22 +229,22 @@ contract AtomicSettlementFlow is Script {
 
         require(token.balanceOf(taker) == 0, "REDEEM: taker tokens not debited");
         require(token.balanceOf(address(swap)) == swapTokensBeforeRedeem + 10e18, "REDEEM: tokens not back in swap");
-        require(usdc.balanceOf(taker) == takerUsdcBeforeRedeem + 1_000e6, "REDEEM: taker did not get USDC back");
-        require(usdc.balanceOf(taker) == 100_000e6, "REDEEM: taker not made whole on round trip");
+        require(usdc.balanceOf(taker) == takerUsdcBeforeRedeem + 10e6, "REDEEM: taker did not get USDC back");
+        require(usdc.balanceOf(taker) == 1_000e6, "REDEEM: taker not made whole on round trip");
         require(swap.isQuoteUsed(2), "REDEEM: quoteId 2 not consumed");
         console2.log("[6] REDEEM executed at NAV");
         console2.log("    taker tokens: %d (back to 0)", token.balanceOf(taker));
-        console2.log("    taker USDC:   %d (100000 USDC, full round trip)", usdc.balanceOf(taker));
+        console2.log("    taker USDC:   %d (1000 USDC, full round trip)", usdc.balanceOf(taker));
         console2.log("    swap tokens:  %d (collateral returned)", token.balanceOf(address(swap)));
 
         // ── Step 7: WITHDRAW leg (treasurer evacuates NET USDC to the wallet) ─
         uint256 walletUsdcBefore = usdc.balanceOf(deployer);
         uint256 swapUsdcBeforeWithdraw = usdc.balanceOf(address(swap));
         vm.broadcast(DEPLOYER_PK); // treasurer = deployer (acct[0]); a bare vm.broadcast() would sign with anvil acct[1], which holds no roles
-        swap.withdraw(address(usdc), 1_000e6);
-        require(usdc.balanceOf(deployer) == walletUsdcBefore + 1_000e6, "WITHDRAW: wallet not credited");
-        require(usdc.balanceOf(address(swap)) == swapUsdcBeforeWithdraw - 1_000e6, "WITHDRAW: swap not debited");
-        console2.log("[7] WITHDRAW: 1000 USDC evacuated to withdrawalWallet (%s)", deployer);
+        swap.withdraw(address(usdc), 10e6);
+        require(usdc.balanceOf(deployer) == walletUsdcBefore + 10e6, "WITHDRAW: wallet not credited");
+        require(usdc.balanceOf(address(swap)) == swapUsdcBeforeWithdraw - 10e6, "WITHDRAW: swap not debited");
+        console2.log("[7] WITHDRAW: 10 USDC evacuated to withdrawalWallet (%s)", deployer);
 
         console2.log("");
         console2.log("=== FLOW OK: deploy -> NAV -> wire -> seed -> BUY -> REDEEM -> WITHDRAW all asserted ===");

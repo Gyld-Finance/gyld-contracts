@@ -451,7 +451,9 @@ contract IssuanceManagerTest is Test {
     }
 
     function testFuzz_subscribe_redeem_roundTrip(uint256 amount) public {
-        amount = bound(amount, 1e18, 1_000_000e18);
+        // Upper bound is the daily cap (FIND-001) — above it subscribe fails closed,
+        // which test_subscribe_revertsOverDailyCap covers directly.
+        amount = bound(amount, 1e18, mgr.DEFAULT_DAILY_CAP());
 
         _subscribeAp(amount);
         _apSendsToMgr(amount);
@@ -490,6 +492,32 @@ contract IssuanceManagerTest is Test {
         vm.prank(admin);
         mgr.renounceRole(whitelistAdminRole, admin);
         assertFalse(mgr.hasRole(whitelistAdminRole, admin));
+    }
+
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(mgr.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, admin);
+        assertTrue(mgr.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); mgr.grantRole(adminRole, timelock);
+        vm.prank(admin); mgr.revokeRole(adminRole, admin);
+        assertFalse(mgr.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, timelock);
     }
 
     // ── registerToken interface validation (GYL-298) ──────────────────────────
@@ -599,6 +627,135 @@ contract IssuanceManagerTest is Test {
             "a registered token must NOT appear in whitelisted's slot (fields swapped?)"
         );
     }
+    // ── Daily mint cap (audit FIND-001) ───────────────────────────────────────
+
+    address pauser = address(0xA5);
+
+    function test_dailyCap_defaultsTo10k() public view {
+        assertEq(mgr.dailyCap(address(token)), 10_000e18);
+    }
+
+    /// The finding: subscribe() bounded nothing, so one online key could mint without limit.
+    function test_subscribe_revertsOverDailyCap() public {
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), 10_000e18 + 1, 10_000e18));
+        mgr.subscribe(address(token), ap, 10_000e18 + 1);
+    }
+
+    /// The cap must hold across many small mints, not just one large one.
+    function test_subscribe_capIsCumulativeWithinTheDay() public {
+        for (uint256 i = 0; i < 10; i++) {
+            vm.prank(subscriber);
+            mgr.subscribe(address(token), ap, 1_000e18);
+        }
+        (uint256 minted,) = mgr.mintedToday(address(token));
+        assertEq(minted, 10_000e18);
+
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), 10_000e18));
+        mgr.subscribe(address(token), ap, 1);
+    }
+
+    function test_subscribe_windowResetsAfterADay() public {
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, 10_000e18);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, 10_000e18);
+        assertEq(token.totalSupply(), 20_000e18);
+    }
+
+    /// One second early must NOT reset, or the cap is bypassable by waiting slightly less.
+    function test_subscribe_windowDoesNotResetEarly() public {
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, 10_000e18);
+
+        vm.warp(block.timestamp + 1 days - 1);
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), 10_000e18));
+        mgr.subscribe(address(token), ap, 1);
+    }
+
+    function test_setDailyCap_raisesAndZeroRestoresDefault() public {
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), 50_000e18);
+        assertEq(mgr.dailyCap(address(token)), 50_000e18);
+
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, 50_000e18);
+
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), 0);
+        assertEq(mgr.dailyCap(address(token)), 10_000e18, "zero restores the default");
+    }
+
+    /// Usage.minted is a uint192 and subscribe casts to it explicitly, which Solidity does
+    /// not check — a cap above that range would truncate the running total and silently
+    /// reset the counter. The setter is the only place that can create one.
+    function test_setDailyCap_rejectsCapAboveUint192() public {
+        uint256 tooBig = uint256(type(uint192).max) + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.InvalidCap.selector, tooBig));
+        mgr.setDailyCap(address(token), tooBig);
+
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), type(uint192).max); // the boundary itself is fine
+        assertEq(mgr.dailyCap(address(token)), type(uint192).max);
+    }
+
+    /// A cap the online key could raise would not be a cap.
+    function test_setDailyCap_subscriberCannotRaiseIt() public {
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.setDailyCap(address(token), type(uint256).max);
+    }
+
+    // ── Pause ─────────────────────────────────────────────────────────────────
+
+    function _grantPauser() internal {
+        bytes32 role = mgr.ISSUANCE_PAUSER_ROLE();
+        vm.prank(admin);
+        mgr.grantRole(role, pauser);
+    }
+
+    function test_pauseIssuance_blocksSubscribe() public {
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    /// Redeem stays open: trapping APs mid-incident makes the incident worse.
+    function test_pauseIssuance_leavesRedeemOpen() public {
+        vm.prank(whitelistAdmin); mgr.addToWhitelist(address(mgr));
+        vm.prank(subscriber); mgr.subscribe(address(token), address(mgr), 10e18);
+
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(redeemer);
+        mgr.redeem(address(token), ap, 10e18);
+        assertEq(token.totalSupply(), 0);
+    }
+
+    /// Asymmetric, like the swap (D-14): pauser stops it, only the timelock restarts it.
+    function test_unpauseIssuance_isTimelockOnly() public {
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(pauser);
+        vm.expectRevert();
+        mgr.unpauseIssuance();
+
+        vm.prank(admin); mgr.unpauseIssuance();
+        vm.prank(subscriber); mgr.subscribe(address(token), ap, 1e18);
+    }
 }
 
 /// @dev Malicious token that attempts to re-enter IssuanceManager on burn() or mint().
@@ -646,6 +803,7 @@ contract ReentrantToken {
             _mgr.subscribe(address(this), _mintRecipient, _mintAmount);
         }
     }
+
 }
 
 // Forge cheatcode interface needed inside ReentrantToken

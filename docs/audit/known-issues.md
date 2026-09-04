@@ -10,7 +10,7 @@ this document and `ci/slither-baseline.json` are kept in step by the build.
 | solc | 0.8.28, `via_ir = true`, `optimizer_runs = 200` |
 | Command | `slither .` (unfiltered — see *The `--filter-paths` trap* below) |
 | Results, whole tree | **1,956** |
-| Results touching `contracts/*.sol` | **48** (44 unique fingerprints) |
+| Results touching `contracts/*.sol` | **49** (45 unique fingerprints) |
 | Live defects found | **0** |
 
 The other ~1,908 results are in `lib/` — OpenZeppelin v5.3.0 and forge-std. They
@@ -44,16 +44,23 @@ unit of precision. The error is ≤ 1 unit of USDC (1e-6 USD) on a *tolerance
 band*, not on a transferred amount. No value moves on this number — it only
 widens or narrows the window a signed quote must fall inside.
 
-### `incorrect-equality` ×5 — `KaleidoscopeNAVFeed` — **False positive**
+### `incorrect-equality` ×6 — `KaleidoscopeNAVFeed` — **False positive**
 
-`getRoundData`, `isFresh`, `latestAnswer`, `latestRoundData`, `stalenessSeconds`,
-all on `_updatedAt == 0`.
+`getRoundData`, `isFresh`, `latestAnswer`, `latestRoundData`, `stalenessSeconds`
+and `emergencyUpdateAnswer`, all on `_updatedAt == 0` (`emergencyUpdateAnswer`
+additionally on `lastEmergencyAt != 0`, the same never-written sentinel shape —
+audit FIND-003).
 
 The detector looks for strict equality against a value an attacker can land on.
 `_updatedAt` is a `block.timestamp` written on every push, and `0` is its
 *never-written sentinel* — the feed reverts `NoPriceSet` on it. Timestamp 0 is
 not reachable on any live chain, so there is no equality to grind toward. A `<= 0`
 or `< 1` rewrite would be strictly less clear and no safer.
+
+`lastEmergencyAt != 0` is the same pattern one step over: zero means "no emergency
+correction has ever run", and the guard exists so the **first** one is not refused
+by a cooldown measured against an unset slot. Reaching it would require
+`block.timestamp == 0`.
 
 ### `unused-return` — `GyldAtomicSwap._checkQuoteBand` — **Accepted, D-18**
 
@@ -115,15 +122,44 @@ bytecode the factory itself just wrote — not attacker-controlled. There is no
 untrusted re-entry point, and `deployToken` is `onlyOwner` (the timelock in
 production) and `nonReentrant` besides.
 
-### `timestamp` ×9 — **False positive**
+### `timestamp` ×12 — **False positive**
 
 `GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
-freshness), `NAVFeedForwarder` (future-date probe).
+freshness, and the emergency cooldown / signature deadline — audit FIND-003),
+`NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
+cap window, audit FIND-001), `TokenFactory.deployToken` (past-maturity check,
+audit FIND-009).
 
 Every comparison is on an **hour-to-day** scale: `MIN_UPDATE_INTERVAL` is 1 hour,
-`maxNavAgeSecs` is ceilinged at 72 hours, quote TTL at 10 minutes. Proposer
-timestamp latitude is seconds. There is no threshold here a validator could
-straddle to gain anything.
+`EMERGENCY_COOLDOWN` is 1 hour, `maxNavAgeSecs` is ceilinged at 72 hours, quote
+TTL at 10 minutes, and the issuance `CAP_WINDOW` is 24 hours. Proposer timestamp
+latitude is seconds. There is no threshold here a validator could straddle to gain
+anything.
+
+`emergencyUpdateAnswer` deserves the explicit note, because it is the one function
+that *skips* `MIN_UPDATE_INTERVAL` and so has no rate guard of its own besides the
+1 h cooldown. A proposer with seconds of latitude who moved `block.timestamp`
+across that boundary would buy one emergency correction marginally early — and
+that correction still needs **both** keys and still lands inside $0.50-$2.00, so
+the latitude grants no capability the pair did not already have. The `deadline`
+comparison is the owner's own chosen expiry, measured in minutes to hours.
+
+`TokenFactory.deployToken` is the loosest of all: `maturityTimestamp` is a bond
+maturity, months to years out, compared once at deployment to reject a date
+already in the past. A proposer with seconds of latitude cannot move a date
+across that boundary in either direction, and the call is `onlyOwner` (the
+timelock) besides. The check is a payload sanity gate, not a security control —
+D-25 is explicit that maturity is never enforced after deployment.
+
+The issuance window deserves the explicit version, because it is the one where
+straddling a boundary *does* buy something: a mint at the end of one window and
+another at the start of the next yields two daily budgets, so the real bound is
+2× the cap per rolling 24 h. That is a property of a fixed resetting window, not
+of timestamp latitude — it holds at any clock precision, and moving the boundary
+by a few seconds neither creates nor widens it. The same design ships in Ondo's
+`InstantMintTimeBasedRateLimiter`. It is documented on `CAP_WINDOW` and in the
+FIND-001 remediation; the answer if a hard 1× bound is ever required is to halve
+the cap, not to chase sub-second accuracy.
 
 ---
 

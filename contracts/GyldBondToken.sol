@@ -72,7 +72,7 @@ contract GyldBondToken is
     struct GyldBondTokenStorage {
         ISanctionsList sanctionsList;
         string isin;
-        uint256 maturityTimestamp;
+        uint256 maturityTimestamp; // reference data only — never read on-chain (D-25)
         // ── IERC-1643 document management ────────────────────────────────────
         // Appended fields — ERC-7201 layout-safe for the UUPS upgrade of live proxies.
         mapping(bytes32 => Document) documents;
@@ -95,6 +95,7 @@ contract GyldBondToken is
     error ZeroAmount();
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
+    error CannotRemoveLastAdmin(); // audit FIND-007
     error NotValidSanctionsList(address addr);
     error SanctionsListNotSet();
     error EmptyDocumentName();
@@ -118,7 +119,8 @@ contract GyldBondToken is
     /// @param name_              Token name (e.g. "Gyld US Treasury Bond 2026-06")
     /// @param symbol_            Ticker (e.g. "GYLD-UST-2606")
     /// @param isin_              ISO 6166 ISIN, e.g. "US912797KR72"
-    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended.
+    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended. Reference data —
+    ///                           not enforced by any function. See maturityTimestamp().
     /// @param defaultAdmin       Should be a TimelockController in production.
     /// @param pauser             Ops multisig — separate from governance.
     /// @param sanctionsList_     Chainalysis on-chain sanctions oracle (read-only).
@@ -153,6 +155,13 @@ contract GyldBondToken is
     // ── Getters ───────────────────────────────────────────────────────────────
 
     function isin() external view returns (string memory) { return _getStorage().isin; }
+
+    /// @notice Maturity date of this series. OFF-CHAIN METADATA — NOT ENFORCED (audit FIND-009).
+    /// @dev    No function reads this value. mint(), transfer(), transferFrom() and
+    ///         IssuanceManager.subscribe() behave identically before and after it, so a matured
+    ///         series stays mintable and tradeable until operations retire it. Retiring is a
+    ///         deliberate manual step (D-25) — integrators must not infer a control here.
+    /// @return Unix maturity timestamp, or 0 for an open-ended series with no fixed maturity.
     function maturityTimestamp() external view returns (uint256) { return _getStorage().maturityTimestamp; }
     function sanctionsList() external view returns (ISanctionsList) { return _getStorage().sanctionsList; }
 
@@ -338,6 +347,27 @@ contract GyldBondToken is
     function renounceRole(bytes32 role, address callerConfirmation) public override {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
         super.renounceRole(role, callerConfirmation);
+    }
+
+    /// @dev Audit FIND-007. `renounceRole` above refuses DEFAULT_ADMIN_ROLE, but the role
+    ///      admins itself, so the sole holder could self-revoke into the same bricked state.
+    ///      Guarding `_revokeRole` covers both paths. Removing a NON-last admin is untouched
+    ///      — that is the deploy handover (grant successor, then self-revoke).
+    ///      `<= 1` not `== 1`: a proxy upgraded to this code never wrote the slot, so it reads
+    ///      0 while holding one admin; blocking there is the safe direction.
+    uint256 public defaultAdminCount;
+
+    function _grantRole(bytes32 r, address a) internal override returns (bool granted) {
+        granted = super._grantRole(r, a);
+        if (granted && r == DEFAULT_ADMIN_ROLE) defaultAdminCount++;
+    }
+
+    function _revokeRole(bytes32 r, address a) internal override returns (bool revoked) {
+        revoked = super._revokeRole(r, a);
+        if (revoked && r == DEFAULT_ADMIN_ROLE) {
+            if (defaultAdminCount <= 1) revert CannotRemoveLastAdmin();
+            defaultAdminCount--;
+        }
     }
 
     // ── UUPS upgrade authorization ────────────────────────────────────────────

@@ -28,6 +28,7 @@ contract GyldAtomicSwapTest is Test {
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
     event MaxQuoteTtlUpdated(uint64 newTtl);
+    event MaxNavAgeForSeriesUpdated(address indexed token, uint32 newSecs);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
 
     GyldAtomicSwap swap;
@@ -883,17 +884,262 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(0xD00D), address(navFeed));
     }
 
-    function test_deregisterSeries_nonEmpty_reverts() public {
+    // ── FIND-024: deregistration sweeps residual inventory ───────────────────
+
+    /// Residual inventory is swept to the withdrawalWallet in the same call.
+    function test_deregisterSeries_sweepsResidualInventory() public {
         // The swap still holds 1_000e18 of the series from setUp.
+        uint256 held = token.balanceOf(address(swap));
+        assertGt(held, 0, "precondition: swap holds inventory");
+        uint256 walletBefore = token.balanceOf(wallet);
+
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.SeriesNotEmpty.selector, address(token)));
         swap.deregisterSeries(address(token));
+
+        assertEq(token.balanceOf(address(swap)), 0, "swap inventory must be swept");
+        assertEq(token.balanceOf(wallet), walletBefore + held, "sweep must land in withdrawalWallet");
+        assertFalse(swap.registeredSeries(address(token)), "series must be deregistered");
+        assertEq(swap.navForwarderOf(address(token)), address(0), "forwarder must be cleared");
+    }
+
+    /// The sweep emits Withdrawn, so ops' existing log indexing picks it up.
+    function test_deregisterSeries_sweepEmitsWithdrawn() public {
+        uint256 held = token.balanceOf(address(swap));
+        vm.expectEmit(true, true, false, true, address(swap));
+        emit GyldAtomicSwap.Withdrawn(address(token), wallet, held);
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+    }
+
+    /// The FIND-024 griefing vector: an unprivileged holder re-seeds one wei to force
+    /// a fresh withdrawal plus a fresh 48 h cycle. The sweep carries the dust out instead.
+    function test_deregisterSeries_dustRefillCannotGrief() public {
+        // Operator clears inventory the old way first.
+        uint256 held = token.balanceOf(address(swap));
+        vm.prank(treasurer);
+        swap.withdraw(address(token), held);
+        assertEq(token.balanceOf(address(swap)), 0, "inventory cleared");
+
+        // An ordinary holder (passes sanctions screening, holds no role) re-seeds dust
+        // in the gap before the timelocked proposal executes.
+        address griefer = address(0xBEEF);
+        vm.prank(wallet);
+        token.transfer(griefer, 1);
+        vm.prank(griefer);
+        token.transfer(address(swap), 1);
+        assertEq(token.balanceOf(address(swap)), 1, "dust reintroduced");
+
+        // Deregistration still succeeds and carries the dust out.
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertFalse(swap.registeredSeries(address(token)), "dust must not block retirement");
+        assertEq(token.balanceOf(address(swap)), 0, "dust must be swept");
+    }
+
+    /// Both sides of the `residual != 0 && to == address(0)` guard: an empty series
+    /// retires with no wallet set; a residual balance is fail-closed, never burned.
+    function test_deregisterSeries_withdrawalWalletUnset_bothBranches() public {
+        GyldAtomicSwap freshImpl = new GyldAtomicSwap();
+        GyldAtomicSwap fresh = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(freshImpl),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, MAX_NAV_AGE)
+                    )
+                )
+            )
+        );
+        assertEq(fresh.withdrawalWallet(), address(0), "fresh proxy should have no withdrawalWallet");
+
+        // Zero balance needs no destination: the `residual != 0` conjunct short-circuits
+        // and the series retires even with the wallet unset.
+        vm.prank(admin);
+        fresh.registerSeries(address(token), address(navFeed));
+        assertEq(token.balanceOf(address(fresh)), 0, "precondition: fresh proxy holds nothing");
+        vm.prank(admin);
+        fresh.deregisterSeries(address(token));
+        assertFalse(fresh.registeredSeries(address(token)), "empty series must retire without a wallet");
+
+        // A residual balance with no destination is fail-closed rather than burned.
+        vm.prank(admin);
+        fresh.registerSeries(address(token), address(navFeed));
+        token.mint(address(fresh), 1e18); // this test contract holds MINTER_ROLE
+        vm.prank(admin);
+        vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
+        fresh.deregisterSeries(address(token));
+        assertTrue(fresh.registeredSeries(address(token)), "failed sweep must leave the series intact");
+    }
+
+    /// Zero balance means no transfer, so a paused token is no obstacle — this is the
+    /// zero-code remedy: withdraw to zero, pause, execute.
+    function test_deregisterSeries_pausedTokenZeroBalance_succeeds() public {
+        uint256 held = token.balanceOf(address(swap));
+        vm.prank(treasurer);
+        swap.withdraw(address(token), held);
+
+        vm.prank(pauser);
+        token.pause();
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertFalse(swap.registeredSeries(address(token)), "pause must not block an empty retirement");
+    }
+
+    /// With a residual balance the paused token blocks the sweep, via its own
+    /// whenNotPaused — not the swap's.
+    function test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause() public {
+        vm.prank(pauser);
+        token.pause();
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        swap.deregisterSeries(address(token));
+        assertTrue(swap.registeredSeries(address(token)), "failed sweep must leave the series intact");
     }
 
     function test_deregisterSeries_unregistered_reverts() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.UnregisteredSeries.selector, address(0xD00D)));
         swap.deregisterSeries(address(0xD00D));
+    }
+
+    // ── FIND-017: the registered series set is readable ──────────────────────
+
+    /// A second/third 18dp series, distinct from setUp's `token`. Nothing is minted, so
+    /// these retire through the empty branch of deregisterSeries' sweep.
+    function _newSeries(string memory symbol) internal returns (GyldBondToken) {
+        GyldBondToken impl = new GyldBondToken();
+        return GyldBondToken(
+            address(
+                new ERC1967Proxy(
+                    address(impl),
+                    abi.encodeCall(
+                        GyldBondToken.initialize,
+                        (symbol, symbol, "US912797KR72", 1_780_000_000, admin, pauser, address(mockSanctions))
+                    )
+                )
+            )
+        );
+    }
+
+    /// True if `needle` appears in the registry enumeration.
+    function _listed(address needle) internal view returns (bool) {
+        address[] memory all = swap.registeredSeriesList();
+        for (uint256 i = 0; i < all.length; i++) {
+            if (all[i] == needle) return true;
+        }
+        return false;
+    }
+
+    /// The whole point of the finding: before this, the set could only be recovered by
+    /// replaying SeriesRegistered/SeriesDeregistered or hand-computing the ERC-7201 slot
+    /// for eth_getStorageAt — both offchain-only, so no contract could enumerate it.
+    function test_seriesEnumeration_exposesRegisteredSet() public {
+        // setUp registered exactly one series.
+        address[] memory one = swap.registeredSeriesList();
+        assertEq(one.length, 1, "setUp registers one series");
+        assertEq(one[0], address(token), "the setUp series must be listed");
+
+        GyldBondToken b = _newSeries("GYLD-B");
+        GyldBondToken c = _newSeries("GYLD-C");
+        vm.startPrank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+        swap.registerSeries(address(c), address(navFeed));
+        vm.stopPrank();
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 3, "three series registered");
+        assertEq(all[0], address(token), "registration order is append");
+        assertEq(all[1], address(b));
+        assertEq(all[2], address(c));
+
+        // Enumeration and the membership mapping must agree in both directions.
+        for (uint256 i = 0; i < all.length; i++) {
+            assertTrue(swap.registeredSeries(all[i]), "every enumerated entry must be registered");
+        }
+        assertFalse(swap.registeredSeries(address(usdc)), "control: a non-series must not be registered");
+        assertFalse(_listed(address(usdc)), "control: a non-series must not be listed");
+    }
+
+    /// Re-registering a live series (the documented forwarder-rotation path) must update
+    /// the forwarder WITHOUT appending a second array entry — otherwise deregistration
+    /// leaves a phantom behind, since the swap-and-pop scan breaks on the first match.
+    function test_registerSeries_reRegisterLive_doesNotDuplicateEntry() public {
+        MockNavForwarder rotated = new MockNavForwarder(NAV);
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(rotated));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "re-registration must not append a duplicate");
+        assertEq(all[0], address(token));
+        assertEq(swap.navForwarderOf(address(token)), address(rotated), "forwarder must be rotated");
+    }
+
+    /// Deregistering a MIDDLE entry is swap-and-pop: the tail moves into the hole. This
+    /// is exactly the position instability registeredSeriesList's NatSpec warns about,
+    /// so pin it rather than leave it to be discovered against a live proxy.
+    function test_deregisterSeries_middleEntry_swapAndPopReorders() public {
+        GyldBondToken b = _newSeries("GYLD-B");
+        GyldBondToken c = _newSeries("GYLD-C");
+        vm.startPrank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+        swap.registerSeries(address(c), address(navFeed));
+        vm.stopPrank();
+        assertEq(swap.registeredSeriesList()[1], address(b), "precondition: b sits at position 1");
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(b));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 2, "one entry removed");
+        assertFalse(swap.registeredSeries(address(b)), "b must be deregistered");
+        assertFalse(_listed(address(b)), "the retired series must not appear in the list");
+        // The tail (c) took b's position — a caller that cached position 1 now reads a
+        // DIFFERENT series, with no revert to signal it.
+        assertEq(all[1], address(c), "swap-and-pop moves the tail into the hole");
+        assertEq(all[0], address(token), "untouched entries keep their position");
+    }
+
+    /// Removing the TAIL is a plain pop: nothing else moves.
+    function test_deregisterSeries_lastEntry_popsWithoutReordering() public {
+        GyldBondToken b = _newSeries("GYLD-B");
+        vm.prank(admin);
+        swap.registerSeries(address(b), address(navFeed));
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(b));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "tail pop leaves one entry");
+        assertEq(all[0], address(token), "the head must not move");
+    }
+
+    /// Retiring every series empties the enumeration rather than leaving stale entries.
+    function test_seriesEnumeration_emptyAfterAllDeregistered() public {
+        // setUp's series still holds inventory; the sweep carries it out.
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+
+        assertEq(swap.registeredSeriesList().length, 0, "list must be empty");
+        assertFalse(_listed(address(token)), "the retired series must not appear in the list");
+    }
+
+    /// Deregister then re-register appends exactly one entry — the push guard keys off
+    /// the mapping, which deregisterSeries cleared.
+    function test_deregisterSeries_thenReregister_appendsOnce() public {
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertEq(swap.registeredSeriesList().length, 0, "precondition: registry emptied");
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(navFeed));
+
+        address[] memory all = swap.registeredSeriesList();
+        assertEq(all.length, 1, "re-registration must append exactly one entry");
+        assertEq(all[0], address(token));
+        assertTrue(swap.registeredSeries(address(token)));
     }
 
     // ── Pause ─────────────────────────────────────────────────────────────────
@@ -1289,6 +1535,32 @@ contract GyldAtomicSwapTest is Test {
         swap.renounceRole(adminRole, admin);
     }
 
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(swap.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(GyldAtomicSwap.CannotRemoveLastAdmin.selector);
+        swap.revokeRole(adminRole, admin);
+        assertTrue(swap.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); swap.grantRole(adminRole, timelock);
+        vm.prank(admin); swap.revokeRole(adminRole, admin);
+        assertFalse(swap.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(GyldAtomicSwap.CannotRemoveLastAdmin.selector);
+        swap.revokeRole(adminRole, timelock);
+    }
+
     /// DEFAULT_ADMIN_ROLE is the ONLY non-renounceable role. The incident-response pair
     /// stays renounceable on purpose (F-7 was considered and rejected): a holder who knows
     /// their key is compromised must be able to shed the role immediately rather than wait
@@ -1545,5 +1817,128 @@ contract GyldAtomicSwapTest is Test {
         swap.upgradeToAndCall(address(newImpl), "");
 
         assertEq(swap.maxQuoteTtl(), 5 minutes, "a configured TTL must survive the upgrade");
+    }
+
+    // ── Per-series maxNavAgeSecs (audit FIND-022) ─────────────────────────────
+
+    /// Unset means "follow the global", never "zero seconds". This is the property that
+    /// keeps a proxy upgraded across the mapping's addition working: every series reads
+    /// 0 from the fresh slot, and 0 must resolve to the pre-upgrade behaviour.
+    function test_maxNavAgeSecsFor_unsetFallsBackToGlobal() public view {
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), swap.maxNavAgeSecs());
+    }
+
+    /// An unregistered address has no override and no series, but the view must still
+    /// resolve rather than revert — it reports what the global would apply.
+    function test_maxNavAgeSecsFor_unknownTokenReportsGlobal() public view {
+        assertEq(swap.maxNavAgeSecsFor(address(0xDEAD)), MAX_NAV_AGE);
+    }
+
+    function test_setMaxNavAgeSecsFor_overridesOnlyThatSeries() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 3 hours, "series follows its override");
+        assertEq(swap.maxNavAgeSecs(), MAX_NAV_AGE, "the global is untouched");
+    }
+
+    function test_setMaxNavAgeSecsFor_emits() public {
+        vm.expectEmit(true, false, false, true, address(swap));
+        emit MaxNavAgeForSeriesUpdated(address(token), 3 hours);
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+    }
+
+    /// Zero is the CLEAR sentinel here, not a literal age — the one place this setter's
+    /// zero differs from setMaxNavAgeSecs, where zero is rejected.
+    function test_setMaxNavAgeSecsFor_zeroClearsBackToGlobal() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 3 hours);
+
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 0);
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "cleared, not zero seconds");
+    }
+
+    /// The 72 h ceiling (D-16) must bind per-series too. An override that escaped it
+    /// would reopen exactly the no-op the global ceiling exists to prevent.
+    function test_setMaxNavAgeSecsFor_respectsGlobalCeiling() public {
+        uint32 over = uint32(72 hours) + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavAge.selector, over));
+        swap.setMaxNavAgeSecsFor(address(token), over);
+
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), uint32(72 hours));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), 72 hours, "the ceiling itself is allowed");
+    }
+
+    function test_setMaxNavAgeSecsFor_unregisteredSeriesReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.UnregisteredSeries.selector, address(0xDEAD)));
+        swap.setMaxNavAgeSecsFor(address(0xDEAD), 3 hours);
+    }
+
+    function test_setMaxNavAgeSecsFor_nonAdminReverts() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+    }
+
+    /// The point of the whole change: the override must actually govern the hot path.
+    /// A feed age that clears the 24 h global must still fail a 3 h series override.
+    function test_executeSwap_perSeriesOverrideTightensStaleNav() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        uint256 age = block.timestamp - (3 hours + 1); // fine globally, stale for this series
+        navFeed.setUpdatedAt(age);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(91);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.StaleNav.selector, address(token), age));
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    /// And the converse: inside the override the same swap settles, so the override is
+    /// governing rather than merely being stored.
+    function test_executeSwap_withinPerSeriesOverrideSucceeds() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+        navFeed.setUpdatedAt(block.timestamp - 2 hours);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(92);
+        bytes memory sig = _sign(m, SIGNER_PK);
+        vm.prank(taker);
+        usdc.approve(address(swap), 1_000e6);
+
+        uint256 before = token.balanceOf(taker);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+        assertEq(token.balanceOf(taker) - before, 10e18, "the swap settled inside the override");
+    }
+
+    /// An override must not outlive its series: a re-registered token would otherwise
+    /// silently inherit a matured series' threshold.
+    function test_deregisterSeries_clearsPerSeriesOverride() public {
+        vm.prank(admin);
+        swap.setMaxNavAgeSecsFor(address(token), 3 hours);
+
+        // Drain inventory first — deregisterSeries refuses to orphan a balance.
+        vm.prank(treasurer);
+        swap.withdraw(address(token), 1_000e18);
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "override died with the series");
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(navFeed));
+        assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "re-registration does not resurrect it");
     }
 }

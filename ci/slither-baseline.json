@@ -34,6 +34,11 @@
     {
       "check": "incorrect-equality",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
     {
@@ -183,6 +188,16 @@
     },
     {
       "check": "timestamp",
+      "file": "contracts/IssuanceManager.sol",
+      "element": "subscribe"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
+    },
+    {
+      "check": "timestamp",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
@@ -215,6 +230,11 @@
       "check": "timestamp",
       "file": "contracts/NAVFeedForwarder.sol",
       "element": "_probeNotFutureDated"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/TokenFactory.sol",
+      "element": "deployToken"
     },
     {
       "check": "unused-return",

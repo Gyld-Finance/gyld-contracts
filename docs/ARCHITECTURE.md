@@ -4,8 +4,8 @@
 each contract is for, how they interact, who holds which key, what fails closed
 and what does not.
 
-Verified against the Solidity on `main` @ `0678230` (524 tests,
-20 suites, all passing). Every claim here was checked against the source at the
+Verified against the Solidity on `main` @ `0678230` (646 tests,
+21 suites, all passing). Every claim here was checked against the source at the
 time of writing.
 
 | | |
@@ -134,8 +134,8 @@ Rust crates that do not exist in this tree, and it has been removed.
                             KaleidoscopeNAVFeed
                             push oracle, Ownable2Step, NOT upgradeable
                                       ▲
-                                      │ updateAnswer(int256)   ← KMS signer
-                                      │   (the only write path — no bypass)
+                                      │ updateAnswer(int256)   ← KMS signer alone
+                                      │ emergencyUpdateAnswer  ← 2-of-2 (D-29)
                               Kaleidoscope backend
 
         ┌──────────────────────── Token layer ───────────────────────────┐
@@ -181,7 +181,7 @@ Two independent settlement paths reach the same token:
 | `GyldBondToken` | `contracts/GyldBondToken.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | ERC-20 per bond series. Fixed balances. Sanctions screen on every secondary transfer. Pausable. EIP-2612 permit. ERC-1643 document register (prospectus / supplements), `DOCUMENT_ROLE`-gated. |
 | `IssuanceManager` | `contracts/IssuanceManager.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | Single mint/burn gate for every series. AP whitelist. Token registry. |
 | `TokenFactory` | `contracts/TokenFactory.sol` | None (immutable) | `Ownable2Step` | Deploys the `(token proxy, NAV feed, forwarder)` triple per series and wires roles atomically. |
-| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | None (immutable) | `Ownable2Step` | Push NAV oracle in `AggregatorV3Interface` shape. Deviation cap and interval gate, both unconditional — `updateAnswer` is the only write path. |
+| `KaleidoscopeNAVFeed` | `contracts/KaleidoscopeNAVFeed.sol` | None (immutable) | `Ownable2Step` | Push NAV oracle in `AggregatorV3Interface` shape. Deviation cap and interval gate, both unconditional on `updateAnswer`. A second path, `emergencyUpdateAnswer`, skips them for a real market gap but is a 2-of-2 bounded to a strict subset of the normal range (D-29). |
 | `NAVFeedForwarder` | `contracts/NAVFeedForwarder.sol` | None (immutable) | `Ownable2Step` | Permanent DeFi-facing oracle address. Pure delegation to a swappable upstream. |
 | `SanctionsOracleMirror` | `contracts/SanctionsOracleMirror.sol` | None (immutable) | `AccessControl` | Platform sanctions oracle on **every** production EVM chain. Local list plus an optional gas-capped, fail-closed forward to a vendor oracle. |
 | `GyldAtomicSwap` | `contracts/GyldAtomicSwap.sol` | **UUPS** (ERC1967Proxy) | `AccessControl` | Self-custodial atomic USDC⇄bond settlement against signed EIP-712 quotes. Holds its own inventory. |
@@ -251,8 +251,14 @@ Inheritance: `Initializable`, `ERC20Upgradeable`, `ERC20PermitUpgradeable`,
 | Field | Getter | Example |
 |---|---|---|
 | ISIN | `isin() → string` | `"US912797KR72"` |
-| Maturity | `maturityTimestamp() → uint256` | `1788739200` (2028-09-06); `0` = open-ended |
+| Maturity | `maturityTimestamp() → uint256` | `1851811200` (2028-09-06); `0` = open-ended |
 | Sanctions oracle | `sanctionsList() → ISanctionsList` | the `SanctionsOracleMirror` address |
+
+> **`maturityTimestamp` is not enforced on-chain.** No function reads it — `mint`,
+> `transfer`, `transferFrom` and `IssuanceManager.subscribe` behave identically before and
+> after it, so a matured series stays mintable and tradeable until operations retire it.
+> `TokenFactory.deployToken` validates it is in the future (or `0`) at deploy time and
+> nothing checks it again. See **D-25**.
 
 `initialize(name, symbol, isin, maturityTimestamp, defaultAdmin, pauser, sanctionsList)`
 rejects a zero `defaultAdmin`, `pauser` or `sanctionsList`, and
@@ -496,7 +502,10 @@ deployToken(name, symbol, isin, maturityTimestamp, operator, issuanceManager, na
   │     grant  DEFAULT_ADMIN_ROLE  → owner()          (the Timelock in production)
   │     revoke PAUSER_ROLE         from address(this)
   │     revoke DEFAULT_ADMIN_ROLE  from address(this)
-  ├─ new KaleidoscopeNAVFeed(navFeedOwner, "<symbol> / USD NAV")
+  ├─ new KaleidoscopeNAVFeed(navFeedOwner, "<symbol> / USD NAV", operator)
+  │                                              ← operator is the NAV emergency
+  │                                                guardian (D-29); it SUBMITS,
+  │                                                navFeedOwner SIGNS
   ├─ new NAVFeedForwarder(navFeed, owner())    ← forwarder owner is the FACTORY OWNER,
   │                                              not navFeedOwner
   ├─ record _deployedIsins / navFeedOf / forwarderOf
@@ -559,17 +568,23 @@ calls. `decimals() == 8`, `version() == 3`.
 ```
 NAV per token = (bonds_held × bond_price_usd) / tokens_outstanding
 
-e.g. 1,000 TLT at $95.42 backing 10,000 tokens
-     → $9.542/token → answer = 954_200_000   (8 decimals)
+e.g. 1,000 TLT at $95.42 backing 95,420 tokens
+     → $1.00/token → answer = 100_000_000   (8 decimals)
+     token count is chosen at issuance so NAV starts at the $1.00 standard;
+     MIN_ANSWER/MAX_ANSWER ($0.10-$5.00) are sized for it (audit FIND-003)
 ```
 
 #### Constants
 
 | Constant | Value | What it actually does |
 |---|---|---|
-| `MAX_STALENESS` | **96 hours** | Threshold for the `isFresh()` **monitoring view only**. No read function reverts on staleness. Sized so `isFresh() == false` means "a push was missed", not "the market is closed": a normal weekend is ~65 h, a 3-day holiday weekend ~87 h, and 96 h clears both. |
-| `MIN_UPDATE_INTERVAL` | 1 hour | `updateAnswer` reverts `UpdateTooSoon` if called sooner. A security floor, not the operational cadence (which is once per market day). |
-| `MAX_PRICE_DEVIATION_BPS` | 1000 (**10 %**) | `updateAnswer` reverts `PriceDeviationTooLarge` if the new answer moves more than 10 % from the last. Applies only *after* the first push — the initial anchor has nothing to compare against and is accepted as-is. |
+| `stalenessThreshold` | **24 hours**, owner-settable | Threshold for the `isFresh()` **monitoring view only**. No read function reverts on staleness. Pinned to `GyldAtomicSwap.maxNavAgeSecs`, so `isFresh()` answers exactly "will `executeSwap` accept this NAV right now?" and goes false as settlement starts refusing rather than a day later. False over weekends by design — settlement is refusing then too. See [D-22](#171-adopted-and-current) (audit FIND-022). |
+| `DEFAULT_STALENESS_THRESHOLD` | 24 hours | The constructor's seed for `stalenessThreshold`. A `constant`; changing the live window is `setStalenessThreshold`, not a redeploy. Retune it whenever `maxNavAgeSecs` moves. |
+| `MIN_UPDATE_INTERVAL` | 1 hour | `updateAnswer` reverts `UpdateTooSoon` if called sooner. A security floor, not the operational cadence (which is once per market day). **Normal path only** — `emergencyUpdateAnswer` skips it (D-29). |
+| `MAX_PRICE_DEVIATION_BPS` | 1000 (**10 %**) | `updateAnswer` reverts `PriceDeviationTooLarge` if the new answer moves more than 10 % from the last. Applies only *after* the first push — the initial anchor has nothing to compare against and is accepted as-is. **Normal path only** — `emergencyUpdateAnswer` skips it (D-29). |
+| `MIN_ANSWER` / `MAX_ANSWER` | `1e7` / `5e8` (**$0.10 / $5.00**) | Absolute range, enforced on **every** push including the first, on **both** write paths. Retuned from $0.01/$10bn by audit FIND-003 for the $1.00 NAV standard; the old range was an anti-brick and anti-overflow guard only (below 10 raw units the deviation guard can never pass again; above ~5.8e72 its arithmetic overflows). This feed serves the $1.00 standard and nothing else. |
+| `EMERGENCY_MIN_ANSWER` / `EMERGENCY_MAX_ANSWER` | `5e7` / `2e8` (**$0.50 / $2.00**) | The band `emergencyUpdateAnswer` may land in. A **strict subset** of `MIN_ANSWER`-`MAX_ANSWER` — that relation is the security argument, so both are `constant` and neither may be retuned without the other (D-29). |
+| `EMERGENCY_COOLDOWN` | **1 hour**, equal to `MIN_UPDATE_INTERVAL` | Minimum gap between emergency corrections. Without a cooldown the two keys together hold a $0.50 ⇄ $2.00 oscillation primitive every block. Parity, not longer: a longer lock rate-limits the OPERATOR, not an attacker, who holds the hourly owner key anyway (D-29). |
 | `BPS_DENOMINATOR` | 10_000 | Basis-point denominator. |
 
 The deviation check is written to avoid division:
@@ -582,18 +597,34 @@ if (diff * int256(BPS_DENOMINATOR) > last * int256(MAX_PRICE_DEVIATION_BPS))
 
 #### Write paths
 
-| Function | Caller | Bypasses | Event |
-|---|---|---|---|
-| `updateAnswer(int256)` | `owner()` — the KMS signer | nothing | `AnswerUpdated` |
+| Function | Caller | Writes | Bypasses | Event |
+|---|---|---|---|---|
+| `updateAnswer(int256)` | `owner()` — the KMS signer | price, round, `updatedAt` | nothing | `AnswerUpdated` |
+| `emergencyUpdateAnswer(int256,uint256,bytes)` | `emergencyUpdater` (ops multisig) **calling**, `owner()` **signing** — both, always | price, round, `updatedAt`, nonce | `MIN_UPDATE_INTERVAL` **and** `MAX_PRICE_DEVIATION_BPS`. **Not** the absolute range, which tightens to $0.50-$2.00 here | `AnswerUpdated` **and** `EmergencyAnswerUpdated` |
+| `setStalenessThreshold(uint256)` | `owner()` — the KMS signer | `stalenessThreshold` only | nothing — it gates no guard | `StalenessThresholdUpdated` |
 
-**There is exactly one write path, and it has no privileged bypass.** Every guard
-— `answer > 0`, `MIN_UPDATE_INTERVAL`, `MAX_PRICE_DEVIATION_BPS` — is
-unconditional. A correction larger than 10 % is reached by *chaining* calls: the
-deviation band is measured against the **last stored** answer, and `last` moves
-with every push, so successive calls compound. See
-[§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) for the procedure and
-[D-19](#171-adopted-and-current) for why the bypass that used to live here was
-removed.
+**No single key can write price state past the guards.** `updateAnswer` is what the
+owner key reaches alone, and its guards — `MIN_ANSWER`/`MAX_ANSWER`,
+`MIN_UPDATE_INTERVAL`, `MAX_PRICE_DEVIATION_BPS` — are unconditional. A correction
+larger than 10 % is normally reached by *chaining* calls: the deviation band is
+measured against the **last stored** answer, and `last` moves with every push, so
+successive calls compound.
+
+`emergencyUpdateAnswer` is the one path past the interval and the band, and it is a
+**2-of-2** — the guardian calls, the owner signs, neither alone suffices — bounded
+absolutely to a **strict subset** of the range chaining already reaches, and
+rate-limited to the same 1-hour cadence as the routine path. It buys **latency, not reach**; it exists because
+chaining takes five hours during a real market gap, and for those five hours every
+clamped push refreshes `updatedAt` and so reads *fresh* while being knowingly wrong
+(audit FIND-003). See [D-29](#171-adopted-and-current), and
+[D-19](#171-adopted-and-current) for the appointable bypass that was removed and
+stays removed.
+
+`setStalenessThreshold` (D-22) is owner-only but touches no price, no round and no
+`updatedAt`, and no guard reads it — it retunes the `isFresh()` view and nothing
+else. What that adds to a compromised owner key is bounded and stated in
+[§6.3](#63-what-a-single-key-compromise-buys). See
+[§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) for the procedure.
 
 `renounceOwnership()` is disabled outright (GLD-165) and is the one carve-out that
 remains. The feed is not upgradeable and its reads never revert on staleness, so an
@@ -623,8 +654,8 @@ time-weighted-NAV requirement needs a new feed that stores a round history.
 The full reasoning for non-reverting reads is in [§11](#11-oracle-design).
 
 `stalenessSeconds()` returns a magnitude rather than a bool so an alerting rule
-can choose its own threshold (page at ~26 h, escalate at 96 h) instead of being
-pinned to `MAX_STALENESS`, and so a dashboard can chart the gap. The sentinel for
+can choose its own threshold (page at ~26 h on a market day, escalate at 48 h) instead of being
+pinned to `stalenessThreshold`, and so a dashboard can chart the gap. The sentinel for
 "never set" is `type(uint256).max` rather than `0` so a never-initialised feed
 can never be mistaken for a just-updated one.
 
@@ -898,7 +929,7 @@ if (buy == redeem) revert NotOneBondLeg(tokenIn, tokenOut);   // covers tokenIn 
 (, int256 nav,, uint256 updatedAt,) = INavForwarder(navForwarderOf[bondToken]).latestRoundData();
 if (nav <= 0)                                  revert InvalidNav(bondToken, nav);
 if (updatedAt > block.timestamp)               revert StaleNav(bondToken, updatedAt);   // F-6
-if (block.timestamp > updatedAt + maxNavAgeSecs) revert StaleNav(bondToken, updatedAt);
+if (block.timestamp > updatedAt + _effectiveMaxNavAge($, bondToken)) revert StaleNav(bondToken, updatedAt);
 
 navValue = tokenAmount * uint256(nav) / 1e20;       // 18dp bond × 8dp NAV / 1e20 = 6dp USDC
 band     = navValue * maxQuoteDeviationBps / 10_000;
@@ -936,7 +967,11 @@ usable `decimals()`" signal.
 semantics). **This consumer-side `StaleNav` check is therefore the only staleness
 defence anywhere in the swap path.**
 
-`maxNavAgeSecs` is admin-settable but structurally bounded:
+`maxNavAgeSecs` is admin-settable but structurally bounded. Since FIND-022 it is a
+global **default** rather than the only value: `setMaxNavAgeSecsFor(token, secs)` holds
+one series to its own threshold, read through `_effectiveMaxNavAge()` where zero means
+"unset, follow the global" (D-23). The same 72 h ceiling binds an override — a per-series
+escape from it would reopen exactly the no-op the ceiling prevents:
 
 ```
 0 < maxNavAgeSecs <= MAX_NAV_AGE_CEILING (72 hours)
@@ -1011,21 +1046,61 @@ decimals, pushes `token` onto `seriesList` if new, and sets
 `registeredSeries` / `navForwarderOf`. Re-registering an active series just
 updates its forwarder — which is also the escape hatch if a forwarder is bricked.
 
-`deregisterSeries(token)` reverts `SeriesNotEmpty` while the contract still holds
-any balance of the series: silently orphaning inventory that can no longer be
-priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
-mappings. The list is **not** externally observable, and **order is not stable
-across deregistrations** (invariant I-24).
+`deregisterSeries(token)` **sweeps** any residual balance of the series to the
+fixed `withdrawalWallet` and then retires it: it swap-and-pops `seriesList` and
+deletes all three mappings (`registeredSeries`, `navForwarderOf`,
+`maxNavAgeSecsOf`). The list is **not** externally observable, and **order is not
+stable across deregistrations** (invariant I-24). Silently orphaning inventory
+that can no longer be priced or served is unsafe — the sweep, not a
+balance precondition, is what prevents it.
 
-> **A paused bond token blocks deregistration too.** The only way to reach
-> `balanceOf(swap) == 0` is `withdraw`, and `withdraw` is precisely what a paused
-> bond token blocks (see *Treasury withdrawal* below). So a token pause silently
-> gates this second, unrelated admin operation: the retirement of a matured series
-> fails with a bare `SeriesNotEmpty(token)` that names the balance, not the pause
-> that is actually preventing you from clearing it — and via the timelock, 48 h
-> after the proposal. The runbook's unpause → withdraw → re-pause sequence is
-> therefore a **precondition for deregistration**, not just an evacuation remedy.
-> Check `token.paused()` before proposing.
+> **Why the sweep replaced the `SeriesNotEmpty` guard (audit FIND-024, D-24).**
+> The old form required `balanceOf(swap) == 0` *at execution time*. Clearing the
+> balance needs a separate `withdraw` (`TREASURER_ROLE`) and the deregistration
+> itself waits on the 48 h timelock, so the two were never atomic. Anything that
+> passes the token's sanctions screen — the only transfer gate
+> `GyldBondToken._update` carries, there is no transfer allowlist — could re-open
+> that window for **one wei** of dust, costing the operator a fresh withdrawal plus
+> a fresh 48 h cycle each time, for the price of one ERC-20 transfer. The
+> asymmetry ran strongly against the defender and needed no privilege. Clearing
+> and retiring are now one call, so there is no gap to race.
+>
+> A dust *threshold* was rejected as the remedy: an attacker simply sends
+> `threshold + 1`, and a threshold additionally licenses orphaning real inventory.
+
+**Fail-closed on an unset `withdrawalWallet`**, matching `withdraw`: with a
+residual balance and no destination the call reverts `ZeroAddress` rather than
+burning inventory to `address(0)`. A zero balance needs no destination and
+deregisters regardless.
+
+**CEI and reentrancy.** Registry writes land before the sweep, which is the only
+external call and is covered by `nonReentrant` — the same guard `executeSwap` and
+`withdraw` share (I-17), so a hostile inventory token cannot re-enter on its
+transfer hook and observe a half-removed series. The sweep emits `Withdrawn` so it
+appears in the log stream ops already index for the withdrawal path.
+
+**DEFAULT_ADMIN_ROLE gains a token-moving path that does not require
+`TREASURER_ROLE`** — called out because the two concerns are deliberately separated
+elsewhere (see `setWithdrawalWallet`). Per call the destination is the fixed
+`withdrawalWallet`, but the admin sets that too, so `setWithdrawalWallet` +
+`deregisterSeries` can drain a registered series to an arbitrary address where
+before it took a UUPS upgrade. **No new trust assumption** — same role, same 48 h
+timelock, and `_authorizeUpgrade` is already `DEFAULT_ADMIN_ROLE`, so the inventory
+was always reachable. What is genuinely lost is friction and visibility: the
+upgrade ceremony and its `ci/check_storage_layout.py` review gate. Bounded (only
+registered series, and `registerSeries` demands `decimals() == 18`, so the USDC
+float is unreachable) and loud (`SeriesDeregistered` + `Withdrawn`, registry entry
+destroyed).
+
+> **A paused bond token blocks the sweep, not the deregistration.** The transfer
+> calls `GyldBondToken.transfer`, which is `whenNotPaused`, so with a residual
+> balance the revert is `EnforcedPause` — raised on the token, not here (see
+> *Treasury withdrawal* below). With a **zero** balance there is no transfer and a
+> paused token is no obstacle. That ordering is also the cheapest operational
+> answer to the griefing above and needs no code: **withdraw to zero → pause the
+> token → execute the proposal.** The pause blocks the attacker's dust transfer,
+> `balanceOf` still reads zero, and the retirement goes through. For a matured
+> series being retired anyway, the pause costs nothing.
 
 #### Treasury withdrawal
 
@@ -1049,7 +1124,7 @@ Three deliberate properties:
 - **Not `whenNotPaused`.** The treasury drain must work during an incident pause
   so inventory can be evacuated. It shares the `nonReentrant` guard with
   `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer
-  hook to enter `executeSwap` (I-17).
+  hook to enter `executeSwap` (I-17). The `deregisterSeries` sweep shares it too.
 - **That exemption covers this contract's pause only — and a paused bond token
   still gates its own leg.** There are two independent pause switches. `withdraw`
   ignores the swap's. It cannot ignore the token's: moving a `GyldBondToken` calls
@@ -1057,9 +1132,10 @@ Three deliberate properties:
   by that modifier on `GyldBondToken.transfer` itself — not in the swap, and not in
   the token's `_update` (which carries only the sanctions check; the pause gate never
   reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
-  evacuates normally with both switches pulled. This also gates `deregisterSeries`,
-  which needs `balanceOf(swap) == 0` and so cannot succeed until the token is
-  unpaused long enough to withdraw — see *Series registration* above.
+  evacuates normally with both switches pulled. This also gates the
+  `deregisterSeries` **sweep** — a residual balance cannot leave until the token is
+  unpaused, though an already-empty series retires fine while paused (FIND-024,
+  D-24) — see *Series registration* above.
 
   This is a **design requirement, not a gap**. A pause that inventory can be moved
   through is not a pause; the token's pause is the stronger statement and is meant
@@ -1107,9 +1183,14 @@ rejected.** Recording why, because the argument looks persuasive until you check
   are unoverridden — so a renounce costs one `grantRole`, not a permanent loss.
 - **There is no accidental path.** OZ's `renounceRole(role, callerConfirmation)`
   requires `callerConfirmation == msg.sender`, so you cannot renounce someone else's
-  role or fat-finger an address into a self-renounce. Both roles are held by M-of-N
-  wallets in the deployed topology, so an "accident" would need a signing quorum to
-  approve a transaction whose only effect is surrendering their own role.
+  role or fat-finger an address into a self-renounce. The intended production topology
+  holds both roles in M-of-N wallets, so an "accident" would need a signing quorum to
+  approve a transaction whose only effect is surrendering their own role. **That is not
+  yet true of any live deployment** — [DEPLOYMENTS](../DEPLOYMENTS.md) records every
+  privileged role resting on the single deployer EOA `0xcEae…FEAd`, with the two
+  timelocks at `minDelay = 0` and that same EOA their sole proposer. Do not lean on the
+  quorum argument until the production wallets are actually in place; it is why the
+  FIND-007 guard (D-27) is enforced in code rather than assumed from the topology.
 - **A malicious renounce is pure self-harm.** A compromised `PAUSER` renouncing
   removes the defenders' halt but gains the attacker nothing — they had no use for
   `pause()`. A compromised `TREASURER` renouncing surrenders its own `withdraw()`,
@@ -1161,7 +1242,8 @@ production. This is the table to read first if you are auditing the system.
 | `IssuanceManager` | `WHITELIST_ADMIN_ROLE` | `addToWhitelist`, `removeFromWhitelist`, `addToWhitelistBatch` | Compliance ops Gnosis Safe | Yes |
 | `IssuanceManager` | `REGISTRAR_ROLE` | `registerToken`, `deregisterToken` | `TokenFactory` — **held permanently, never revoked** | Yes |
 | `TokenFactory` | `owner` (`Ownable2Step`) | `deployToken`; is also the address that receives `DEFAULT_ADMIN_ROLE` on every token and `owner` of every forwarder | **TimelockController** (48 h) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to factories deployed before it. |
-| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer` — **the only write path**, and it bypasses nothing | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
+| `KaleidoscopeNAVFeed` | `owner` (`Ownable2Step`) | `updateAnswer` — bypasses nothing; **the only write path this key reaches alone**. It must also **sign** every `emergencyUpdateAnswer`, but cannot call one (D-29). `setStalenessThreshold` (D-22) is also owner-only but writes no price and gates no guard | AWS KMS signer (Phase 1) → Fordefi MPC (Phase 2) | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-165). Not retrofitted to feeds deployed before it. |
+| `KaleidoscopeNAVFeed` | `emergencyUpdater` (`immutable`) | **Calls** `emergencyUpdateAnswer` and nothing else — and only with the owner's EIP-712 signature over the answer. **Submits; never signs.** Holds no other power on this contract | **Fordefi MPC ops wallet** — passed as `operator` to `deployToken`, the same key that holds `PAUSER_ROLE`. Signing stays on the KMS owner key, mirroring the swap (quote KMS signs, taker submits) | **N/A** — immutable, no setter, and `transferOwnership` refuses to hand ownership to it (D-29) |
 | `NAVFeedForwarder` | `owner` (`Ownable2Step`) | `setUpstreamOracle` | **TimelockController** — an EOA here is one key that can repoint every integrated market's price feed | **No** — `renounceOwnership()` reverts `CannotRenounceOwnership` (GLD-166). Not retrofitted to forwarders already deployed.
 | `SanctionsOracleMirror` | `DEFAULT_ADMIN_ROLE` | Grant/revoke roles; `setForwardingOracle` | Compliance ops Gnosis Safe | **No** |
 | `SanctionsOracleMirror` | `SANCTIONS_UPDATER_ROLE` | `addToSanctionsList`, `removeFromSanctionsList` | Keeper-bot hot wallet | Yes |
@@ -1191,10 +1273,13 @@ production. This is the table to read first if you are auditing the system.
   so that per-taker allowlisting does not need a 48 h governance proposal per
   user. It grants access to *swap*, never to funds or upgrades — that is what makes
   the carve-out acceptable.
-- **The NAV feed has no privileged bypass at all.** `updateAnswer` is the single
-  write path and its interval and deviation guards are unconditional, so the feed
-  owner's ceiling is genuinely 10 %/hour with no second key that lifts it
-  ([D-19](#171-adopted-and-current)).
+- **No single key can bypass the NAV write guards.** `updateAnswer`'s interval and
+  deviation guards are unconditional, so the feed owner's ceiling is genuinely
+  10 %/hour. The one path past them, `emergencyUpdateAnswer`, is a **2-of-2**: the
+  immutable guardian calls, the owner signs, and neither alone can reach it. Its
+  band is a strict subset of what chaining already reaches, so the pair buys speed
+  rather than new territory ([D-29](#171-adopted-and-current),
+  [D-19](#171-adopted-and-current)).
 - **Among *roles*, only `DEFAULT_ADMIN_ROLE` is non-renounceable.** (Separately,
   `KaleidoscopeNAVFeed.renounceOwnership()` reverts — GLD-165 — but that is
   ownership, not a role.) `PAUSER_ROLE` and
@@ -1212,11 +1297,13 @@ production. This is the table to read first if you are auditing the system.
 | `SUBSCRIBER_ROLE` | Mint arbitrary amounts of any registered token — but **only to a whitelisted AP** | Blast radius limited to KYC-approved addresses. Token pause stops it. Supply reconciliation should catch it. |
 | `REDEEMER_ROLE` | Burn the whole pooled `IssuanceManager` balance naming any whitelisted AP | Cannot redirect the off-chain USDC payment (a separate backend service keys off the `Redeemed` event's beneficiary). Cannot name a non-whitelisted address, so no payout results. Token pause stops it. |
 | `WHITELIST_ADMIN_ROLE` | Add an attacker-controlled address to the AP whitelist — which then makes it a legal mint target or redemption beneficiary | Needs `SUBSCRIBER_ROLE`/`REDEEMER_ROLE` as well to extract value. Whitelist events are cheap to monitor. |
-| `PAUSER_ROLE` (token) | Halt all token movement, including liquidations on Morpho and Euler | Denial of service, not theft. Note this **freezes DeFi liquidations** — undercollateralised positions cannot be closed until unpause. |
-| `QUOTE_SIGNER_ROLE` | Sign quotes at any price | Bounded by `maxQuoteDeviationBps` (deployed 2 %) against the on-chain NAV, **per trade**. The feed is written by a *different* key and is itself capped at ±10 % per hour, so one stolen key cannot both move the reference and exploit the band. Contained by `bumpQuoteEpoch`. |
+| `PAUSER_ROLE` (token) | Halt all token movement, including liquidations on Morpho and Euler | Denial of service, not theft. **Not independent of the `emergencyUpdater` row below:** for factory-deployed series both are `operator`, the same ops key (D-29 residual (e)). Note this **freezes DeFi liquidations** — undercollateralised positions cannot be closed until unpause. It does **not** freeze `borrow`, which moves only the loan token, so a pause is containment only when the wrong price is in the borrower's disfavour; against an *overstated* NAV it disables the remedy and leaves the harm reachable ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure), FIND-004). |
+| `QUOTE_SIGNER_ROLE` | Sign quotes at any price | Bounded by `maxQuoteDeviationBps` (deployed 2 %) against the on-chain NAV, **per trade**. The feed is written by a *different* key and is itself capped at ±10 % per hour, so one stolen key cannot both move the reference and exploit the band. (The emergency path moves NAV faster, but needs **two** further keys — neither of them this one — so it does not weaken this separation.) Contained by `bumpQuoteEpoch`. |
 | `ALLOWLIST_ADMIN_ROLE` | Allowlist an attacker address as a swap taker | Still needs a valid signed quote from `QUOTE_SIGNER_ROLE`, still bounded by the NAV band. No access to funds or upgrades. |
 | `TREASURER_ROLE` | Move all swap inventory out | **Only to the admin-fixed `withdrawalWallet`.** Cannot redirect. This is why the role is safe to keep live while paused — the swap's pause, that is; a paused bond token still blocks its own leg, by design — see §5.7 › *Treasury withdrawal*. |
-| `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV **±10 % per hour, and nothing faster** | Hard ceiling — the feed has no bypass function and no second privileged address, so this is the whole of what the key buys. A 25 % total move takes 3 hours of chained updates, which is enough time to detect it, pause the token and rotate the key. Every push emits `AnswerUpdated`. |
+| `KaleidoscopeNAVFeed.owner` (KMS) | Move NAV **±10 % per hour, and nothing faster**, within **$0.10-$5.00**; and retune the `isFresh()` window | Hard ceiling on price: **alone**, this key reaches no faster path. It must additionally *sign* an `emergencyUpdateAnswer`, but it cannot *call* one — that needs the immutable guardian (D-29, see the two rows below). So ±10 %/h remains the whole of what a stolen KMS key buys over NAV. A 25 % total move takes 3 hours of chained updates — enough time to detect it, pause the token and rotate the key. Every push emits `AnswerUpdated`. The one thing the key additionally buys since D-22 is `setStalenessThreshold`, which can widen the window until `isFresh()` reads `true` through any outage. That blinds **only the coarse boolean**: `stalenessSeconds()` returns a raw magnitude that no owner action can alter, and it — not `isFresh()` — is the designated monitoring entrypoint precisely so the alert does not depend on an on-chain threshold. The change also emits `StalenessThresholdUpdated`. A key that can already push a wrong price is not meaningfully more dangerous for being able to widen a view. |
+| `KaleidoscopeNAVFeed.emergencyUpdater` (ops multisig) | **Nothing, unless an owner signature is outstanding.** It can call `emergencyUpdateAnswer`, but every call carries an EIP-712 signature that must recover to `owner()` at execution time, and it holds no other power on the feed. With an unused, unexpired owner signature in hand it can replay that **one** answer — see D-29 residual (d) | **Zero on its own**, and otherwise bounded to one already-authorised price inside $0.50-$2.00. The guardian is a co-signature *requirement*, not a price authority. It is `immutable`, so a compromised owner cannot re-point it, and `transferOwnership` refuses to collapse the two roles onto one address. |
+| `owner` **and** `emergencyUpdater` **together** | One instant jump to any price in **$0.50-$2.00**, ignoring the 1 h interval and the 10 % band, at most once per hour; then back to ±10 %/h | **Reaches nothing the owner key could not already reach** — $0.50-$2.00 is a strict subset of $0.10-$5.00, which chaining covers in ≤ 32 hourly pushes. It buys **latency, not reach**. The one genuine gain is arriving *without the intermediate prices*, hence without the liquidations each would have fired — which is why it takes two keys. Both `AnswerUpdated` and `EmergencyAnswerUpdated` fire (D-29). |
 | `SANCTIONS_UPDATER_ROLE` (keeper) | Sanction arbitrary addresses (griefing) or un-sanction a designated one (evasion) | Cannot grant itself admin. Compliance multisig revokes and re-grants in one transaction. |
 | `TokenFactory` (holds `REGISTRAR_ROLE` forever) | If the factory were ever upgraded — it cannot be, it is immutable — or if its `owner` (the timelock) were compromised, `deployToken` could register a token | The factory has no `registerToken` passthrough, so the only reachable effect is registering a token it deploys itself. The residual `REGISTRAR_ROLE` is a **documentation defect, not an exploitable one** — but do not build a threat model that assumes the factory holds no permissions post-deploy. |
 
@@ -1443,7 +1530,7 @@ BUY, worked end to end
 | **Decimal probes** (F-1) | The `/1e20` ladder mis-scaling silently on a non-18dp series or non-6dp cash token. |
 | **Push, not allowance** | The Hashflow-June-2023 class: the swap grants **zero** outbound allowances, ever. Outbound funds move only by push; the only inbound `transferFrom` pulls from `msg.sender`. |
 | **Asymmetric pause** | A hot-key incident. `PAUSER_ROLE` halts cheaply; only the timelock resumes. `withdraw` stays live so inventory can be evacuated — past *this* contract's pause; a paused bond token still gates its own leg by design — see §5.7 › *Treasury withdrawal*. |
-| **CEI + shared reentrancy guard** | `_consumeQuote` is the only state write and precedes all external calls. `executeSwap` and `withdraw` share one guard, so a malicious inventory token's transfer hook cannot re-enter (I-17). |
+| **CEI + shared reentrancy guard** | `_consumeQuote` is the only state write and precedes all external calls. `executeSwap`, `withdraw` and the `deregisterSeries` sweep share one guard, so a malicious inventory token's transfer hook cannot re-enter (I-17). |
 | **Probe-before-store** | Fat-finger config: `registerSeries` probes forwarder `decimals()==8` and token `decimals()==18`; `initialize` probes USDC `decimals()==6`. |
 | **Permit griefing tolerance** | A front-run `permit()` cannot brick the swap — `try/catch` swallows it and `safeTransferFrom` enforces the allowance regardless. |
 
@@ -1633,8 +1720,10 @@ independently of the vault's own `totalAssets()`.
 
 ```
 Kaleidoscope backend (KMS signer)
-    │ updateAnswer(navPerToken)        ← ±10% per update, >= 1h apart
-    │                                    the ONLY write path; no bypass exists
+    │ updateAnswer(navPerToken)        ← ±10% per update, >= 1h apart, $0.10-$5.00
+    │                                    the only path ONE key reaches
+    │ emergencyUpdateAnswer(...)       ← 2-of-2: ops multisig calls, KMS owner signs.
+    │                                    skips both rate guards; $0.50-$2.00; max 1/h (D-29)
     ▼
 KaleidoscopeNAVFeed          AggregatorV3Interface + latestAnswer()
     │                        immutable, Ownable2Step, 8 decimals
@@ -1653,20 +1742,26 @@ all integrations follow.
 There is **no pull path**. Nothing on-chain can request a fresh NAV. If the keeper
 stops pushing, the feed keeps serving the last answer indefinitely.
 
-### 11.2 The three write-side guards
+### 11.2 The write-side guards
 
-All three are **unconditional**. `updateAnswer` is the feed's only write path and
-there is no privileged address, role or function that can skip any of them — see
-[D-19](#171-adopted-and-current).
+Every guard below is **unconditional on `updateAnswer`** — no address, role or
+function lets the owner key skip one. Two of them are skipped on the emergency path,
+which no single key can reach: it needs the immutable guardian to call *and* the
+owner to sign ([D-29](#171-adopted-and-current)).
 
-| Guard | Value | Enforced on |
-|---|---|---|
-| `MAX_PRICE_DEVIATION_BPS` | 1000 = **10 %** per update | `updateAnswer`, only after the first push |
-| `MIN_UPDATE_INTERVAL` | **1 hour** between pushes | `updateAnswer` |
-| `answer > 0` | — | `updateAnswer` |
+| Guard | Value | `updateAnswer` | `emergencyUpdateAnswer` |
+|---|---|---|---|
+| `MIN_ANSWER` / `MAX_ANSWER` | $0.10 / $5.00 | Every push, first included | Superseded by the tighter band below |
+| `EMERGENCY_MIN_ANSWER` / `EMERGENCY_MAX_ANSWER` | $0.50 / $2.00 | — | Every push. A **strict subset** of the range above |
+| `MAX_PRICE_DEVIATION_BPS` | 1000 = **10 %** per update | Yes, after the first push | **Skipped** — publishing a real gap in one step is the point |
+| `MIN_UPDATE_INTERVAL` | **1 hour** between pushes | Yes | **Skipped** |
+| `EMERGENCY_COOLDOWN` | **1 hour** (= `MIN_UPDATE_INTERVAL`) | — | Yes |
+| Owner EIP-712 signature over `(answer, nonce, deadline)` | — | — | Yes, recovered against `owner()` at execution time |
 
-`MAX_STALENESS` is **not** a write-side guard and **not** a circuit breaker. It
-gates only the `isFresh()` view. Changing it would change no on-chain guarantee.
+`stalenessThreshold` is **not** a write-side guard and **not** a circuit breaker.
+It gates only the `isFresh()` view. Changing it would change no on-chain guarantee
+— which is precisely why `setStalenessThreshold` carries no structural ceiling,
+unlike `setMaxNavAgeSecs` ([D-16](#171-adopted-and-current)). See [D-22](#171-adopted-and-current).
 
 Why 10 % is the right width for this asset class:
 
@@ -1677,10 +1772,16 @@ Why 10 % is the right width for this asset class:
 | IG corporate bonds | 0.2 % – 2 % | ~5 % (extreme stress) |
 
 A >10 % single-hour move in any of these would require a US sovereign default or
-similar. Legitimate large moves are published as chained updates: 15 % in 2 updates
-over 2 hours, 25 % in 3, 40 % in 4. For investment-grade bonds any move >10 % is a
-multi-day event unfolding over hours, so a 2–3 hour correction window is
-operationally fine.
+similar. Legitimate large moves are published as chained updates — but note the
+counts are **directional**, because the band compounds multiplicatively: upward,
+15 % takes 2 pushes, 25 % takes 3 and 40 % takes 4; **downward the same percentages
+take 2, 3 and 5**, because `0.9^4 = 0.656` clears only −34 %. The −40 % case is
+therefore a five-push, four-hour ramp, and audit FIND-003 is precisely about what
+happens during it: the feed serves a price the desk knows is wrong, and because
+every clamped push refreshes `updatedAt`, it reads *fresh* the whole way down. That
+is the case `emergencyUpdateAnswer` exists for ([D-29](#171-adopted-and-current));
+for a move that also leaves the $0.50-$2.00 band, chaining is still the only route
+and the runbook's Case C applies.
 
 The rate limit is also a **feature for borrowers**, not only a defence against
 malicious updates: gradual price discovery lets Morpho borrowers see each step, add
@@ -1689,20 +1790,30 @@ collateral or repay, and get liquidated only if they choose not to. A single-tra
 slippage for everyone.
 
 If Gyld ever tokenises high-yield or distressed debt where 10 %+ daily moves do
-occur, the right action is a **separate feed contract with a wider constant set at
-deploy time** — not a runtime bypass on this one. Wider constants for a
-higher-volatility instrument are a design choice; a bypass is attack surface.
+occur, the right action is still a **separate feed contract with a wider constant
+set at deploy time** — not a retune of this one, whose `MIN_ANSWER`/`MAX_ANSWER` are
+sized for the $1.00 NAV standard and whose emergency band's subset relation to them
+is the security argument. Wider constants for a higher-volatility instrument are a
+design choice.
+
+The paragraph above used to end "a bypass is attack surface", and that instinct is
+still right about the *shape* D-7 had: an owner-appointable, unbounded, instant one.
+What [D-29](#171-adopted-and-current) adds is not that. It cannot be appointed (the
+guardian is `immutable`), cannot be reached by one key (the guardian calls, the
+owner signs), cannot exceed a band that chaining already reaches, and cannot fire
+more than once an hour. Those four properties are what make it a correction path
+rather than a bypass, and removing any one of them turns it back into D-7.
 
 ### 11.3 Reads never revert on staleness — the deliberate choice
 
 ```
-Friday 16:00   push NAV = $95.42
+Friday 16:00   push NAV = $0.9542
 Saturday       markets closed, nothing pushed
-Sunday 23:00   latestRoundData() → ($95.42, updatedAt = Friday 16:00)
-               isFresh() == true          (55 h < 96 h)
+Sunday 23:00   latestRoundData() → ($0.9542, updatedAt = Friday 16:00)
+               isFresh() == false         (55 h > 24 h — settlement is refusing too)
                stalenessSeconds() == 198_000
-Wednesday      latestRoundData() → ($95.42, updatedAt = Friday 16:00)
-               isFresh() == false         (> 96 h)
+Wednesday      latestRoundData() → ($0.9542, updatedAt = Friday 16:00)
+               isFresh() == false         (> 24 h)
                stalenessSeconds() == 450_000
                ← still no revert. Ever.
 ```
@@ -1776,8 +1887,11 @@ age check.*
    is a keeper/alerting failure, not a contract failure: every contract behaves as
    written. `isFresh()` and `stalenessSeconds()` exist to be *polled*;
    they protect nobody if nothing polls them. A missed daily push is visible within
-   ~26 h, which is far earlier than the 96 h `MAX_STALENESS` threshold — page on the
-   magnitude, not on the bool.
+   ~26 h on a market day. `isFresh()` now flips at the same 24 h the swap enforces
+   (D-22), so it no longer reads healthy while settlement fails — but it is false every
+   weekend too, because settlement is refusing then. Distinguishing "the keeper died"
+   from "the market is closed" is what the calendar-aware rule over `stalenessSeconds()`
+   is for. Page on the magnitude, not on the bool.
 
 **A missed push is an ops incident requiring alerting, not a self-limiting
 condition.** The feed keeps serving the last price forever.
@@ -1799,46 +1913,149 @@ part of any upstream migration**, before the timelock proposal, not after.
 
 ### 11.5 Correcting a wrong NAV — the incident procedure
 
-A wrong answer is on the feed. There is no bypass and there will not be one
-([D-19](#171-adopted-and-current)). The procedure is:
+A wrong answer is on the feed.
+
+**First, establish which kind of wrong it is** — the two need different tools:
+
+| The true price is | Kind | Route |
+|---|---|---|
+| **within 10 % of the published answer** | a fat-finger that got in through the band | Chain `updateAnswer`. Always terminates in **n = 2** — see below. Cases A / B. |
+| **more than 10 % away**, and inside $0.50-$2.00 | a genuine market gap | **Case C** — one `emergencyUpdateAnswer`, two keys. |
+| **more than 10 % away**, and outside $0.50-$2.00 | a solvency event, not a pricing error | Chaining is the only route (5+ hours). Case C's tail, and the honest limit of the design. |
+
+**Then establish the direction of the error before touching anything.** The correct
+response is *opposite* in the two cases, and pausing the bond token is safe in only
+one of them. Reaching for the pause by reflex converts a recoverable pricing error
+into unrecoverable bad debt at an external lender (audit FIND-004).
+
+| Published answer is | Pause the bond token? |
+|---|---|
+| **Too high** — overstates the bond | **No. Do not pause.** |
+| **Too low** — understates the bond | **Yes.** |
+
+**Why the asymmetry.** Pausing `GyldBondToken` gates `transfer` / `transferFrom`, so
+on Morpho it blocks every operation that *moves* the token: `supplyCollateral`,
+`withdrawCollateral` and `liquidate`. It does **not** block `borrow`, which pays out
+the loan token and never touches the collateral. Against an **overstated** NAV a
+pause therefore leaves borrowing at the inflated valuation open while disabling the
+liquidations that would close those positions — the harm stays reachable and the
+remedy does not — and the walk-back in step 2 drives the positions further underwater
+with no operator action available. Against an **understated** NAV the same freeze is
+protective: the liquidations it blocks are the wrongful ones.
+
+#### Case A — the answer is too HIGH: do not pause
+
+1. **Leave the token unpaused.** Liquidations are the mechanism that closes positions
+   as the price returns to truth; the pause would be the one thing that stops them.
+2. **Chain `updateAnswer` back to the true NAV.** One call per hour, each at most
+   10 % from the *then*-current stored answer.
+3. **Nothing to unpause.** Watch Morpho and Euler health factors through the
+   walk-back and expect liquidations on the way down — they are the correct outcome,
+   not a second incident.
+
+#### Case B — the answer is too LOW: pause
 
 1. **`pause()` the bond token.** `PAUSER_ROLE`, held by the ops multisig, instant,
    **no timelock, no admin**. This freezes every transfer of the series, which per
-   [§6.3](#63-what-a-single-key-compromise-buys) also freezes DeFi liquidations —
-   nobody is liquidated against the wrong price while it is being walked back.
-2. **Chain `updateAnswer` back to the true NAV.** One call per hour, each at most
-   10 % from the *then*-current stored answer.
+   [§6.3](#63-what-a-single-key-compromise-buys) also freezes DeFi liquidations. Here
+   those liquidations are firing against a price wrong in the borrower's disfavour,
+   so blocking them is the point.
+2. **Chain `updateAnswer` back to the true NAV.** Same mechanics as Case A.
 3. **`unpause()`** once the feed reads correctly. The token's pause is **symmetric**
    ([§5.1 › Pause semantics](#pause-semantics)) — the same `PAUSER_ROLE` resumes, so
    step 3 does not wait on governance. (The *swap's* pause is asymmetric; this
    procedure does not use it.)
 
+#### Case C — the true price has GAPPED more than 10 %: use the emergency path
+
+This is the case Cases A and B do not reach, and the one audit FIND-003 found. The
+market has moved further in an hour than the band allows, so the true price
+**cannot be published at all** by `updateAnswer`. Ramping at the band edge means the
+feed serves a number the desk knows is wrong for hours — and because every clamped
+push refreshes `updatedAt`, `StaleNav`, `isFresh()` and Euler's `maxStaleness` all
+read **healthy** the whole way down. The correction disarms the freshness defence
+instead of tripping it. Worse, `GyldAtomicSwap`'s per-round notional cap
+([D-28](#171-adopted-and-current)) resets on each new round, so a five-push ramp
+admits **five times** the per-round budget.
+
+1. **Verify the true NAV independently before signing anything.** This path skips
+   the deviation cap; the cap is what normally catches a bad number. Two people,
+   two sources.
+2. **Do not reach for the pause first.** The direction rule above still governs, and
+   in the overstated case a pause blocks `liquidate` but not `borrow`
+   ([D-26](#171-adopted-and-current)) — it disables the remedy and leaves the harm.
+3. **`emergencyUpdateAnswer(answer, deadline, sig)`.** Get the digest from the feed's
+   own `hashEmergencyUpdate` — never rebuild the EIP-712 domain by hand — and
+   **dry-run the call with `cast call` before spending the Safe quorum**. Signer
+   mechanics for KMS and Fordefi are in the
+   [runbook §6.9](atomic-settlement-testnet-runbook.md). Sign with a **short deadline**
+   — minutes, not months. An unused signature stays usable until it expires or until
+   the next emergency push consumes the nonce, and a long-dated one left in an inbox
+   is a standing authorisation (D-29 residual (d)). The KMS owner signs the
+   EIP-712 payload `(answer, emergencyNonce, deadline)`; the ops multisig submits
+   it. **Both are required** — neither key reaches this alone. One transaction, no
+   waiting, no ramp.
+4. **Check the result** — `latestRoundData()` and the `EmergencyAnswerUpdated` log.
+   The path is then locked for `EMERGENCY_COOLDOWN` (1 h) — so a second gap the same day
+   can be corrected the same way; routine updates continue
+   on the ±10 %/h path against the new baseline.
+
+**When the true price is outside $0.50-$2.00** — a bond genuinely defaulting to
+$0.30 — the emergency path **refuses it** (`EmergencyAnswerOutOfRange`), by design:
+its band is deliberately a strict subset of the normal range so it can never reach
+somewhere chaining could not. Then it is Case A or B on the ±10 %/h path, five hours
+or more, and the honest answer is that a default is a **solvency** event rather than
+a pricing one: pause, delist, retire the Morpho market, repoint the forwarder. That
+residual is accepted and recorded in [D-29](#171-adopted-and-current).
+
 **Why chaining always terminates, and fast.** The deviation band is relative to the
 **last stored** price, and `last` advances with each accepted push, so the reachable
-set compounds. Concretely: NAV was `9_500_000_000` ($95.00), a fat-finger pushed
-`8_560_000_000` ($85.60) — inside the band, so it was accepted. Recovering needs
+set compounds. Concretely: NAV was `95_000_000` ($0.9500), a fat-finger pushed
+`85_600_000` ($0.8560) — inside the band, so it was accepted. Recovering needs
 +10.98 %, more than one step allows. Two steps do it:
 
 ```
-push 9_416_000_000   ← exactly +10.000 % of 8_560_000_000; the guard is `>`,
-                       so the boundary is INCLUSIVE and this is accepted
+push 94_160_000   ← exactly +10.000 % of 85_600_000; the guard is `>`,
+                    so the boundary is INCLUSIVE and this is accepted
 wait 1 hour
-push 9_500_000_000   ← +0.89 % of 9_416_000_000
+push 95_000_000   ← +0.89 % of 94_160_000
 ```
 
 Two calls, two hours. This generalises: any answer that *passed* the band is within
 10 % of the price it displaced, so the round trip is at most
 `ln(1/0.9) = 0.1054` of log-distance against a per-step reach of
-`ln(1.1) = 0.0953` — **n = 2 for every in-band fat-finger, without exception.** A
-genuine large market move needs more steps (15 % in 2, 25 % in 3, 40 % in 4) but the
-same mechanism.
+`ln(1.1) = 0.0953` — **n = 2 for every in-band fat-finger, without exception.**
 
-**The honest cost.** `pause()` is a blunt instrument. It halts **all** transfers for
-**all** holders — not just liquidations — for the couple of hours the walk-back
-takes. Secondary trading, redemptions and atomic swaps stop with it. That is a real
+A genuine large market move is a different problem and needs more steps — and the
+counts are **directional**, because 10 % up and 10 % down are not symmetric: upward
+15 % takes 2, 25 % takes 3, 40 % takes 4; **downward those are 2, 3 and 5**. That
+five-push, four-hour ramp is what Case C exists to avoid.
+
+**The honest cost of Case B.** `pause()` is a blunt instrument. It halts **all**
+transfers for **all** holders — not just liquidations — for the couple of hours the
+walk-back takes. Secondary trading, redemptions and atomic swaps stop with it. That is a real
 cost, and it is the cost this design deliberately accepts in exchange for the feed
-having no unbounded instant-price primitive at all. Pausing also adds **no new
+having no *unbounded* instant-price primitive at all. Since
+[D-29](#171-adopted-and-current) there is a **bounded** one — $0.50-$2.00, two keys,
+once per hour — and where it applies, Case C is shorter and cheaper than a
+multi-hour pause. It does not replace the pause: it removes the reason to hold one
+for four hours. Pausing also adds **no new
 privilege**: `PAUSER_ROLE` already exists for exactly this class of incident.
+
+**What this procedure cannot reach, and why no contract change fixes it.** In Case A
+the damage accrues inside Morpho, which prices from the last pushed answer and checks
+no timestamp ([§11.3](#113-reads-never-revert-on-staleness--the-deliberate-choice)).
+Nothing we can do to `KaleidoscopeNAVFeed` or `NAVFeedForwarder` reaches it. Audit
+FIND-004 proposed a governance-set fault flag on the forwarder that serves a
+deliberately stale `updatedAt`; that is **declined** — it is a signal, and only a
+consumer that age-checks can act on it, which is precisely the set of consumers
+(Euler, `GyldAtomicSwap`) that already fail closed without it. See
+[D-26](#171-adopted-and-current). Containment for Case A is upstream of the feed: the
+±10 %/hour band and the absolute $0.10-$5.00 range (D-19, D-29, FIND-020) bound how
+wrong a single push can be, `stalenessSeconds()` monitoring bounds how long it stays
+wrong, and since D-29 Case C bounds how long a *legitimate* correction leaves a
+knowingly-wrong price on the feed — which had been the longer window of the two. The runbook's job is to make sure the operator does not enlarge the loss while
+that plays out.
 
 ---
 
@@ -1873,6 +2090,9 @@ B+5   registeredSeries (mapping)
 B+6   navForwarderOf   (mapping)
 B+7   allowed          (mapping)
 B+8   maxQuoteTtl (uint64)      ← APPEND-ONLY tail, added by finding F-4
+B+9   maxNavAgeSecsOf       (mapping) ← added by audit FIND-022
+B+10  maxNavRoundNotionalOf (mapping) ← added by audit FIND-021
+B+11  navRoundDrawOf        (mapping) ← added by audit FIND-021
 ```
 
 An upgrade that reorders or resizes any of these fails the test. New fields go at
@@ -1920,12 +2140,19 @@ cost is that additions like `stalenessSeconds()` reach only future deployments.
 - Never reintroduce a zero-address short-circuit in `_requireAccess`. An unset
   `sanctionsList` must revert, never skip screening (audit §4.1). Any new writer of
   that slot must reject zero, and must not be the only thing that does.
-- Never add **any** bypass of the NAV feed's deviation cap or interval gate —
-  owner-callable or separate-key. A separate-key one shipped once and was removed;
-  its premise was arithmetically false and its key separation did not hold. See
-  [D-19](#171-adopted-and-current) and [§17.3](#173-superseded--recorded-so-it-is-not-re-litigated)
-  before proposing it again. Wider constants on a *new* feed contract are the
-  supported answer for a higher-volatility instrument.
+- **Never make the NAV emergency path appointable, and never add a second one.**
+  `emergencyUpdateAnswer` is the *only* route past the deviation cap and interval
+  gate, and it survives audit only because of four properties, all load-bearing:
+  `emergencyUpdater` is `immutable` with **no setter**; it only **calls**, while
+  the owner must **sign**; its band `$0.50-$2.00` is a **strict subset** of
+  `MIN_ANSWER`-`MAX_ANSWER`, so it buys latency and never reach; and it is
+  rate-limited at least as tightly as the routine path. Remove or weaken any one of those and it becomes
+  [D-7](#173-superseded--recorded-so-it-is-not-re-litigated), which shipped once and
+  was deleted because a compromised KMS key could appoint its way into it in one
+  transaction. See [D-29](#171-adopted-and-current) and
+  [D-19](#171-adopted-and-current). Wider constants on a *new* feed contract remain
+  the supported answer for a higher-volatility instrument — this one is sized for
+  the $1.00 NAV standard and must not be retuned in place.
 - Never add a staleness revert to a read path.
 - Never add `pendingRedemption` / `deposited` accounting to `IssuanceManager`
   without explicit product and compliance sign-off — it changes the AP-facing UX.
@@ -2209,14 +2436,18 @@ and the two upstream properties a vault builder must document are in
 
 ### 15.5 Cross-cutting notes
 
-- **Pause freezes DeFi positions, liquidations included.** When `GyldBondToken` is
-  paused, every Morpho and Euler interaction reverts — including liquidations, so an
-  undercollateralised position cannot be closed until unpause. The ops multisig must
-  weigh that before triggering a pause; it is the same tension as
-  [§18](#18-known-gaps-and-open-decisions) gap 10. It is also the tension the NAV
-  walk-back procedure ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure))
-  deliberately accepts: freezing liquidations is the point, and freezing everyone
-  else's transfers alongside them is the price.
+- **Pause freezes DeFi positions, liquidations included — but not borrowing.** When
+  `GyldBondToken` is paused, every Morpho and Euler operation that *moves the token*
+  reverts: `supplyCollateral`, `withdrawCollateral` and `liquidate`, so an
+  undercollateralised position cannot be closed until unpause. `borrow` is **not**
+  blocked — it pays out the loan token and never touches the collateral. The ops
+  multisig must weigh both halves before triggering a pause; it is the same tension as
+  [§18](#18-known-gaps-and-open-decisions) gap 10. The NAV walk-back procedure
+  ([§11.5](#115-correcting-a-wrong-nav--the-incident-procedure)) accepts that cost
+  **only when the published answer is too low**, where the frozen liquidations are the
+  wrongful ones. Against an answer that is too high the same freeze is harmful — it
+  stops the liquidations that should fire while leaving borrowing at the inflated
+  valuation open — and the procedure directs the operator not to pause (FIND-004).
 - **Protocol addresses are screened as spenders.** Morpho's and Euler's contract
   addresses go through the sanctions oracle on every collateral deposit and
   withdrawal — as `to`, as `from`, and as the `transferFrom` spender. A protocol
@@ -2234,18 +2465,18 @@ and the two upstream properties a vault builder must document are in
 
 ### 16.1 Test suites
 
-`forge test` — **524 tests, 20 suites, 0 failures**, at full `foundry.toml`
+`forge test` — **646 tests, 21 suites, 0 failures**, at full `foundry.toml`
 intensity (fuzz `runs = 10000`; invariant `runs = 1000, depth = 50`,
 `fail_on_revert = true`).
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `GyldAtomicSwapTest` | 85 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts |
-| `KaleidoscopeNAVFeedTest` | 58 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`** |
-| `TokenFactoryTest` | 62 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
-| `IssuanceManagerTest` | 51 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard |
+| `GyldAtomicSwapTest` | 96 | Happy-path BUY/REDEEM via permit and plain allowance; expiry; epoch; replay; wrong signer; tampered message; wrong taker; allowlist; pause asymmetry; paused-bond-token evacuation boundary; permit front-run; withdrawal-wallet family; zero amounts; per-series `maxNavAgeSecs` overrides (FIND-022) |
+| `KaleidoscopeNAVFeedTest` | 106 | `updateAnswer`, deviation cap, interval gate, round IDs, `Ownable2Step`, non-renounceable ownership, chained-update recovery from an in-band fat-finger, **`test_noStalenessRevertPathExists`**, settable `stalenessThreshold` (FIND-022), and the 2-of-2 emergency correction path — key separation, EIP-712 replay/deadline/answer binding, cooldown, and the strict-subset band relation (FIND-003, D-29) |
+| `TokenFactoryTest` | 64 | Deploy, role wiring, mint, burn, pause, sanctions compliance, CREATE2 prediction, `REGISTRAR_ROLE` preflight, duplicate-ISIN rejection |
+| `IssuanceManagerTest` | 62 | Subscribe, redeem, whitelist (single + batch), registry, `SUBSCRIBER`/`REDEEMER` role isolation, UUPS, renounce guard, daily mint cap + mint-path pause (FIND-001) |
 | `SanctionsOracleMirrorTest` | 50 | Constructor, add/remove, events, access control, forwarding-oracle probe and gas cap, fuzz round-trip |
-| `GyldAtomicSwapSpecTest` | 48 | The numbered invariant / finding catalogue below |
+| `GyldAtomicSwapSpecTest` | 63 | The numbered invariant / finding catalogue below, plus the FIND-021 round-cap family |
 | `GyldBondTokenTest` | 46 | Core token functions; ERC-1643 document set/remove and `DOCUMENT_ROLE` gating; fail-closed screening on an unset sanctions list |
 | `NAVFeedForwarderTest` | 39 | Delegation, upstream swap, probe matrix, future-dated rejection, access control |
 | `TimelockTest` | 15 | 48 h delay enforcement, cancellation, `IssuanceManager` admin wiring |
@@ -2288,11 +2519,13 @@ test suite, so every reference resolves to something checkable.
 | **I-14** | Exactly one bond leg — `tokenIn == tokenOut` can never classify as a swap (`buy == redeem` → `NotOneBondLeg`). This is what makes the post-pull-in inventory measurement sound | `test_executeSwap_sameTokenBothLegs_reverts` |
 | **I-15** | NAV fail-closed — a `<= 0` answer reverts `InvalidNav`; a stale answer reverts `StaleNav`; the guard is structurally bounded by `MAX_NAV_AGE_CEILING` | `test_executeSwap_negativeNav_reverts` and the GYL-1135 ceiling tests |
 | **I-16** | Withdrawal target — `withdraw` can only ever send to the admin-fixed `withdrawalWallet` | `test_withdraw_*` family |
-| **I-17** | Reentrancy exclusion covers `withdraw` too — it shares the guard with `executeSwap`, so a malicious inventory token cannot use the withdrawal transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap` |
+| **I-17** | Reentrancy exclusion covers `withdraw` and the `deregisterSeries` sweep too — all three share one guard, so a malicious inventory token cannot use a transfer hook to enter | `test_withdraw_cannotReenterExecuteSwap`, `test_deregisterSeriesSweep_cannotReenterExecuteSwap` |
 | **I-18** | Pause asymmetry — `PAUSER_ROLE` halts, only `DEFAULT_ADMIN_ROLE` resumes | `test_pause_asymmetric_onlyAdminUnpauses` |
-| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8 | `test_storageLayout_erc7201SlotAndPacking` |
+| **I-19** | ERC-7201 storage location and packing — base slot matches the derivation; `quoteEpoch`/`maxQuoteDeviationBps`/`maxNavAgeSecs` pack into B+0 at offsets 0/8/10; `withdrawalWallet` and `usdc` at B+1/B+2; `maxQuoteTtl` at the append-only tail B+8, `maxNavAgeSecsOf` appended at B+9, `maxNavRoundNotionalOf`/`navRoundDrawOf` at B+10/B+11 | `test_storageLayout_erc7201SlotAndPacking`, `test_navRoundCap_storageLayoutAppendedAtTail` |
 | **I-20** | Upgrade authority — `upgradeToAndCall` is admin-only | `test_upgradeToAndCall_onlyAdmin` |
 | **I-21** | Series deregistration then re-registration restores tradability | `test_deregisterSeries_thenReregister_restoresTradability` |
+| **I-25** | Deregistration sweeps any residual inventory to the `withdrawalWallet` and retires the series, so dust cannot block it (FIND-024) | `test_deregisterSeries_sweepsResidualInventory`, `test_deregisterSeries_dustRefillCannotGrief`, `test_deregisterSeries_sweepEmitsWithdrawn` |
+| **I-26** | The sweep is fail-closed on an unset `withdrawalWallet`, and a paused bond token blocks the sweep but not an already-empty retirement (FIND-024) | `test_deregisterSeries_residualWithNoWithdrawalWallet_reverts`, `test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause`, `test_deregisterSeries_pausedTokenZeroBalance_succeeds` |
 | **I-22** | Permit is never load-bearing for authorization — a `tokenIn` with no `permit()` at all still settles via a plain approval | `test_executeSwap_permitOnTokenWithoutPermit_doesNotBrick` |
 | **I-23** | Quote expiry is TTL-bounded: `block.timestamp <= expiry <= block.timestamp + maxQuoteTtl`, upper edge **inclusive** | `test_executeSwap_quoteExpiryTtlBound_inclusiveEdge` |
 | **I-24** | `seriesList` is a duplicate-free mirror of `registeredSeries`, and deregister swap-and-pops (last element moves into the removed slot) | **Not covered.** `seriesList` is not externally observable and is read by no other contract logic, so the swap-and-pop loop (`registerSeries`/`deregisterSeries`) has no external assertion point. Pre-existing gap on `main`. |
@@ -2360,19 +2593,27 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 | D-13 | **`ALLOWLIST_ADMIN_ROLE` split off `DEFAULT_ADMIN_ROLE`** (GYL-1050) | Per-taker allowlisting must stay a same-day operational action after the timelock handover. It grants access to swap, never to funds or upgrades. |
 | D-14 | **Asymmetric pause on the swap; symmetric on the token** | The swap runs off a hot signing key, so re-arming it is deliberately slow. |
 | D-15 | **Chain-allowlist deploy guards, fail-closed** (GYL-1135) | Denylist guards let every L2 through; that is how a zero-delay timelock and a bare-EOA admin reached a production chain. [§13](#13-deployment-model) |
-| D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. |
+| D-16 | **`maxNavAgeSecs` structurally ceilinged at 72 h** (GYL-1135) | It is the only staleness defence in the swap path, so an admin must not be able to widen it into a no-op. 72 h matches Euler's `MAX_STALENESS_UPPER_BOUND`. The ceiling binds per-series overrides too (D-23). |
+| D-23 | **`maxNavAgeSecs` is per-series, with the global as fallback** (audit FIND-022) | One `GyldAtomicSwap` serves many series, each with its own feed — `navForwarderOf` and `registeredSeries` are already per-token mappings — but the age threshold was a single `uint32` applied to all of them. A feed pushing hourly and one pushing daily were held to one number that is necessarily wrong for one of them: sized for the daily feed, the hourly one may be most of a day dead and still settle. `maxNavAgeSecsOf` is an **append-only** ERC-7201 field read only through `_effectiveMaxNavAge()`, where **zero means unset, not zero seconds** — the same contract as `maxQuoteTtl` (F-4) and for the same reason: a proxy upgraded across the mapping's addition reads 0 for every series, and that must resolve to the pre-upgrade behaviour rather than reverting `StaleNav` on every swap. `setMaxNavAgeSecsFor` requires the series be registered, obeys the 72 h ceiling (D-16), and takes 0 to CLEAR an override; `deregisterSeries` clears it too, so an override cannot outlive its series. [§11](#11-oracle-design) |
 | D-18 | **`answeredInRound` is deliberately not checked in `_checkQuoteBand`** (audit §4.10) | Chainlink **deprecated** the field — modern OCR aggregators return it equal to `roundId`, as does `KaleidoscopeNAVFeed` by construction, so the classic `answeredInRound < roundId` guard is structurally unable to fire on any feed we would point at. Adding it would be dead code on the hot path. Staleness is enforced on `updatedAt` against the 72 h-ceilinged `maxNavAgeSecs` plus a future-dating guard (F-6). Revisit only if an upstream is adopted whose `answeredInRound` can genuinely lag `roundId`. [§5.7](#57-gyldatomicswap) |
 | D-17 | **ERC-8056 dropped on EVM** (GYL-1201) | Splits standard used as a NAV mirror; no EVM wallet implements it; observed display divergence on our own deployment; nobody in our category uses it. Standing record: [`decisions/erc8056-dropped-on-evm.md`](decisions/erc8056-dropped-on-evm.md). [§8.3](#83-erc-8056-was-evaluated-and-dropped) |
 | D-21 | **`TokenFactory` holds `REGISTRAR_ROLE` on the `IssuanceManager` permanently, and that is required** (audit §18 item 1) | `deployToken` calls `registerToken` on *every* deployment, not just the first, so revoking the role would brick every subsequent deploy. Token-level roles are a different case and *are* shed — `_wireRoles` self-revokes `PAUSER_ROLE` and `DEFAULT_ADMIN_ROLE`, which are needed only while that one token is wired. What bounds the retained role: the factory is immutable (no proxy, no upgrade path) and contains no call to `deregisterToken`, the only other function it gates; its one `registerToken` call site targets a token CREATE2-deployed three lines earlier in the same transaction. The `IssuanceManager` admin (the timelock) can revoke it at any time, at the cost of disabling further deploys. Both halves pinned by `test_deployToken_factoryRetainsRegistrarRole_andNeedsIt` and `test_deployToken_factoryShedsAllTokenRoles`. |
 | D-20 | **Every cross-contract interface has exactly one declaration, in `contracts/interfaces/`, and implementers declare it** (audit §4.8) | Interfaces used to be restated per file — `ISanctionsList` twice, and three overlapping oracle shapes. Solidity types are per-declaration, so identical copies are unrelated types the compiler cannot cross-check, and implementers that merely *happened* to expose the right functions declared nothing. Renaming `SanctionsOracleMirror.isSanctioned` compiled cleanly across every production contract; only a test caught it. One shared declaration plus `is` on the implementer turns that into a build failure in the contract itself. |
-| D-19 | **No privileged bypass on the NAV write guards** — `emergencyUpdateAnswer` and `setEmergencyUpdater` removed | The premise for the bypass (D-7, now [superseded](#173-superseded--recorded-so-it-is-not-re-litigated)) was **arithmetically false**: the deviation band is relative to the *last stored* price, and `last` moves with each push, so chaining reaches **any** in-band fat-finger in **n = 2** calls. The bypass therefore bought ~2 hours of latency and cost an unbounded instant-price primitive that a compromised KMS key could reach in one extra transaction. The replacement procedure — `pause()` the token, chain `updateAnswer`, `unpause()` — adds no new privilege. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
+| D-19 | **No *appointable* bypass on the NAV write guards** — `setEmergencyUpdater` removed, permanently. **Amended by [D-29](#171-adopted-and-current)** (audit FIND-003), which restores a correction path in immutable, two-key, absolutely-bounded form; the ban on an owner-appointable one is untouched and permanent | The premise for the bypass (D-7, now [superseded](#173-superseded--recorded-so-it-is-not-re-litigated)) was **arithmetically false**: the deviation band is relative to the *last stored* price, and `last` moves with each push, so chaining reaches **any** in-band fat-finger in **n = 2** calls. The bypass therefore bought ~2 hours of latency and cost an unbounded instant-price primitive that a compromised KMS key could reach in one extra transaction. The replacement procedure — `pause()` the token, chain `updateAnswer`, `unpause()` — adds no new privilege. **Amended by D-29:** the arithmetic above is about an *in-band fat-finger*, where n = 2 holds. It does **not** cover a genuine market gap, where the true price is out of band and the ramp is 5 pushes — and where §11.5 Case A forbids the pause that would otherwise contain it. That case is what FIND-003 found and what D-29 closes. What D-19 got right and D-29 keeps: there is no setter, so the owner key can still never appoint its way to a bypass. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
+| D-22 | **The `isFresh()` window is owner-settable and pinned to the strictest enforced age (24 h)** (audit FIND-022) | Two halves. **Settable:** `KaleidoscopeNAVFeed` has no proxy, so a `constant` window could only be corrected by deploying a replacement feed and repointing every `NAVFeedForwarder.setUpstreamOracle()` — a migration to fix a monitoring number. `setStalenessThreshold` makes it a transaction. It carries no ceiling (unlike D-16) because it gates a view and no on-chain guarantee; a ceiling would imply a protection that does not exist. Zero is rejected. **Pinned to 24 h, matching `maxNavAgeSecs`:** the defect was a monitoring view sitting ABOVE the age its consumer enforces — settlement began failing at +24 h while `isFresh()` read healthy to +96 h, a three-day blind spot on a weekday keeper failure. `isFresh()` now answers exactly one question, "will `executeSwap` accept this NAV right now?", and flips as settlement starts refusing. **We considered and rejected keeping it at 96 h** to avoid a false signal over weekends: the keeper pushes once per market day, so a normal weekend is a ~65 h gap and the view is false all weekend. That is correct rather than noisy — settlement genuinely is refusing then, nothing pages on this boolean, and a window above the enforced age is precisely the defect. What `isFresh()` cannot do is separate "the keeper died" from "the market is closed"; no on-chain constant can, which is why the operator signal is `stalenessSeconds()` under a **calendar-aware off-chain rule** (page ~26 h on a market day) and this boolean is the coarse backstop. Retune both together: if `maxNavAgeSecs` moves — including per-series, D-23 — move this with it. **Not retrofittable, and the deployed feed is not remediated:** the contract is immutable, so the live Sepolia feed (`0x4266a4A4…`, [DEPLOYMENTS](../DEPLOYMENTS.md)) keeps its hardcoded window and cannot be retuned. Reaching it means deploying a replacement feed and repointing `setUpstreamOracle()` — exactly the migration the setter exists to avoid *next* time. This lands before the production deployment, which is why the audit flagged it as pre-deployment work. [§11](#11-oracle-design) |
+| D-24 | **`deregisterSeries` sweeps residual inventory instead of requiring a zero balance** (audit FIND-024) | The old guard demanded `balanceOf(swap) == 0` *at execution time*, but clearing the balance is a separate `withdraw` (`TREASURER_ROLE`) and the deregistration itself waits on the 48 h timelock — the two were never atomic. `GyldBondToken._update` carries only a sanctions screen and **no transfer allowlist**, so any unsanctioned holder could re-seed **one wei** in that window and cost the operator a fresh withdrawal plus a fresh 48 h cycle, for the price of one ERC-20 transfer. The asymmetry ran strongly against the defender and required no privilege. The sweep makes clearing and retiring one call, leaving no gap to race. **A dust threshold was rejected:** an attacker sends `threshold + 1`, and a threshold additionally licenses orphaning real inventory — the very thing the original guard existed to prevent. Fail-closed on an unset `withdrawalWallet` (`ZeroAddress`), matching `withdraw`, so residual inventory is never burned to `address(0)`; a zero balance needs no destination and retires regardless. `nonReentrant` was added with the external call and registry writes precede it (CEI). This does hand `DEFAULT_ADMIN_ROLE` a token-moving path that skips `TREASURER_ROLE` — no new trust assumption, since the admin also sets that wallet and `_authorizeUpgrade` is already `DEFAULT_ADMIN_ROLE` — but it does skip the upgrade ceremony and its storage-layout review gate, which is the honest delta. **The zero-code half of the remedy stands too:** `deregisterSeries` only *reads* the balance, so withdraw → **pause the token** → execute blocks the dust refill outright and needs no upgrade. [§9](#9-gyldatomicswap) |
+| D-25 | **`maturityTimestamp` stays off-chain metadata; it is validated at deploy and never enforced** (audit FIND-009) | The field was stored and exposed but read by nothing, so a matured series minted and traded exactly like a live one — an implied control that did not exist. **We rejected enforcing it in `mint()`.** Series lifecycle is an operational process, not a contract state machine: coupon handling, extensions and early calls are all decided off-chain, and a hard on-chain cutoff would need an upgrade to correct a date entered wrong at deploy — a governance cycle to fix a typo. Primary issuance is fully permissioned (`SUBSCRIBER_ROLE` only), so a matured series stops minting when operations stop submitting, and the audit's own recommendation offers documentation as an accepted remedy. **What we did instead:** `deployToken` rejects a maturity already in the past (`MaturityInPast`), keeping `0` as the open-ended sentinel, so a bad date is caught once at the only point it can be corrected for free; and the NatSpec on `maturityTimestamp()` states plainly that nothing enforces it, so no integrator infers a gate. **The honest residual:** a compromised or careless `SUBSCRIBER_ROLE` key can still mint a matured series, and the per-series levers for stopping it are weak — `deregisterToken` has no live `REGISTRAR_ROLE` holder (D-21) and would block `redeem` as well as `subscribe`, `setDailyCap(token, 0)` *restores* the 10,000e18 default rather than disabling minting, and `pauseIssuance()` is global. Retiring a matured series today therefore means pausing that bond token. **Validating the field surfaced the reason it matters:** all three devnet maturity literals disagreed with their own comments — Caterpillar and Citigroup were each ~2 years early, Citigroup landing 8 months in the *past* — drift that went unnoticed precisely because nothing read the value. [§3](#3-gyldbondtoken) |
+| D-26 | **The wrong-NAV procedure branches on the direction of the error, and no fault flag is added to `NAVFeedForwarder`** (audit FIND-004) | The old §11.5 opened with an unconditional `pause()` of the bond token, justified as "nobody is liquidated against the wrong price while it is being walked back". That holds in one direction only. A pause gates `transfer`/`transferFrom`, so on Morpho it blocks `supplyCollateral`, `withdrawCollateral` and `liquidate` — but **not** `borrow`, which pays out the loan token and never touches the collateral. Against an **overstated** NAV the pause therefore leaves the harm reachable and disables the remedy, and the hourly walk-back drives positions further underwater while nothing can close them: a recoverable pricing error turned into unrecoverable bad debt at an external lender, by an operator following our own runbook. §11.5 now branches — Case A (too high) does not pause, Case B (too low) does — and the two other places that asserted freezing liquidations "is the point" (§6.3, §15.5) are qualified to the borrower's-disfavour case. **The audit's second recommendation — a governance-set flag on the forwarder serving a deliberately stale `updatedAt` — is declined.** It is a *signal*: only a consumer that age-checks can act on it, and that is exactly the set (Euler, `GyldAtomicSwap`) that already fails closed without it, while Morpho — the sole consumer this finding is about — checks no timestamp and would price identically through the flag ([§11.3](#113-reads-never-revert-on-staleness--the-deliberate-choice)). The only read that reaches Morpho is a reverting one, already rejected as D-6 for the stronger version of this same failure. The cost is not zero either: the forwarder's owner is the 48 h timelock, so a flag usable in an incident needs a new hot role on the one address baked immutably into Morpho market params, and it forfeits the "no local state, pure delegation" property integrators are told to rely on. Recorded rather than deferred because `NAVFeedForwarder` is not upgradeable: once the first Morpho market fixes its address, the option is gone. The audit's third recommendation — confirm and record per-integration whether the consumer age-checks — shipped earlier under FIND-022 as the `INTEGRATION PRECONDITION` block. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure) |
+| D-27 | **The last `DEFAULT_ADMIN_ROLE` holder cannot be removed; the guard sits in `_revokeRole` on all four contracts** (audit FIND-007) | All four overrode `renounceRole` to refuse `DEFAULT_ADMIN_ROLE` and none overrode `revokeRole`. The role admins itself, so the sole holder reached the identical bricked state through the function next to the guarded one — protection advertised but not delivered. **A blanket "admin role cannot be revoked" was rejected, and measured:** it fails 55 tests, because every handover here is *grant successor, then revoke self* — `TokenFactory._wireRoles` does it inside `deployToken`, so no bond series could ever be issued again, and the deploy scripts would leave the deployer holding a live admin key beside the timelock, the exact bypass they exist to remove. Distinguishing the safe removal from the bricking one requires knowing whether another holder remains, so the guard counts: `_grantRole` increments, `_revokeRole` refuses at one and decrements otherwise. **In `_revokeRole`, not the public `revokeRole` the audit named** — strictly stronger, since it also covers `renounceRole` and any future internal caller. **A plain `uint256` rather than an ERC-7201 field:** all three UUPS contracts declare no other regular state (every base is namespaced), so the counter lands alone at slot 0 with nothing to collide with, and the pinned structs and their `ci/storage-layouts/` baselines are untouched. Note that slot is **not** covered by `ci/check_storage_layout.py`, which pins only the namespaced structs — append future plain state after it, never before. **Severity is Informational and that is right:** the intended topology puts admin behind a timelock a multisig proposes on. **But no live deployment has that yet** (see §Non-renounceable roles), so until the production wallets exist this guard, not the topology, is the protection. **Forward-applicable only:** a proxy upgraded into this code never wrote slot 0, so it reads zero while holding one admin — the last-admin revoke is still correctly refused, but an ordinary A→B handover on such a proxy is refused too. Hence `<= 1` rather than `== 1`, erring closed. Moot in practice because [DEPLOYMENTS](../DEPLOYMENTS.md) already directs deploying fresh rather than upgrading those proxies into service. **Residual:** this bounds one self-inflicted footgun, not admin compromise. [§3](#3-gyldbondtoken), [§9](#9-gyldatomicswap) |
+| D-28 | **Aggregate notional is capped per NAV round, per series** (audit FIND-021) | Every other guard in `executeSwap` is per-fill — the NAV band bounds one quote's price, the TTL bounds one quote's life, the bitmap bounds one quote's reuse — and none of them relate fills to one another. Nothing bounded how much total notional could settle against a single NAV price, so the real limit was desk issuance discipline plus inventory: policy, not code. `navRoundDrawOf` counts USDC notional per series against the feed's `updatedAt`, and `_drawNavRoundNotional` refuses the fill that would cross `maxNavRoundNotionalOf`. Worst case per series per round becomes `cap x band` instead of `inventory x band`: at the deployed 200 bps band that is $20k against the $1M fallback and $200k against the $10M each series is actually configured to at deploy. **The $1M constant is a conservative floor, not the operating value** — it is what an unconfigured series falls back to; `setMaxNavRoundNotionalFor` sets the real per-series cap, and $50M remains the structural ceiling no admin call can pass. Sizing is two-sided: the setter is behind the 48 h timelock, so a cap set to a typical day rather than a busy one reverts legitimate flow with no same-day remedy. **Keyed on `updatedAt`, not `roundId`**, because `roundId` is not guaranteed monotone across a forwarder repoint, and reset only on a **strictly newer** round: a plain inequality lets a feed whose `updatedAt` moves backwards re-open a spent budget. **Zero means unset**, resolving to `DEFAULT_MAX_NAV_ROUND_NOTIONAL` — as a literal cap it would revert every swap, as 'unlimited' it would ship the guard disarmed. Denominated in USDC and charged **GROSS on both legs** — a buy adds its `amountIn` and a redeem its `amountOut`, so a round trip consumes 2x its notional. Netting (`|in - out|`) was rejected: a taker could buy $1M ten times and sell $1M ten times, net zero, and a netting cap would admit all of it — yet that is $10M of buys settled against one stale NAV, each leaking up to the band width. The exposure is the GROSS flow, not the net position, which is precisely what the finding identified. The griefing vector below is the accepted cost of that choice. `deregisterSeries` clears both fields so a re-registered token inherits neither budget nor spend. **Interaction with [D-29](#171-adopted-and-current) (audit FIND-003):** because the counter resets on every strictly-newer round, a multi-push NAV *ramp* opens a fresh budget on each step — a five-push walk-back admits 5x the per-round cap, all of it against prices the desk knows are wrong. That is not a defect in this cap, which is per-round by design; it is why the ramp itself had to be removed for the case where it matters, which is what D-29 does. **Accepted residuals:** N registered series admit N x cap in one wall-clock round (the knob is deliberately per-series); and an allowlisted taker can round-trip buy-then-redeem at NAV to burn 2x notional of budget for gas alone, blocking the series until the next push — bounded by the allowlist being KYC'd counterparties, not by the contract. The two sizing routes Halborn offered were declined: signing the draw size reverses the capped-allowance design (GYL-1201), and raising `MIN_DRAW_BPS` collides with this cap once `remaining` falls below the floor (Ondo's Medium finding, recorded on the deferred rate-limiter row). [§5.7](#the-signed-quote) |
+| D-29 | **A two-key, absolutely-bounded emergency NAV correction path** (audit FIND-003) | The relative guards are the whole write-side defence, and both are measured against the **last stored** price, so a market move larger than 10 % **cannot be published at all**. The keeper's only route is to ramp at the band edge: a -40 % gap is **5 pushes over 4 hours** (90 → 81 → 72.9 → 65.61 → 60), and throughout it the feed serves a number the desk knows is wrong. The sharp part is what that does to the guards: **every clamped push refreshes `_updatedAt`**, so `StaleNav`, `isFresh()` and Euler's `maxStaleness` all read healthy at exactly the moment the price is least correct — **the correction disarms the freshness defence instead of tripping it**. It also defeats [D-28](#171-adopted-and-current): `_drawNavRoundNotional` resets on any strictly-newer round, so each ramp push opens a **fresh** notional budget and a 5-push ramp admits 5x the per-round cap. Worst case at the $10M series cap is ~**$8.5M** across the ramp. And §11.5 never covered it — that runbook is written for an in-band fat-finger (n = 2), and its Case A explicitly **forbids** the pause, because pausing blocks `liquidate` but not `borrow`. **`emergencyUpdateAnswer` publishes the true price in one transaction**, skipping the interval and the deviation cap. **Why this is not [D-7](#173-superseded--recorded-so-it-is-not-re-litigated).** D-7 died on one fact: `setEmergencyUpdater` was `onlyOwner`, the feed's owner is the KMS signer rather than the timelock, so a compromised key appointed a second address it also controlled in one transaction and held the bypass **alone**. **There is no appointment surface here at all** — `emergencyUpdater` is `immutable`, fixed by `TokenFactory` to the ops multisig (`operator`, which already holds `PAUSER_ROLE`), with no setter; `transferOwnership` refuses to hand ownership to it; and the constructor and `TokenFactory.deployToken` both reject `guardian == owner`. Nor is it reachable by one key: the guardian only **calls**, and every push carries an EIP-712 signature over `(answer, nonce, deadline)` that must recover to `owner()` **at execution time**. **A stolen guardian key is worth zero** — it holds no other power here and cannot forge the signature. **A stolen owner key is worth exactly what it is worth today** — ±10 %/h — because it cannot make the call. And what the *pair* obtains is not the "unbounded, instant, rate-limit-free price primitive" D-7 was killed for: it is bounded to **$0.50-$2.00**, a **strict subset** of the $0.10-$5.00 the normal path already reaches by chaining (worst case $0.10 → $2.00 is 32 hourly pushes), and rate-limited to **once per hour, exactly the cadence the owner key already has** (`EMERGENCY_COOLDOWN == MIN_UPDATE_INTERVAL`, pinned by a test). **It buys latency, not reach — not frequency.** **A 24 h cooldown was written first and rejected**, and the arithmetic is recorded here so this is not re-read as a weakening. It bought nothing: whoever holds both keys also holds the owner key, which already writes hourly and reaches $2.00 → $0.50 by chaining in 14 pushes, so the longer lock rate-limited one of two write paths the same adversary held. And a single $2.00 → $0.50 push with no intermediate rounds already liquidates the whole Morpho market in one block — residual (b) — so swings 2 through 24 extract from a market that is already empty and has emitted `EmergencyAnswerUpdated` on every push. Against that near-zero gain it cost the finding itself: a cascading credit event needing a second in-band correction the same day would fall back to the ±10 %/h ramp, which is FIND-003 restated for event two. It also attached an option value to *not* publishing the truth now, so an operator had reason to hoard the path early in a developing event. A rate guard on a bypass is calibrated against the fastest legitimate write cadence; anything slower binds operations rather than the attacker. The invariant is now uniform and one line: **no path writes this feed more than once an hour.** `MIN_ANSWER`/`MAX_ANSWER` were retuned from $0.01-$10bn to **$0.10-$5.00** in the same pass — the old range was an anti-brick and anti-overflow guard only, and gave a compromised owner key unbounded reach given enough hours. **Constants, not constructor parameters:** the strict-subset relation *is* the security argument and must be checkable from source, not from deploy calldata. The cost is that this contract now serves the **$1.00 NAV standard and nothing else**. **Halborn's other three recommendations are declined.** *Publish the clamped value without refreshing the timestamp*: arithmetically inert here — the keeper pushes once per market day at ~16:15 ET, so a gap at the 09:30 open is already 17.25 h into a 24 h `maxNavAgeSecs`, and freezing `updatedAt` only binds for a ramp longer than 6.75 h, i.e. a move **> 57 %**; worse, after a normal 65 h weekend gap a clamped Monday push could never un-stale the feed. *A rolling cumulative drift limit*: bounds a compromised key but makes the ramp **slower**, so the feed stays knowingly wrong for longer. *Elapsed-time-scaled deviation* (accrue `10 % x hours_elapsed` of budget) was raised later and rejected on its own arithmetic: the keeper pushes once per market day, so accrued budget at a Monday-open gap is ~24 x 10 %, effectively unbounded; capping the accrual then hands an idle-then-compromised owner key a one-shot instant jump reachable **alone**, which is D-7 with a timer. *Shortening `MIN_UPDATE_INTERVAL`* (1 h -&gt; 10 min) publishes a -40 % gap in 40 minutes with no new key, and was rejected because it pays for that latency in the system's primary modelled risk: full traversal of $0.10-$5.00 by a stolen KMS key drops from 22 h to under 4 h, and the whole single-key containment story in [§6.3](#63-what-a-single-key-compromise-buys) is written against the 1-hour constant. D-29 buys the owner key **nothing** by comparison — it can sign, but never call. *Clamp instead of revert*: reverting is what makes a clamp visible off-chain; silent clamping would make a wrong price indistinguishable from a right one at the write site. **What this actually covers, stated precisely.** The band refuses anything outside $0.50-$2.00, so the most-cited &gt;10 % trigger for a Treasury-backed bond — a credit event heading toward $0.30 — is **not** covered and still ramps. The covered set is "a 10-50 % move that stops inside $0.50-$2.00", and its most realistic member is not a market move at all: it is an **NAV computation error at the administrator** — a wrong `bonds_held` or `tokens_outstanding` — that lands outside the 10 % band. That is a recurring operational risk rather than a tail event, and it is the case this path most earns its keep on. "Market gap" oversells the trigger; do not repeat that framing without this qualification. **Accepted residuals:** (a) a true price **outside** $0.50-$2.00 — a bond defaulting to $0.30 — is still a chained ramp, and one outside $0.10-$5.00 is unpublishable on both paths; that is a solvency event, answered by pause/delist/repoint at governance speed, not a pricing error. (b) The pair reaches an endpoint **without the intermediate prices**, so without the liquidations each of those would have fired — a genuine capability the owner alone lacks, and the reason it takes two keys. (c) Not retrofittable: the feed has no proxy, so the live Sepolia feed keeps the old constants and never gets this path. (e) **The guardian is an availability single point of failure.** `emergencyUpdater` is `immutable`, has no setter, and the feed has no proxy, so a lost or compromised ops key **permanently** removes this remedy for every already-deployed series — leaving only the ±10 %/h ramp, which is FIND-003 restated. That is the deliberate price of having no appointment surface (the property that separates this from D-7), but it is a real operational obligation: the ops Safe's key custody now gates the NAV correction path as well as the pause. Note also that `operator` holds **both** `PAUSER_ROLE` on the token and this submit right, so §6.3's per-key rows are not independent for factory-deployed series. That concentration grants **no new attack capability** — a guardian holding an owner signature can already pair `emergencyUpdateAnswer` with `liquidate` in one transaction, and pausing would block the attacker's own liquidations — but it does mean the §11.5 direction rule and the correction submission rest on the same key, so the two-person check there is a Safe-quorum convention rather than a key separation. (d) **The signature `deadline` has no on-chain cap**, so a long-dated unused signature is a standing authorisation, and the "a stolen guardian key is worth zero" row in [§6.3](#63-what-a-single-key-compromise-buys) holds absolutely only while none is outstanding. A cap was **considered and rejected**: one short enough to matter could expire mid-incident while the guardian Safe gathers its quorum, failing the correction in precisely the case this path exists for — a new availability failure in the direction the finding was about. The residual is bounded by the other two bindings rather than by time: a stale signature can replay only the ONE answer the owner already authorised, inside $0.50-$2.00, and only until the next successful emergency push consumes the nonce. Signing with a short deadline is therefore a **runbook rule**, recorded on `emergencyUpdateAnswer` and in §11.5 Case C. [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure), [§11.2](#112-the-write-side-guards) |
 
 ### 17.2 Deferred
 
 | Decision | Status | Revisit when |
 |---|---|---|
 | **ERC-2771 / gasless meta-transactions** | Not implemented. Phase-1 users are institutional APs who hold ETH and submit their own transactions. Adding it means operating relay infrastructure — who submits, who pays gas, how failures are handled, how the relay audit log is produced — for a problem that does not exist yet. | **Retail access.** Then: deploy a `MinimalForwarder`, upgrade the token via UUPS to inherit `ERC2771ContextUpgradeable` and override `_msgSender()`/`_msgData()` (~15 lines; ERC-7201 makes the upgrade safe), and deploy or integrate a relay service. The operational commitment is the real work. Additive and invisible to DeFi: the `_msgSender()` override only activates when `msg.sender` is the trusted forwarder. **Never** build a bespoke `delegatedTransfer()`; use the standard. The forwarder address must be set at deploy time and locked — a compromised or wrong forwarder can spoof any `_msgSender()`, admin addresses included. |
-| **On-chain rate limiter in `executeSwap`** | V1.1 candidate, following Ondo's `InstantMintTimeBasedRateLimiter`. If a minimum size is added alongside a cap, keep `min < cap remainder` — that was Ondo's Medium finding. | Before meaningful notional flows through the swap. |
+| **On-chain rate limiter in `executeSwap`** | **SHIPPED as D-28** (audit FIND-021) — a per-NAV-round notional cap, not the time-window shape this row anticipated: the NAV round is the natural window here, and it needs no clock of its own. Ondo's `min < cap remainder` warning is why `MIN_DRAW_BPS` was left at 100 rather than raised alongside the cap: with both, a quote whose 1% floor exceeds the round's `remaining` is unfillable at any size. | Done — see D-28. |
 | **Multi-draw quotes (remaining-balance tracking)** | Explicitly out of scope for the capped-allowance design. Needs `filled[quoteId] += requestedAmountIn` instead of one bitmap bit, which swaps 256-quotes-per-slot for a per-quote counter, reopens "which fill's NAV and expiry apply to fill #2", and needs its own reentrancy analysis. | Only if the AP/LP flow genuinely needs draw-over-time rather than single-shot-capped sizing. Confirm which before estimating. |
 | **Multi-source NAV aggregator** (Phase 3) | Independent data sources each submit; median forwarded when M-of-N agree. | At scale. Phases 1→2 (KMS → Fordefi MPC) need **no contract change at all** — `transferOwnership` + `acceptOwnership`; from the feed's perspective it is still one address calling `updateAnswer`, with the MPC threshold happening invisibly at the signing layer. `renounceOwnership()` reverts (GLD-165) — retire a feed by transferring it to a custodian you still control, never by renouncing. |
 | **Solana** | No Solana contracts in this repo. Token standard, custodian and compliance tooling are all EVM-native for v1. | After the EVM flow is battle-tested and a Solana custodian or issuer relationship exists. |
@@ -2383,8 +2624,8 @@ cheatcodes, `GITHUB_TOKEN` restricted to `contents: read`.
 
 | Was | Now | Why it changed |
 |---|---|---|
-| `MAX_STALENESS = 36 hours`, reads revert when exceeded | **96 hours, advisory only**; no read has ever reverted | Never implemented. Both halves were false against the deployed bytecode from the day it was written. The reverting design was then re-rejected on its merits (D-6). |
-| **D-7:** `emergencyUpdateAnswer(int256)` ships, gated on a separate `emergencyUpdater` key, bypassing **both** the interval and deviation caps | **The entire path is deleted.** `updateAnswer` is the feed's only write function and all three of its guards are unconditional (D-19) | **D-7's premise was arithmetically wrong, and that is the reason — not a change of appetite.** It claimed a fat-finger *within* the 10 % band strands the correct price out of reach because chained hourly updates "cannot fix that at all". False: the band is measured against the **last stored** price, and `last` advances with each accepted push, so the reachable set compounds. Worked example, pinned by a passing test — wrong `8_560_000_000`, correct `9_500_000_000`: push `9_416_000_000` (exactly +10 %, and the guard is `>`, so the boundary is **inclusive**), wait 1 h, push `9_500_000_000`. Two calls, two hours. This is general: any answer that passed the band sits within 10 % of what it displaced, so the return trip is at most `ln(1/0.9) = 0.1054` of log-distance against a per-step reach of `ln(1.1) = 0.0953` — **n = 2 for every in-band error**. So the bypass bought roughly two hours of latency. What it cost: an **unbounded, instant, rate-limit-free** price primitive. And the key separation that was supposed to make that safe never held. The feed's owner is the **KMS signer, not the timelock** (`TokenFactory.deployToken` sets the feed owner to `navFeedOwner`; only the forwarder gets the timelock), and `setEmergencyUpdater` was `onlyOwner` with a single check, `newUpdater != owner()`. A compromised KMS key simply appointed a second address it also controlled — one extra transaction — and then had the bypass. The setter's own NatSpec asserted "a compromised KMS key must not be able to call `emergencyUpdateAnswer`"; that goal was never achieved. Live exposure was nonetheless **zero**: `_emergencyUpdater` was `address(0)` in every deploy script and no script ever called `setEmergencyUpdater`. **Do not re-propose this, in owner-callable or separate-key form.** The correct response to a bad NAV is [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure). |
+| `MAX_STALENESS = 36 hours`, reads revert when exceeded | **`stalenessThreshold`, 24 h default, advisory only, owner-settable** (D-22); no read has ever reverted | Never implemented. Both halves were false against the deployed bytecode from the day it was written. The reverting design was then re-rejected on its merits (D-6). |
+| **D-7:** `emergencyUpdateAnswer(int256)` ships, gated on a separate `emergencyUpdater` key, bypassing **both** the interval and deviation caps | **The entire path is deleted.** `updateAnswer` is the feed's only write function and all three of its guards are unconditional (D-19) | **D-7's premise was arithmetically wrong, and that is the reason — not a change of appetite.** It claimed a fat-finger *within* the 10 % band strands the correct price out of reach because chained hourly updates "cannot fix that at all". False: the band is measured against the **last stored** price, and `last` advances with each accepted push, so the reachable set compounds. Worked example, pinned by a passing test — wrong `8_560_000_000`, correct `9_500_000_000`: push `9_416_000_000` (exactly +10 %, and the guard is `>`, so the boundary is **inclusive**), wait 1 h, push `9_500_000_000`. Two calls, two hours. This is general: any answer that passed the band sits within 10 % of what it displaced, so the return trip is at most `ln(1/0.9) = 0.1054` of log-distance against a per-step reach of `ln(1.1) = 0.0953` — **n = 2 for every in-band error**. So the bypass bought roughly two hours of latency. What it cost: an **unbounded, instant, rate-limit-free** price primitive. And the key separation that was supposed to make that safe never held. The feed's owner is the **KMS signer, not the timelock** (`TokenFactory.deployToken` sets the feed owner to `navFeedOwner`; only the forwarder gets the timelock), and `setEmergencyUpdater` was `onlyOwner` with a single check, `newUpdater != owner()`. A compromised KMS key simply appointed a second address it also controlled — one extra transaction — and then had the bypass. The setter's own NatSpec asserted "a compromised KMS key must not be able to call `emergencyUpdateAnswer`"; that goal was never achieved. Live exposure was nonetheless **zero**: `_emergencyUpdater` was `address(0)` in every deploy script and no script ever called `setEmergencyUpdater`. **Do not re-propose this, in owner-callable or separate-key form.** The correct response to a bad NAV is [§11.5](#115-correcting-a-wrong-nav--the-incident-procedure). **Update (audit FIND-003, [D-29](#171-adopted-and-current)):** a correction path is back, and this row is why it looks nothing like D-7. D-7 had two defects. **Appointability** — `setEmergencyUpdater` was `onlyOwner`, so the KMS key reached the bypass alone in one extra transaction; D-29 closes it by making `emergencyUpdater` `immutable` with **no setter at all**, refusing `transferOwnership` to it, and rejecting `guardian == owner` at both the constructor and `TokenFactory.deployToken`. **Unboundedness** — D-7 was instant, arbitrary and un-rate-limited; D-29 is bounded to $0.50-$2.00, a **strict subset** of the $0.10-$5.00 the owner key already reaches by chaining, and fires no faster than the routine hourly path. D-7's own stated goal, "a compromised KMS key must not be able to call `emergencyUpdateAnswer`", is **achieved** by D-29 and was not by D-7: the KMS key cannot call it at all, only sign for it. The prohibition above therefore still stands as written — an owner-callable or owner-*appointable* path remains forbidden. What changed is that a two-key, non-appointable, absolutely-bounded one is not that thing. |
 | ERC-8056 display multiplier permitted as a narrow display-only carve-out (GYL-956) | Removed; the prohibition on any multiplier is absolute again (GYL-1201) | See D-17. |
 | `SanctionsOracleMirror` is a "deployment gap adapter" for chains where Chainalysis never deployed, to be retired when a vendor oracle appears | It is the primary oracle **everywhere**, mainnet included, and is not retired (GYL-1051) | The founding premise inverted. Its access-control design, keeper model and not-a-blacklist argument all carry over unchanged; only the which-chain-uses-which-oracle question reversed. |
 | `GyldSettlementVault` + deferred DvP escrow; v1 `SwapMessage` (`amountIn`/`amountOut`); EIP-712 domain version `"1"` | Self-custodial swap; capped-allowance `SwapMessage` (`maxAmountIn`/`price`); domain version `"2"` | GYL-548 removed the vault; GYL-1201-era work landed the capped-allowance wire format. **Do not implement against the v1 shape.** |

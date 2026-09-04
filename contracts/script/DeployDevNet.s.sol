@@ -44,7 +44,9 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                           In prod: platform MPC wallet / Fordefi — burn quorum (separate)
 ///   WHITELIST_ADMIN      →  IssuanceManager WHITELIST_ADMIN_ROLE (AP whitelist mgmt)
 ///                           In prod: ops Gnosis Safe
-///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls)
+///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls). MUST differ
+///                            from OPS_MULTISIG: the two form the 2-of-2 quorum on the
+///                            feed's emergency correction path (audit FIND-003).
 ///                           In prod: KMS signer
 ///   SANCTIONS_LIST       →  SanctionsOracleMirror (prod) / MockSanctionsList (dev)
 ///
@@ -157,6 +159,16 @@ contract DeployDevNet is Script {
         c.whitelistAdmin = DeployGuards.envAddressProdRequired("WHITELIST_ADMIN", c.deployer);
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
 
+        // audit FIND-003. The NAV feed's emergency path is a 2-of-2: navFeedOwner SIGNS,
+        // the ops multisig (passed to deployToken as `operator`) CALLS. The feed's
+        // constructor refuses a guardian equal to its owner, so on a dev chain — where
+        // BOTH of the above default to the deployer — deployToken would revert. Derive a
+        // distinct dev NAV owner instead. Production is unaffected: envAddressProdRequired
+        // ignores the fallback there and requireDistinct below is the real guard.
+        if (DeployGuards.isDevChain() && c.navFeedOwner == c.opsMultisig) {
+            c.navFeedOwner = vm.addr(uint256(keccak256("DeployDevNet:dev-nav-feed-owner")));
+        }
+
         // On production none of these may be the broadcasting EOA — that is precisely
         // the shape of the GYL-1135 incident, where "handover complete" meant nothing moved.
         DeployGuards.requireNotDeployer(c.governanceMultisig, c.deployer, "GOVERNANCE_MULTISIG");
@@ -169,6 +181,10 @@ contract DeployDevNet is Script {
         // Mint and burn are a deliberate two-key quorum; one address holding both
         // collapses it back into a single point of compromise.
         DeployGuards.requireDistinct(c.subscriber, c.redeemer, "SUBSCRIBER_ADDRESS", "REDEEMER_ADDRESS");
+
+        // Same reasoning for the NAV emergency quorum (audit FIND-003): the key that signs
+        // a correction must not be the key that submits it.
+        DeployGuards.requireDistinct(c.opsMultisig, c.navFeedOwner, "OPS_MULTISIG", "NAV_FEED_OWNER");
 
         // Delay: required on production and never below 48h. On Anvil it defaults to 0
         // (instant schedule+execute for dev convenience); on any other dev chain, 48h.
@@ -425,11 +441,11 @@ contract DeployDevNet is Script {
 
         // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF62, CUSIP 14913UBF6, matures 2028-09-06)
         {
-            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_788_739_200);
+            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_851_811_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62",
-                 1_788_739_200, operator, issuanceMgr_, navFeedOwner)
+                 1_851_811_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"));
@@ -441,11 +457,11 @@ contract DeployDevNet is Script {
 
         // C — Citigroup Inc 3.887% 2028 (ISIN US172967LD16, CUSIP 172967LD1, matures 2028-01-10)
         {
-            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16", 1_767_052_800);
+            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16", 1_831_075_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16",
-                 1_767_052_800, operator, issuanceMgr_, navFeedOwner)
+                 1_831_075_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"));
@@ -457,11 +473,11 @@ contract DeployDevNet is Script {
 
         // KO — Coca-Cola Co 2.25% 2032 (ISIN US191216DP29, CUSIP 191216DP2, matures 2032-09-01)
         {
-            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29", 1_975_017_600);
+            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29", 1_977_609_600);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
                 ("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29",
-                 1_975_017_600, operator, issuanceMgr_, navFeedOwner)
+                 1_977_609_600, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"));
