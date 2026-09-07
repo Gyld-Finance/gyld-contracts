@@ -178,6 +178,49 @@ contract TokenFactoryTest is Test {
         new TokenFactory(address(bondTokenImpl), wrongContract, address(this));
     }
 
+    /// Audit FIND-008. The oracle is baked into every token this factory deploys, so the
+    /// factory's admission must be no looser than GyldBondToken's. A reply that is 32 bytes
+    /// long but not a canonical bool passed the old length-only check here and then reverted
+    /// the ABI validator on every transfer of every series the factory produced.
+    function test_constructor_nonCanonicalBool_sanctionsList_reverts() public {
+        address bad = address(new NonCanonicalSanctionsOracle());
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, bad));
+        new TokenFactory(address(bondTokenImpl), bad, address(this));
+    }
+
+    /// The factory's constructor holds its own copy of the admission logic — it cannot call
+    /// the token's helper before any token exists — so nothing but this test stops the two
+    /// from drifting. That is the failure class D-20 and the shared `ISanctionsList`
+    /// declaration exist to prevent, and a copy the compiler cannot check needs an assertion
+    /// that it still agrees. Every candidate the token would admit, the factory must admit,
+    /// and every one it refuses, the factory must refuse.
+    function test_constructorProbe_agreesWithBondTokenProbe() public {
+        address[4] memory candidates = [
+            address(mockSanctions),
+            address(0xEEEE),
+            address(new MockWrongSanctionsList()),
+            address(new NonCanonicalSanctionsOracle())
+        ];
+        GyldBondToken impl = new GyldBondToken();
+        for (uint256 i; i < candidates.length; ++i) {
+            // What the token itself does with this candidate, via a real initialize.
+            bool tokenAccepts;
+            try new ERC1967Proxy(
+                address(impl),
+                abi.encodeCall(GyldBondToken.initialize, (
+                    "Test Bond", "TST", "XX0000000001", 0,
+                    address(0xAD), address(0xAD), candidates[i]
+                ))
+            ) { tokenAccepts = true; } catch { tokenAccepts = false; }
+
+            try new TokenFactory(address(bondTokenImpl), candidates[i], address(this)) {
+                assertTrue(tokenAccepts, "factory admitted what GyldBondToken rejects");
+            } catch {
+                assertFalse(tokenAccepts, "factory rejected what GyldBondToken admits");
+            }
+        }
+    }
+
     // ── deployToken input guards ──────────────────────────────────────────────
 
     function test_deployToken_zeroOperator_reverts() public {
@@ -1283,3 +1326,11 @@ contract MockSanctionsListTest is Test {
 
 /// @dev A contract with no isSanctioned() — used to test the factory constructor oracle probe.
 contract MockWrongSanctionsList {}
+
+
+/// @dev Returns a full word whose value is 2 — well-formed length, invalid bool (FIND-008).
+contract NonCanonicalSanctionsOracle {
+    fallback() external {
+        assembly { mstore(0, 2) return(0, 32) }
+    }
+}

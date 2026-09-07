@@ -109,10 +109,21 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     ///                        TimelockController (or an address that hands over to one).
     constructor(address bondTokenLogic_, address sanctionsList_, address owner_) Ownable(owner_) {
         if (bondTokenLogic_ == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
+        // Same admission terms as GyldBondToken._probeSanctionsOracle, leg for leg, including
+        // the code-length and canonical-bool checks (audit FIND-008): a word above 1 passes a
+        // length-only probe and then reverts the ABI validator on every transfer of every token
+        // deployed here. This is a hand-rolled copy because no token exists yet to call, and
+        // `sanctionsList` is immutable with no setter — an oracle this constructor admits but
+        // `GyldBondToken.initialize` refuses would make every deployToken revert forever, with
+        // no remedy but redeploying the factory. test_constructorProbe_agreesWithBondTokenProbe
+        // is what holds the two together.
+        if (sanctionsList_.code.length == 0) revert NotValidSanctionsList(sanctionsList_);
         (bool ok, bytes memory data) = sanctionsList_.staticcall(
             abi.encodeWithSignature("isSanctioned(address)", address(0))
         );
-        if (!ok || data.length != 32) revert NotValidSanctionsList(sanctionsList_);
+        if (!ok || data.length != 32 || abi.decode(data, (uint256)) != 0) {
+            revert NotValidSanctionsList(sanctionsList_);
+        }
         bondTokenLogic = bondTokenLogic_;
         sanctionsList  = sanctionsList_;
     }

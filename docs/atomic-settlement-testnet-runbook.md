@@ -82,14 +82,26 @@ would drift out of step with them.
 > from the one at that address; do not reason from the source you can read.
 > Deploy a fresh sanctions oracle (platform `SanctionsOracleMirror`, GYL-1051, or
 > a freshly deployed owner-gated mock for pure dev) and pass it as
-> `SANCTIONS_LIST`. The oracle is baked into each token at `deployToken` time and
-> cannot be repointed afterwards, so this decision is unrecoverable once tokens
-> exist — see the TODO(compliance) below and readiness gap 5.
+> `SANCTIONS_LIST`. The factory's own `sanctionsList` is immutable, so the choice is
+> permanent for every series this factory goes on to deploy — but it is *not*
+> unrecoverable per token: `GyldBondToken.setSanctionsList` re-points an already-deployed
+> series behind the timelock, which is the compliance recovery path. Get it right up
+> front regardless; correcting it later costs one timelocked transaction per live series.
+> Since audit FIND-008 the deploy scripts assert the oracle's ANSWERS, not just its
+> interface: `DeployGuards.requireSanctionsOracleAnswers(oracle, knownFlagged, knownClean,
+> label)` requires `true` for an address you take from the **current** OFAC/SDN feed at run
+> time and `false` for a known-clean one, and it fails loudly if the oracle cannot answer at
+> all. Supply `knownFlagged` fresh each run — never hardcode it, since designations are
+> revoked. This is the check that refuses a freshly deployed, **unseeded**
+> `SanctionsOracleMirror`, which answers `false` for everything and passes every structural
+> check while screening nobody. The token's own admission probe cannot catch that: it asks
+> about `address(0)`, whose correct answer is also `false`.
+> See the TODO(compliance) below and readiness gap 5.
 
 - **TODO(compliance):** decide the sanctions oracle for the fresh testnet stack —
   platform `SanctionsOracleMirror` (GYL-1051) or a freshly deployed owner-gated
-  `MockSanctionsList` for pure dev — **before** step 0. It is baked into each token at
-  `deployToken` time and cannot be repointed afterwards.
+  `MockSanctionsList` for pure dev — **before** step 0. It is fixed for the factory, and
+  changing it per token afterwards costs one timelocked `setSanctionsList` per live series.
 
 ---
 

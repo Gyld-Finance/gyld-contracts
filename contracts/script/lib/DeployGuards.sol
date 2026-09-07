@@ -251,6 +251,75 @@ library DeployGuards {
         }
     }
 
+    /// @notice On production, `oracle` must give the RIGHT answers, not merely well-formed
+    ///         ones: `true` for `knownFlagged` and `false` for `knownClean`. No-op on dev.
+    /// @dev    Audit FIND-008. `GyldBondToken`'s own admission probe is an interface check —
+    ///         it asks about `address(0)`, whose correct answer is `false`, which is also
+    ///         what an oracle wired to `false` returns. It therefore cannot distinguish a
+    ///         working compliance gate from a disabled one, and the finding is right that
+    ///         nothing reverts to signal the difference. Detecting that needs an address
+    ///         genuinely on the list, and this is the layer that can supply one: a deploy
+    ///         script takes a **live SDN designation** from the operator at run time, where
+    ///         a fixture stored in the contract would go stale the moment OFAC delisted it
+    ///         and would then brick the compliance recovery path (D-33).
+    ///
+    ///         This is what catches the case the token cannot: a freshly deployed,
+    ///         **unseeded** `SanctionsOracleMirror` — empty local list, no forwarding oracle
+    ///         — answers `false` for everything, satisfies every structural check, satisfies
+    ///         {requireProdContract} and {requireProdNotMock}, and screens nobody.
+    ///
+    ///         Point-in-time by nature. The mirror's list is rewritten by the keeper every
+    ///         few hours, so this proves the oracle was answering correctly at deploy; the
+    ///         continuous equivalent is the keeper re-running the same two `eth_call`s each
+    ///         cycle against the installed oracle.
+    /// @param  knownFlagged an address on the CURRENT OFAC/SDN feed — read it at run time,
+    ///         never hardcode it.
+    /// @param  knownClean   an address that must not be flagged; the deployer EOA will do.
+    function requireSanctionsOracleAnswers(
+        address oracle,
+        address knownFlagged,
+        address knownClean,
+        string memory label
+    ) internal view {
+        if (isDevChain()) return;
+        if (!_screens(oracle, knownFlagged)) {
+            revert(
+                string.concat(
+                    "DeployGuards: ",
+                    label,
+                    " (",
+                    vm.toString(oracle),
+                    ") does NOT flag known-sanctioned ",
+                    vm.toString(knownFlagged),
+                    " - the oracle is unseeded or screening is disabled"
+                )
+            );
+        }
+        if (_screens(oracle, knownClean)) {
+            revert(
+                string.concat(
+                    "DeployGuards: ",
+                    label,
+                    " (",
+                    vm.toString(oracle),
+                    ") flags known-clean ",
+                    vm.toString(knownClean),
+                    " - it would revert every transfer"
+                )
+            );
+        }
+    }
+
+    /// Read one screening answer on the same terms `GyldBondToken._requireAccess` decodes on.
+    /// Reverts rather than returning false if the oracle cannot answer at all, so an
+    /// unreachable oracle fails the deploy loudly instead of reading as "does not flag".
+    function _screens(address oracle, address who) private view returns (bool) {
+        (bool ok, bytes memory data) =
+            oracle.staticcall(abi.encodeWithSignature("isSanctioned(address)", who));
+        require(ok && data.length == 32, "DeployGuards: sanctions oracle did not answer");
+        return abi.decode(data, (uint256)) == 1;
+    }
+
     // ── Post-deploy assertions (run in-band, inside the broadcast) ─────────────
 
     /// @notice Asserts a role handover actually happened: `holder` HAS `role` on

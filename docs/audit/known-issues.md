@@ -10,7 +10,7 @@ this document and `ci/slither-baseline.json` are kept in step by the build.
 | solc | 0.8.28, `via_ir = true`, `optimizer_runs = 200` |
 | Command | `slither .` (unfiltered — see *The `--filter-paths` trap* below) |
 | Results, whole tree | **1,956** |
-| Results touching `contracts/*.sol` | **50** (46 unique fingerprints) |
+| Results touching `contracts/*.sol` | **49** (45 unique fingerprints) |
 | Live defects found | **0** |
 
 The other ~1,908 results are in `lib/` — OpenZeppelin v5.3.0 and forge-std. They
@@ -201,11 +201,18 @@ They are all deliberately non-conforming: the doubles exist to return malformed
 data, revert selectively, or grief on gas. Making them `is ISanctionsList` would
 force them to be well-behaved and destroy what they test.
 
-### `low-level-calls` ×11 — **Accepted**
+### `low-level-calls` ×10 — **Accepted**
 
 `staticcall` probes in `GyldAtomicSwap.initialize` / `registerSeries`,
-`GyldBondToken.initialize` / `setSanctionsList`, `IssuanceManager.registerToken`,
+`GyldBondToken._requireValidSanctionsOracle`, `IssuanceManager.registerToken`,
 `NAVFeedForwarder` ×3, `SanctionsOracleMirror` ×2, `TokenFactory.constructor`.
+
+The count fell by one at audit FIND-008: `GyldBondToken.initialize` and
+`setSanctionsList` each used to hold their own copy of the sanctions-oracle probe and
+were reported separately. Both now delegate to one `_probeSanctionsOracle`, which the
+`probeSanctionsOracle` / `probeInstalledSanctionsOracle` views also call, so admission
+and monitoring cannot drift apart. Two results collapse into one, and the shared helper
+is the reason the fix is a single site rather than four.
 
 `registerToken` carries **two** probes since audit FIND-009 — `MINTER_ROLE()` and
 `maturityTimestamp()`, the second added because `subscribe` now depends on it — but

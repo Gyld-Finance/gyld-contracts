@@ -7,6 +7,7 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {DeployGuards} from "../script/lib/DeployGuards.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
 import {DeployDevNet} from "../script/DeployDevNet.s.sol";
 import {DeployTimelock} from "../script/DeployTimelock.s.sol";
 import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
@@ -35,13 +36,33 @@ contract GuardsHarness {
     function saltFor(string memory name) external view returns (bytes32) {
         return DeployGuards.saltFor(name);
     }
+
+    /// The guard is `internal view` on a library, so a test can only reach it through a
+    /// wrapper — and it has to be an EXTERNAL one for the same CHAINID reason as above:
+    /// {DeployGuards.requireSanctionsOracleAnswers} short-circuits on `isDevChain()`.
+    function requireSanctionsOracleAnswers(
+        address oracle,
+        address knownFlagged,
+        address knownClean,
+        string memory label
+    ) external view {
+        DeployGuards.requireSanctionsOracleAnswers(oracle, knownFlagged, knownClean, label);
+    }
 }
 
 /// @title DeployGuardsTest
 /// @notice Pure guard-library semantics. Touches no environment variables, so unlike
 ///         {DeployScriptsTest} it is safe to split into as many test functions as useful.
-contract DeployGuardsTest is Test {
+contract DeployGuardsTest is ScriptRevertAsserts {
     GuardsHarness harness;
+
+    uint256 constant PROD_L2 = 8453; // a production L2 that a `!= 1` denylist lets through
+    uint256 constant ANVIL = 31337;
+
+    /// Stand-ins for the two run-time inputs the deploy script takes from the operator:
+    /// an address on the CURRENT SDN feed, and one that must not be flagged.
+    address constant KNOWN_FLAGGED = address(0x5D4);
+    address constant KNOWN_CLEAN = address(0xC1EA);
 
     function setUp() public {
         harness = new GuardsHarness();
@@ -108,9 +129,126 @@ contract DeployGuardsTest is Test {
         );
     }
 
+    // ── requireSanctionsOracleAnswers (audit FIND-008) ────────────────────────
+
+    /// The shape a production deploy is supposed to be given: the real mirror, seeded by
+    /// the keeper, answering `true` for a live designation and `false` for everyone else.
+    function test_requireSanctionsOracleAnswers_acceptsACorrectlySeededOracle() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        vm.chainId(PROD_L2);
+        harness.requireSanctionsOracleAnswers(address(oracle), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+    }
+
+    /// THE headline case, and the one {GyldBondToken}'s own admission probe structurally
+    /// cannot catch: a freshly deployed {SanctionsOracleMirror} with an empty local list
+    /// and no forwarding oracle. It has code, it is not a dev mock, it implements the
+    /// interface, and it answers `false` for `address(0)` exactly as a working oracle
+    /// does — so every structural guard passes while it screens nobody at all.
+    function test_requireSanctionsOracleAnswers_rejectsAnUnseededMirror() public {
+        SanctionsOracleMirror oracle = new SanctionsOracleMirror(address(this), address(this), address(0));
+
+        // The probe the token performs cannot tell this apart from a working oracle.
+        assertFalse(oracle.isSanctioned(address(0)), "unseeded mirror should answer false for address(0)");
+
+        _expectGuardRevert(address(oracle), "does NOT flag known-sanctioned");
+    }
+
+    /// The opposite failure: an oracle wired to `true` passes the "does it flag anyone"
+    /// half and would then revert every single transfer.
+    function test_requireSanctionsOracleAnswers_rejectsAnAlwaysTrueOracle() public {
+        _expectGuardRevert(address(new AlwaysSanctionedOracle()), "flags known-clean");
+    }
+
+    /// Fail-loud, not fail-open. A staticcall that reverts must NOT be read as "does not
+    /// flag" — that would turn an unreachable oracle into a silently disabled one.
+    function test_requireSanctionsOracleAnswers_failsLoudWhenTheOracleReverts() public {
+        _expectGuardRevert(address(new RevertingOracle()), "sanctions oracle did not answer");
+    }
+
+    /// Same property for a well-behaved-looking call that returns fewer than 32 bytes:
+    /// `abi.decode` would read past the buffer, so the length is checked first.
+    function test_requireSanctionsOracleAnswers_failsLoudOnShortReturnData() public {
+        _expectGuardRevert(address(new ShortAnswerOracle()), "sanctions oracle did not answer");
+    }
+
+    /// An address with no code staticcalls "successfully" with zero-length returndata —
+    /// the classic silent pass. It must be caught by the same length check.
+    function test_requireSanctionsOracleAnswers_failsLoudWhenTheOracleHasNoCode() public {
+        _expectGuardRevert(address(0xDEAD), "sanctions oracle did not answer");
+    }
+
+    /// Dev chains cannot supply a live SDN designation, so the guard is a no-op there —
+    /// even for an oracle that would be rejected outright on production.
+    function test_requireSanctionsOracleAnswers_isANoOpOnADevChain() public {
+        SanctionsOracleMirror unseeded = new SanctionsOracleMirror(address(this), address(this), address(0));
+
+        vm.chainId(ANVIL);
+        harness.requireSanctionsOracleAnswers(address(unseeded), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+        harness.requireSanctionsOracleAnswers(address(0xDEAD), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+
+        // ...and the very same oracle is refused once the chain is production.
+        _expectGuardRevert(address(unseeded), "does NOT flag known-sanctioned");
+    }
+
+    /// The real production oracle, seeded the way the keeper seeds it.
+    function _seededMirror() internal returns (SanctionsOracleMirror oracle) {
+        oracle = new SanctionsOracleMirror(address(this), address(this), address(0));
+        address[] memory sdn = new address[](1);
+        sdn[0] = KNOWN_FLAGGED;
+        oracle.addToSanctionsList(sdn);
+    }
+
+    /// Matches the REASON, not merely the fact of a revert — same contract as
+    /// {ScriptRevertAsserts._expectRunRevert}, which cannot be reused directly because the
+    /// guard is not a `run()`. Substring, because the messages interpolate addresses.
+    function _expectGuardRevert(address oracle, string memory needle) internal {
+        vm.chainId(PROD_L2);
+        (bool ok, bytes memory ret) = address(harness).staticcall(
+            abi.encodeWithSelector(
+                GuardsHarness.requireSanctionsOracleAnswers.selector,
+                oracle,
+                KNOWN_FLAGGED,
+                KNOWN_CLEAN,
+                "SANCTIONS_LIST"
+            )
+        );
+        assertFalse(ok, string.concat("expected the guard to revert with: ", needle));
+        string memory reason = _revertReason(ret);
+        assertTrue(
+            _contains(reason, needle),
+            string.concat("wrong revert reason\n   expected substring: ", needle, "\n   actual: ", reason)
+        );
+    }
+
     function _isDev(uint256 chainId) internal returns (bool) {
         vm.chainId(chainId);
         return harness.isDevChain();
+    }
+}
+
+/// An oracle wired to `true`: structurally perfect, and it would freeze the token.
+contract AlwaysSanctionedOracle is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) {
+        return true;
+    }
+}
+
+/// An oracle that cannot answer at all. Must fail the deploy loudly rather than read
+/// as "does not flag".
+contract RevertingOracle is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) {
+        revert("oracle unavailable");
+    }
+}
+
+/// Answers with 4 bytes instead of 32 — a successful call whose payload `abi.decode`
+/// must never be pointed at.
+contract ShortAnswerOracle {
+    fallback() external {
+        assembly {
+            mstore(0, 1)
+            return(0, 4)
+        }
     }
 }
 
