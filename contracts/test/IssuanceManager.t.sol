@@ -6,6 +6,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 contract IssuanceManagerTest is Test {
     // Mirror events for vm.expectEmit (Solidity 0.8.20 doesn't support ContractName.Event syntax)
@@ -554,9 +555,11 @@ contract IssuanceManagerTest is Test {
         rtoken.arm(redeemer, ap, 1e18);
 
         // The burn() call on rtoken will attempt to re-enter redeem() — the
-        // ReentrancyGuard must reject the second call.
+        // ReentrancyGuard must reject the second call. Assert the guard's own selector,
+        // not a bare revert: a bare expectRevert is satisfied by any failure, including
+        // one that never reaches the guard.
         vm.prank(redeemer);
-        vm.expectRevert();
+        vm.expectRevert(ReentrancyGuardUpgradeable.ReentrancyGuardReentrantCall.selector);
         mgr.redeem(address(rtoken), ap, 1e18);
     }
 
@@ -572,7 +575,7 @@ contract IssuanceManagerTest is Test {
         rtoken.armMint(subscriber, ap, 1e18);
 
         vm.prank(subscriber);
-        vm.expectRevert();
+        vm.expectRevert(ReentrancyGuardUpgradeable.ReentrancyGuardReentrantCall.selector);
         mgr.subscribe(address(rtoken), ap, 1e18);
     }
     // ── ERC-7201 storage layout (GYL-1208) ────────────────────────────────────
@@ -763,6 +766,103 @@ contract IssuanceManagerTest is Test {
         vm.prank(admin); mgr.unpauseIssuance();
         vm.prank(subscriber); mgr.subscribe(address(token), ap, 1e18);
     }
+
+    // ── Maturity gate on primary issuance (audit FIND-009 / TEST-61) ─────────
+
+    /// Deploy a second series with a real maturity, wired exactly like the fixture token.
+    /// The fixture's own `token` is open-ended (maturity 0), which is why every test above
+    /// this section is untouched by the gate.
+    function _deployMaturingSeries(uint256 maturity) internal returns (GyldBondToken s) {
+        GyldBondToken tokenImpl = new GyldBondToken();
+        s = GyldBondToken(address(new ERC1967Proxy(
+            address(tokenImpl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Maturing Bond", "MBOND", "US000000MATR", maturity,
+                address(this), address(this), address(mockSanctions)
+            ))
+        )));
+        s.grantRole(s.MINTER_ROLE(), address(mgr));
+        s.grantRole(s.BURNER_ROLE(), address(mgr));
+        vm.prank(registrar); mgr.registerToken(address(s));
+    }
+
+    /// subscribe() depends on maturityTimestamp(), so registration must reject a token that
+    /// lacks it — otherwise the failure surfaces later, as an opaque revert on a live
+    /// subscriber transaction, against a token the registry already blessed.
+    function test_registerToken_withoutMaturityTimestamp_reverts() public {
+        NoMaturityToken bad = new NoMaturityToken();
+        vm.prank(registrar);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.NotValidTokenContract.selector, address(bad)));
+        mgr.registerToken(address(bad));
+    }
+
+    /// TEST-61. The finding itself: a matured series must stop minting.
+    function test_subscribe_revertsOnceSeriesHasMatured() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18); // live: fine
+
+        vm.warp(maturity + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(IssuanceManager.SeriesMatured.selector, address(s), maturity, block.timestamp)
+        );
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+    }
+
+    /// The boundary is closed at the timestamp itself, matching TokenFactory.deployToken,
+    /// which requires a maturity strictly greater than the deploying block.
+    function test_subscribe_revertsAtTheMaturityTimestampItself() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+
+        vm.warp(maturity - 1);
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+        assertEq(s.balanceOf(ap), 1e18, "one second before maturity must still mint");
+
+        vm.warp(maturity);
+        vm.expectRevert(
+            abi.encodeWithSelector(IssuanceManager.SeriesMatured.selector, address(s), maturity, maturity)
+        );
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+    }
+
+    /// 0 is the documented open-ended sentinel — it must never be read as "matured at epoch".
+    function test_subscribe_openEndedSeriesNeverMatures() public {
+        vm.warp(4_000_000_000);
+        assertEq(token.maturityTimestamp(), 0, "fixture series must be open-ended");
+        vm.prank(subscriber); mgr.subscribe(address(token), ap, 1e18);
+        assertEq(token.balanceOf(ap), 1e18, "an open-ended series must keep minting");
+    }
+
+    /// The other half of the remediation: closing issuance must not trap holders. Redeem
+    /// and the token's own transfers stay open after maturity, so an AP can still exit.
+    function test_redeemAndTransferStayOpenAfterMaturity() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 10e18);
+
+        vm.warp(maturity + 365 days);
+
+        // Secondary transfer: unaffected by maturity.
+        address other = address(0xBEEF);
+        vm.prank(ap); s.transfer(other, 1e18);
+        assertEq(s.balanceOf(other), 1e18, "transfers must stay open after maturity");
+
+        // Redemption path: AP sends to the manager, REDEEMER burns.
+        vm.prank(ap); s.transfer(address(mgr), 4e18);
+        vm.prank(redeemer); mgr.redeem(address(s), ap, 4e18);
+        assertEq(s.totalSupply(), 6e18, "redeem must stay open after maturity");
+    }
+
+}
+
+/// @dev Passes the MINTER_ROLE() probe but has no maturityTimestamp() — the shape
+///      registerToken must now reject (audit FIND-009).
+contract NoMaturityToken {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    function mint(address, uint256) external {}
+    function burn(address, uint256) external {}
 }
 
 /// @dev Malicious token that attempts to re-enter IssuanceManager on burn() or mint().
@@ -782,6 +882,11 @@ contract ReentrantToken {
     bool    private _armMint;
 
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    /// Open-ended. `subscribe` reads this before minting (audit FIND-009); without it the
+    /// staticcall reverts on an unknown selector and the reentrancy test above passes for
+    /// the wrong reason — never reaching the guard it exists to exercise.
+    function maturityTimestamp() external pure returns (uint256) { return 0; }
 
     constructor(address mgr) { _mgr = IssuanceManager(mgr); }
 

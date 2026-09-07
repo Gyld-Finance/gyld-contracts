@@ -72,7 +72,7 @@ contract GyldBondToken is
     struct GyldBondTokenStorage {
         ISanctionsList sanctionsList;
         string isin;
-        uint256 maturityTimestamp; // reference data only — never read on-chain (D-25)
+        uint256 maturityTimestamp; // read by IssuanceManager.subscribe, never here (D-30)
         // ── IERC-1643 document management ────────────────────────────────────
         // Appended fields — ERC-7201 layout-safe for the UUPS upgrade of live proxies.
         mapping(bytes32 => Document) documents;
@@ -119,8 +119,9 @@ contract GyldBondToken is
     /// @param name_              Token name (e.g. "Gyld US Treasury Bond 2026-06")
     /// @param symbol_            Ticker (e.g. "GYLD-UST-2606")
     /// @param isin_              ISO 6166 ISIN, e.g. "US912797KR72"
-    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended. Reference data —
-    ///                           not enforced by any function. See maturityTimestamp().
+    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended. Not enforced by any
+    ///                           function on THIS contract — the gate lives one layer up, in
+    ///                           IssuanceManager.subscribe(). See maturityTimestamp().
     /// @param defaultAdmin       Should be a TimelockController in production.
     /// @param pauser             Ops multisig — separate from governance.
     /// @param sanctionsList_     Chainalysis on-chain sanctions oracle (read-only).
@@ -156,11 +157,16 @@ contract GyldBondToken is
 
     function isin() external view returns (string memory) { return _getStorage().isin; }
 
-    /// @notice Maturity date of this series. OFF-CHAIN METADATA — NOT ENFORCED (audit FIND-009).
-    /// @dev    No function reads this value. mint(), transfer(), transferFrom() and
-    ///         IssuanceManager.subscribe() behave identically before and after it, so a matured
-    ///         series stays mintable and tradeable until operations retire it. Retiring is a
-    ///         deliberate manual step (D-25) — integrators must not infer a control here.
+    /// @notice Maturity date of this series. Enforced on primary issuance only (audit FIND-009).
+    /// @dev    NOT enforced by this contract. mint(), transfer() and transferFrom() behave
+    ///         identically before and after this date — deliberately, so holders of a matured
+    ///         series can still exit it, and so correcting a maturity entered wrong never
+    ///         requires upgrading a live bond proxy.
+    ///
+    ///         The gate is one layer up: `IssuanceManager.subscribe()` reads this value and
+    ///         refuses a matured series, and IssuanceManager is the sole MINTER_ROLE holder, so
+    ///         that closes the whole primary-issuance path. An integrator must read this as
+    ///         "no new units are issued after this date", NOT as "the token stops moving" (D-30).
     /// @return Unix maturity timestamp, or 0 for an open-ended series with no fixed maturity.
     function maturityTimestamp() external view returns (uint256) { return _getStorage().maturityTimestamp; }
     function sanctionsList() external view returns (ISanctionsList) { return _getStorage().sanctionsList; }

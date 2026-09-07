@@ -127,8 +127,9 @@ production) and `nonReentrant` besides.
 `GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
 freshness, and the emergency cooldown / signature deadline — audit FIND-003),
 `NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
-cap window, audit FIND-001), `TokenFactory.deployToken` (past-maturity check,
-audit FIND-009).
+cap window, audit FIND-001), `IssuanceManager.subscribe` (per-series maturity
+gate, audit FIND-009), `TokenFactory.deployToken` (past-maturity check, audit
+FIND-009).
 
 Every comparison is on an **hour-to-day** scale: `MIN_UPDATE_INTERVAL` is 1 hour,
 `EMERGENCY_COOLDOWN` is 1 hour, `maxNavAgeSecs` is ceilinged at 72 hours, quote
@@ -144,12 +145,20 @@ that correction still needs **both** keys and still lands inside $0.50-$2.00, so
 the latitude grants no capability the pair did not already have. The `deadline`
 comparison is the owner's own chosen expiry, measured in minutes to hours.
 
-`TokenFactory.deployToken` is the loosest of all: `maturityTimestamp` is a bond
-maturity, months to years out, compared once at deployment to reject a date
-already in the past. A proposer with seconds of latitude cannot move a date
-across that boundary in either direction, and the call is `onlyOwner` (the
-timelock) besides. The check is a payload sanity gate, not a security control —
-D-25 is explicit that maturity is never enforced after deployment.
+The two maturity comparisons are the loosest of all: `maturityTimestamp` is a bond
+maturity, months to years out. `TokenFactory.deployToken` compares it once at
+deployment to reject a date already in the past; `IssuanceManager.subscribe`
+compares it on every mint and refuses a series whose maturity has passed (audit
+FIND-009, D-30). It is the same argument in both places — a proposer with seconds
+of latitude cannot move a date months to years away across that boundary in either
+direction. The `>=` in `subscribe` is deliberately the complement of the `>` in
+`deployToken`, so the boundary second is closed rather than falling through a gap
+between two contracts, but that is an off-by-one concern, not a timestamp-latitude
+one: straddling it would buy one extra subscription at the instant of maturity, and
+`subscribe` is `onlyRole(SUBSCRIBER_ROLE)` (`deployToken` is `onlyOwner`, the
+timelock) so there is no unpermissioned caller to buy it. The mint-path maturity
+gate is a real control rather than a payload sanity gate, but nothing about it is
+reachable by moving the clock a few seconds.
 
 The issuance window deserves the explicit version, because it is the one where
 straddling a boundary *does* buy something: a mint at the end of one window and
@@ -185,6 +194,12 @@ force them to be well-behaved and destroy what they test.
 `staticcall` probes in `GyldAtomicSwap.initialize` / `registerSeries`,
 `GyldBondToken.initialize` / `setSanctionsList`, `IssuanceManager.registerToken`,
 `NAVFeedForwarder` ×3, `SanctionsOracleMirror` ×2, `TokenFactory.constructor`.
+
+`registerToken` carries **two** probes since audit FIND-009 — `MINTER_ROLE()` and
+`maturityTimestamp()`, the second added because `subscribe` now depends on it — but
+the count above does not move: this detector reports once per *function*, listing
+every low-level call inside it, so both probes land in the one result already
+recorded here.
 
 This is the repo's probe-before-store idiom: before storing an address that will
 be called on the hot path, staticcall it and require a well-formed answer, so a

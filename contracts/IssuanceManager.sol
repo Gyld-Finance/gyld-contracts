@@ -36,6 +36,12 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 ///   ISSUANCE_PAUSER_ROLE — halts the mint path; redeem stays open so APs are not trapped
 ///   DEFAULT_ADMIN_ROLE   — also authorizes UUPS upgrades (should be a TimelockController)
 ///
+/// Maturity (audit FIND-009): a series' maturityTimestamp used to be read by nothing, so a
+/// matured bond minted exactly like a live one and closing it depended on an operator
+/// remembering to act. subscribe() now refuses a matured series. It gates the mint path only —
+/// redeem() stays open, and the token's own transfers stay open, so holders of a matured
+/// series can still exit.
+///
 /// Issuance limit (audit FIND-001): subscribe() used to bound only "registered,
 /// whitelisted, non-zero", so one compromised online SUBSCRIBER_ROLE key could mint
 /// without limit — diluting every holder, since NAV is computed against total supply.
@@ -107,6 +113,7 @@ contract IssuanceManager is
     error CannotRemoveLastAdmin(); // audit FIND-007
     error DailyCapExceeded(address token, uint256 requested, uint256 cap);
     error InvalidCap(uint256 cap);
+    error SeriesMatured(address token, uint256 maturityTimestamp, uint256 nowTs); // audit FIND-009
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -161,6 +168,10 @@ contract IssuanceManager is
     /// @dev    Caller must hold SUBSCRIBER_ROLE. The Chainalysis oracle is NOT checked here —
     ///         IssuanceManager pre-screens APs off-chain before calling. Only registered
     ///         tokens and whitelisted recipients are accepted.
+    ///
+    ///         Primary issuance closes at the series' maturity (audit FIND-009). That is a
+    ///         mint-path gate only: `redeem` below and the token's own transfers stay open
+    ///         afterwards, so holders of a matured series are never trapped in it.
     /// @param token     A registered GyldBondToken proxy address.
     /// @param recipient Whitelisted AP wallet that receives the bond tokens.
     /// @param amount    Token amount in 18-decimal units. Must be greater than zero.
@@ -173,6 +184,15 @@ contract IssuanceManager is
         if (!_getStorage().registeredTokens[token]) revert UnregisteredToken(token);
         if (!_getStorage().whitelisted[recipient])   revert NotWhitelisted(recipient);
         if (amount == 0)                             revert ZeroAmount();
+
+        // Maturity (audit FIND-009). Read from the token, which is the single source of
+        // truth for the series; 0 is the documented open-ended sentinel and skips the gate.
+        // `>=` closes issuance at the timestamp itself, matching TokenFactory.deployToken,
+        // which requires a maturity strictly greater than the deploying block.
+        uint256 maturity = IGyldBondToken(token).maturityTimestamp();
+        if (maturity != 0 && block.timestamp >= maturity) {
+            revert SeriesMatured(token, maturity, block.timestamp);
+        }
 
         // Daily cap (audit FIND-001). Roll the window if it has elapsed — or if this
         // series has never minted, so the window anchors here rather than at epoch 0.
@@ -281,6 +301,13 @@ contract IssuanceManager is
         // staticcall handles both EOAs (success=true, data="") and wrong contracts
         // (success=false): we require success AND a full 32-byte return value.
         (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSignature("MINTER_ROLE()"));
+        if (!ok || data.length != 32) revert NotValidTokenContract(token);
+
+        // Probe maturityTimestamp() for the same reason, added with the maturity gate
+        // (audit FIND-009): subscribe() now depends on it, so a token without it would
+        // register cleanly and then revert every subscribe with an opaque unknown-selector
+        // error. Fail here, where the registrar can still do something about it.
+        (ok, data) = token.staticcall(abi.encodeWithSignature("maturityTimestamp()"));
         if (!ok || data.length != 32) revert NotValidTokenContract(token);
         _getStorage().registeredTokens[token] = true;
         emit TokenRegistered(token);

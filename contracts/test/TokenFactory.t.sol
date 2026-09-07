@@ -810,15 +810,19 @@ contract TokenFactoryTest is Test {
         );
     }
 
-    /// The finding itself: past maturity is refused at deploy, but a series that matures
-    /// while live keeps minting. This pins the documented behaviour so a future reader
-    /// cannot mistake the deploy check for an enforcement gate.
-    function test_mintStillWorksAfterMaturity_documentedNotEnforced() public {
+    /// Where the maturity gate does NOT live (audit FIND-009). The token itself never reads
+    /// its own maturity: `mint` is MINTER_ROLE-gated to the IssuanceManager, and that is the
+    /// layer that refuses a matured series — see
+    /// `IssuanceManagerTest.test_subscribe_revertsOnceSeriesHasMatured` (TEST-61). Keeping the
+    /// token layer open is deliberate: it means correcting a wrong maturity never requires
+    /// upgrading a live bond proxy. This pins that split so a reader does not assume the gate
+    /// is here, and so removing it from IssuanceManager cannot pass unnoticed.
+    function test_tokenLayerDoesNotGateMintOnMaturity() public {
         (address token,,) = _deploy();
         vm.warp(TEST_MATURITY + 365 days);
         vm.prank(address(issuanceMgr));
         GyldBondToken(token).mint(operator, 1e18);
-        assertEq(GyldBondToken(token).balanceOf(operator), 1e18, "maturity must not gate mint");
+        assertEq(GyldBondToken(token).balanceOf(operator), 1e18, "the token must not gate mint");
     }
 
     // ── same operator, multiple tokens ───────────────────────────────────────

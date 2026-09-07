@@ -682,11 +682,60 @@ Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
 
 ### Retiring a matured series
 
-`deregisterSeries(token)` is a `DEFAULT_ADMIN_ROLE` timelock proposal — 48 h from
-schedule to execute. Since audit **FIND-024** it **sweeps** any residual balance of
-the series to the `withdrawalWallet` in the same call rather than requiring the
-balance to already be zero, so a leftover position no longer blocks retirement and
-cannot be used to stall it.
+Retirement has two halves that are separately gated and should be reasoned about
+separately: **closing primary issuance** on the `IssuanceManager`, and **retiring
+the series from the swap** with `deregisterSeries`. Neither one needs the bond
+token paused, and pausing it to achieve either is the expensive mistake — see the
+note at the end of this section.
+
+**Primary issuance closes itself at maturity.** Since audit **FIND-009**,
+`IssuanceManager.subscribe` reads the token's `maturityTimestamp()` and reverts
+`SeriesMatured(token, maturity, now)` once `block.timestamp >= maturity`, so for a
+series that has actually reached its stated maturity there is **nothing to do** —
+no proposal, no key, no window. `0` is the open-ended sentinel and skips the gate,
+so an open-ended series never closes on its own. Confirm which case you are in
+before scheduling anything:
+
+```bash
+cast call $TOKEN "maturityTimestamp()(uint256)"                          # 0 = open-ended, never auto-closes
+cast call $EVM_ISSUANCE_MANAGER "registeredTokens(address)(bool)" $TOKEN # subscribe and redeem both need this
+```
+
+The gate is **mint-path only**: `redeem` does not read the maturity, and the token's
+`transfer`, `transferFrom` and `mint` are untouched, so a series closing at its
+maturity never strands a holder or an AP mid-redemption. Pinned by
+`test_redeemAndTransferStayOpenAfterMaturity` in `IssuanceManager.t.sol`.
+
+**Closing a series *early*, ahead of its maturity, is the case with no good lever.**
+There is deliberately nothing on the `IssuanceManager` that closes one series and
+only that series to new issuance: FIND-009 asked for enforcement on the mint path,
+the maturity gate is that enforcement, and it fires on a date rather than on command.
+What is actually available, and what each one costs:
+
+- **`deregisterToken(token)`** is the registry check `subscribe` and `redeem`
+  **share**, so deregistering closes redemption too and strands whoever has already
+  transferred tokens in for burn. In production no live key holds `REGISTRAR_ROLE`
+  besides the immutable `TokenFactory`, which never calls it, so reaching for this
+  means first granting the role.
+- **`setDailyCap(token, 0)`** does not do what it looks like: zero *restores* the
+  1,000,000e18 default rather than disabling minting. It is not an off switch, and
+  reading it as one is the failure mode to avoid here.
+- **`pauseIssuance()`** does stop `subscribe` and leaves `redeem` open, but it is
+  **global** — it closes every series at once, not the one you meant.
+- **`pause()` on the bond token** stops the one series, and costs the most: it gates
+  `burn` as well, so it blocks `redeem`. See the cost note at the end of this section.
+
+So an early close today means pausing that bond token or deregistering it, and both
+block the exit for holders — the pause by freezing transfers and burns, the
+deregistration by closing the shared registry check. Weigh either against simply
+letting the series run to its stated maturity, which now closes issuance by itself
+and costs a holder nothing.
+
+**Retiring from the swap.** `deregisterSeries(token)` is a `DEFAULT_ADMIN_ROLE`
+timelock proposal — 48 h from schedule to execute. Since audit **FIND-024** it
+**sweeps** any residual balance of the series to the `withdrawalWallet` in the same
+call rather than requiring the balance to already be zero, so a leftover position no
+longer blocks retirement and cannot be used to stall it.
 
 **Why that mattered.** The old form required `balanceOf(swap) == 0` *at execution
 time*. `GyldBondToken` screens transfers against Chainalysis and nothing else —
@@ -714,7 +763,8 @@ Two ways it can still revert:
   `GyldBondToken.transfer`, not by the swap. With a **zero** balance there is no
   transfer and a paused token is no obstacle at all.
 
-**The hardened sequence — use this when a griefer is actively re-seeding dust:**
+**The hardened sequence — use this ONLY when a griefer is actively re-seeding dust,
+not as the routine retirement path:**
 
 ```bash
 # 1. Clear the balance the normal way.
@@ -722,6 +772,7 @@ cast send $SWAP "withdraw(address,uint256)" $TOKEN <full-balance> --private-key 
 
 # 2. Pause the BOND TOKEN. PAUSER_ROLE on the token — no admin, no timelock.
 #    This blocks the dust refill outright; nobody can transfer the token at all.
+#    Read the cost note below before doing this.
 cast send $TOKEN "pause()" --private-key $PAUSER_KEY
 
 # 3. Execute the timelock proposal. deregisterSeries only READS the balance —
@@ -732,9 +783,17 @@ cast call $TOKEN "balanceOf(address)(uint256)" $SWAP        # expected: 0
 cast call $SWAP "registeredSeries(address)(bool)" $TOKEN    # expected: false
 ```
 
-This sequence needs no code and closes the griefing window completely. For a
-matured series being retired anyway, pausing the token costs nothing. The sweep in
-step 3 is the belt to this braces — either alone is sufficient.
+This sequence needs no code and closes the griefing window completely, but **step 2
+is not free**, and an earlier revision of this runbook said it was. `pause()` gates
+`transfer`, `transferFrom`, `mint` **and** `burn` on `GyldBondToken`, so it freezes
+every holder in place — no secondary transfer, and no `IssuanceManager.redeem`,
+because `redeem` burns. Pausing to stop issuance on a matured series is using the
+one lever that also blocks the exit, and for a matured series it is now simply
+unnecessary: maturity stops `subscribe` by itself. For an *early* close it stays one
+of the only two levers there are, at exactly this cost — see the list above. Reserve the pause for what it is good at — an active dust
+griefer, or a compromise that warrants freezing the series outright — and unpause as
+soon as step 3 executes. The sweep in step 3 is the belt to this braces; either
+alone is sufficient against dust, so on a quiet series skip the pause entirely.
 
 **On success** the series is gone from `registeredSeries`, `navForwarderOf` and
 `maxNavAgeSecsOf` (the per-series age override, D-23, is cleared so it cannot
