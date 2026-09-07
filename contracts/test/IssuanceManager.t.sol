@@ -631,66 +631,73 @@ contract IssuanceManagerTest is Test {
 
     address pauser = address(0xA5);
 
-    function test_dailyCap_defaultsTo10k() public view {
-        assertEq(mgr.dailyCap(address(token)), 10_000e18);
+    /// Pins the literal. Every other cap test derives from DEFAULT_DAILY_CAP, so this is
+    /// the one place a change to the constant has to be acknowledged deliberately.
+    function test_dailyCap_defaultsTo1M() public view {
+        assertEq(mgr.dailyCap(address(token)), 1_000_000e18);
     }
 
     /// The finding: subscribe() bounded nothing, so one online key could mint without limit.
     function test_subscribe_revertsOverDailyCap() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
         vm.prank(subscriber);
         vm.expectRevert(abi.encodeWithSelector(
-            IssuanceManager.DailyCapExceeded.selector, address(token), 10_000e18 + 1, 10_000e18));
-        mgr.subscribe(address(token), ap, 10_000e18 + 1);
+            IssuanceManager.DailyCapExceeded.selector, address(token), cap + 1, cap));
+        mgr.subscribe(address(token), ap, cap + 1);
     }
 
     /// The cap must hold across many small mints, not just one large one.
     function test_subscribe_capIsCumulativeWithinTheDay() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
         for (uint256 i = 0; i < 10; i++) {
             vm.prank(subscriber);
-            mgr.subscribe(address(token), ap, 1_000e18);
+            mgr.subscribe(address(token), ap, cap / 10);
         }
         (uint256 minted,) = mgr.mintedToday(address(token));
-        assertEq(minted, 10_000e18);
+        assertEq(minted, cap);
 
         vm.prank(subscriber);
         vm.expectRevert(abi.encodeWithSelector(
-            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), 10_000e18));
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), cap));
         mgr.subscribe(address(token), ap, 1);
     }
 
     function test_subscribe_windowResetsAfterADay() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
         vm.prank(subscriber);
-        mgr.subscribe(address(token), ap, 10_000e18);
+        mgr.subscribe(address(token), ap, cap);
 
         vm.warp(block.timestamp + 1 days);
         vm.prank(subscriber);
-        mgr.subscribe(address(token), ap, 10_000e18);
-        assertEq(token.totalSupply(), 20_000e18);
+        mgr.subscribe(address(token), ap, cap);
+        assertEq(token.totalSupply(), 2 * cap);
     }
 
     /// One second early must NOT reset, or the cap is bypassable by waiting slightly less.
     function test_subscribe_windowDoesNotResetEarly() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
         vm.prank(subscriber);
-        mgr.subscribe(address(token), ap, 10_000e18);
+        mgr.subscribe(address(token), ap, cap);
 
         vm.warp(block.timestamp + 1 days - 1);
         vm.prank(subscriber);
         vm.expectRevert(abi.encodeWithSelector(
-            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), 10_000e18));
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), cap));
         mgr.subscribe(address(token), ap, 1);
     }
 
     function test_setDailyCap_raisesAndZeroRestoresDefault() public {
+        uint256 raised = mgr.DEFAULT_DAILY_CAP() * 5;
         vm.prank(admin);
-        mgr.setDailyCap(address(token), 50_000e18);
-        assertEq(mgr.dailyCap(address(token)), 50_000e18);
+        mgr.setDailyCap(address(token), raised);
+        assertEq(mgr.dailyCap(address(token)), raised);
 
         vm.prank(subscriber);
-        mgr.subscribe(address(token), ap, 50_000e18);
+        mgr.subscribe(address(token), ap, raised);
 
         vm.prank(admin);
         mgr.setDailyCap(address(token), 0);
-        assertEq(mgr.dailyCap(address(token)), 10_000e18, "zero restores the default");
+        assertEq(mgr.dailyCap(address(token)), mgr.DEFAULT_DAILY_CAP(), "zero restores the default");
     }
 
     /// Usage.minted is a uint192 and subscribe casts to it explicitly, which Solidity does

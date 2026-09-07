@@ -58,7 +58,13 @@ contract IssuanceManager is
     bytes32 public constant ISSUANCE_PAUSER_ROLE = keccak256("ISSUANCE_PAUSER_ROLE");
 
     /// Daily mint cap applied to a series with no explicit cap set.
-    uint256 public constant DEFAULT_DAILY_CAP = 10_000e18;
+    ///
+    /// Sized against operational AP subscription volume, not against a loss budget: the
+    /// series trade at ~$1.00 NAV, so this is ~$1m of primary issuance per series per day
+    /// (~$2m across a window straddle — see CAP_WINDOW). It is a ceiling that stops an
+    /// unbounded mint, not a tight per-desk limit; the timelock lowers it per series with
+    /// setDailyCap where a tighter bound is wanted.
+    uint256 public constant DEFAULT_DAILY_CAP = 1_000_000e18;
 
     /// Cap window. Fixed and resetting, like Ondo's InstantMintTimeBasedRateLimiter.
     uint256 public constant CAP_WINDOW = 1 days;
