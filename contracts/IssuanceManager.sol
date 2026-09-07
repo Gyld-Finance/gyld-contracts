@@ -47,7 +47,7 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 /// without limit — diluting every holder, since NAV is computed against total supply.
 /// Each series now has a daily mint cap (DEFAULT_DAILY_CAP unless the timelock sets
 /// another). Dual control above a threshold is a Fordefi approval policy rather than an
-/// on-chain check, the same split Ondo and Backed use.
+/// on-chain check — an accepted residual, not a claim that on-chain dual control is unusual.
 contract IssuanceManager is
     Initializable,
     AccessControlUpgradeable,
@@ -72,7 +72,8 @@ contract IssuanceManager is
     /// setDailyCap where a tighter bound is wanted.
     uint256 public constant DEFAULT_DAILY_CAP = 1_000_000e18;
 
-    /// Cap window. Fixed and resetting, like Ondo's InstantMintTimeBasedRateLimiter.
+    /// Cap window. Fixed and resetting, not sliding — hence the 2x straddle in §known-issues.
+    /// A decaying-capacity limiter avoids the instantaneous case if a 1x bound is ever needed.
     uint256 public constant CAP_WINDOW = 1 days;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────

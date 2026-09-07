@@ -59,9 +59,12 @@ contract AtomicSettlementDeployTest is Test {
     int256 constant NAV = 1e8;
     uint16 constant MAX_BPS = 200; // 2% band
     uint32 constant MAX_NAV_AGE = 1 days;
+    /// The timestamp setUp warps to; kept as a literal so timestamp maths never reads
+    /// `block.timestamp` into a local across a warp.
+    uint256 constant SETUP_T0 = 1_750_000_000;
 
     function setUp() public {
-        vm.warp(1_750_000_000); // realistic timestamp so expiry math is meaningful
+        vm.warp(SETUP_T0); // realistic timestamp so expiry math is meaningful
         signer = vm.addr(SIGNER_PK);
         taker = vm.addr(TAKER_PK);
 
@@ -521,5 +524,74 @@ contract AtomicSettlementDeployTest is Test {
             address(issuanceMgr),
             navFeedOwner
         );
+    }
+
+    /// FIND-021 companion to the FIND-001 cap test in Timelock.t.sol: once the production
+    /// handover has happened, moving a series' NAV-round notional cap is a 48h change.
+    ///
+    /// The rest of this suite runs the DEV path on purpose (the test contract keeps
+    /// DEFAULT_ADMIN), so every other call to `setMaxNavRoundNotionalFor` is direct and
+    /// the delay was never exercised against it.
+    function test_setMaxNavRoundNotionalFor_throughTimelock_takesFullDelay() public {
+        address[] memory proposers = new address[](1);
+        proposers[0] = address(0xB3);
+        TimelockController timelock = new TimelockController(48 hours, proposers, proposers, address(0));
+
+        // The wait must be the TIMELOCK's floor, not the proposer's good manners. OZ
+        // `_schedule` stores `block.timestamp + delay` using the CALLER's delay and only
+        // checks minDelay as a lower bound, so a zero-delay timelock plus a polite 48h
+        // proposer is indistinguishable from this test unless minDelay is pinned and a
+        // shorter schedule is proved to bounce. That gap is the GYL-1135
+        // cosmetic-handover shape, guarded for the allowlist at :283-287 but not here.
+        assertEq(timelock.getMinDelay(), 48 hours, "timelock minDelay is not the production floor");
+
+        bytes32 adminRole = swap.DEFAULT_ADMIN_ROLE();
+        uint256 startingCap = swap.maxNavRoundNotionalFor(address(token));
+        uint256 raised = 25_000_000e6; // under MAX_NAV_ROUND_NOTIONAL_CEILING (50M)
+        assertTrue(startingCap != raised, "fixture already at the target cap - test would be vacuous");
+
+        // Script step 7: hand DEFAULT_ADMIN to the timelock, revoke the deployer.
+        swap.grantRole(adminRole, address(timelock));
+        swap.revokeRole(adminRole, address(this));
+
+        // The revoked deployer can no longer move the cap at all.
+        vm.expectRevert();
+        swap.setMaxNavRoundNotionalFor(address(token), raised);
+
+        bytes memory data = abi.encodeCall(GyldAtomicSwap.setMaxNavRoundNotionalFor, (address(token), raised));
+        bytes32 salt = bytes32(uint256(0xF021));
+
+        // A proposal below the floor bounces off the timelock itself.
+        vm.prank(proposers[0]);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TimelockController.TimelockInsufficientDelay.selector, uint256(48 hours - 1), uint256(48 hours)
+            )
+        );
+        timelock.schedule(address(swap), 0, data, bytes32(0), bytes32(uint256(0xF022)), 48 hours - 1);
+
+        vm.prank(proposers[0]);
+        timelock.schedule(address(swap), 0, data, bytes32(0), salt, 48 hours);
+        uint256 readyAt = SETUP_T0 + 48 hours; // scheduled at SETUP_T0, nothing warped before here
+        assertEq(swap.maxNavRoundNotionalFor(address(token)), startingCap, "cap moved at schedule time");
+
+        vm.prank(proposers[0]);
+        vm.expectRevert();
+        timelock.execute(address(swap), 0, data, bytes32(0), salt);
+
+        // Literal timestamps: a local read from `block.timestamp` is materialised at the
+        // optimiser's convenience and can take the WARPED value across a vm.warp (see the
+        // note in Timelock.t.sol's cap test, and :428 in this file). Every boundary here
+        // is a timestamp comparison, so that failure mode is fail-OPEN.
+        vm.warp(readyAt - 1);
+        vm.prank(proposers[0]);
+        vm.expectRevert();
+        timelock.execute(address(swap), 0, data, bytes32(0), salt);
+        assertEq(swap.maxNavRoundNotionalFor(address(token)), startingCap, "cap moved before the delay elapsed");
+
+        vm.warp(readyAt);
+        vm.prank(proposers[0]);
+        timelock.execute(address(swap), 0, data, bytes32(0), salt);
+        assertEq(swap.maxNavRoundNotionalFor(address(token)), raised, "cap did not land after the delay");
     }
 }
