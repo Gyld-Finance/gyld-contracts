@@ -48,6 +48,8 @@ IssuanceManager
   SUBSCRIBER_ROLE      →  MPC wallet A  (subscribe / mint path only). Bounded by a
                           per-series daily mint cap, timelock-only to raise (FIND-001)
   ISSUANCE_PAUSER_ROLE →  Ops key; halts minting. redeem() stays open. Unpause = timelock
+                          Granted at deploy from ISSUANCE_PAUSER; must differ from
+                          SUBSCRIBER_ADDRESS (FIND-001)
   REDEEMER_ROLE        →  MPC wallet B  (redeem / burn path only)
   REGISTRAR_ROLE       →  TokenFactory
 

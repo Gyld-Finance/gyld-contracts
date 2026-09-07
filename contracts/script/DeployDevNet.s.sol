@@ -44,6 +44,12 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                           In prod: platform MPC wallet / Fordefi — burn quorum (separate)
 ///   WHITELIST_ADMIN      →  IssuanceManager WHITELIST_ADMIN_ROLE (AP whitelist mgmt)
 ///                           In prod: ops Gnosis Safe
+///   ISSUANCE_PAUSER      →  IssuanceManager ISSUANCE_PAUSER_ROLE (audit FIND-001). Halts
+///                           subscribe(); redeem() stays open. No delay — it is the brake
+///                           on a compromised SUBSCRIBER key, so it MUST differ from
+///                           SUBSCRIBER_ADDRESS or the same compromise holds the brake.
+///                           Unpause is DEFAULT_ADMIN (the timelock), deliberately not this.
+///                           In prod: ops hot key
 ///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls). MUST differ
 ///                            from OPS_MULTISIG: the two form the 2-of-2 quorum on the
 ///                            feed's emergency correction path (audit FIND-003).
@@ -75,6 +81,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   export SUBSCRIBER_ADDRESS=<fordefi_mint_mpc_address>
 ///   export REDEEMER_ADDRESS=<fordefi_burn_mpc_address>
 ///   export WHITELIST_ADMIN=<gnosis_safe_address>
+///   export ISSUANCE_PAUSER=<ops_hot_key_address>
 ///   export NAV_FEED_OWNER=<kms_signer_address>
 ///   export SANCTIONS_LIST=<sanctions_oracle_mirror>
 ///   export TIMELOCK_DELAY_SECONDS=172800
@@ -98,6 +105,7 @@ contract DeployDevNet is Script {
         address subscriber;
         address redeemer;
         address whitelistAdmin;
+        address issuancePauser;
         address navFeedOwner;
         address sanctionsList; // address(0) on a dev chain ⇒ deploy a MockSanctionsList
         uint256 delay;
@@ -157,6 +165,7 @@ contract DeployDevNet is Script {
         c.subscriber = DeployGuards.envAddressProdRequired("SUBSCRIBER_ADDRESS", c.deployer);
         c.redeemer = DeployGuards.envAddressProdRequired("REDEEMER_ADDRESS", c.deployer);
         c.whitelistAdmin = DeployGuards.envAddressProdRequired("WHITELIST_ADMIN", c.deployer);
+        c.issuancePauser = DeployGuards.envAddressProdRequired("ISSUANCE_PAUSER", c.deployer);
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
 
         // audit FIND-003. The NAV feed's emergency path is a 2-of-2: navFeedOwner SIGNS,
@@ -176,11 +185,17 @@ contract DeployDevNet is Script {
         DeployGuards.requireNotDeployer(c.subscriber, c.deployer, "SUBSCRIBER_ADDRESS");
         DeployGuards.requireNotDeployer(c.redeemer, c.deployer, "REDEEMER_ADDRESS");
         DeployGuards.requireNotDeployer(c.whitelistAdmin, c.deployer, "WHITELIST_ADMIN");
+        DeployGuards.requireNotDeployer(c.issuancePauser, c.deployer, "ISSUANCE_PAUSER");
         DeployGuards.requireNotDeployer(c.navFeedOwner, c.deployer, "NAV_FEED_OWNER");
 
         // Mint and burn are a deliberate two-key quorum; one address holding both
         // collapses it back into a single point of compromise.
         DeployGuards.requireDistinct(c.subscriber, c.redeemer, "SUBSCRIBER_ADDRESS", "REDEEMER_ADDRESS");
+
+        // audit FIND-001. ISSUANCE_PAUSER_ROLE exists to halt minting when the mint key is
+        // compromised. One address holding both means the attacker holds the brake too, so
+        // the pause is not a control — it is a formality.
+        DeployGuards.requireDistinct(c.subscriber, c.issuancePauser, "SUBSCRIBER_ADDRESS", "ISSUANCE_PAUSER");
 
         // Same reasoning for the NAV emergency quorum (audit FIND-003): the key that signs
         // a correction must not be the key that submits it.
@@ -317,6 +332,13 @@ contract DeployDevNet is Script {
         // The factory needs REGISTRAR_ROLE so deployToken can register tokens.
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
+        // ISSUANCE_PAUSER_ROLE (audit FIND-001). Granted here, before the deployer gives up
+        // DEFAULT_ADMIN: afterwards the grant would need a full timelock proposal, which is
+        // how the role shipped with NO holder at all and left pauseIssuance() uncallable.
+        // Not revoked in {_handOverToTimelock} — unlike the transient whitelist grant, this
+        // is a permanent operational role, and its whole point is to act without a delay.
+        issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), c.issuancePauser);
+
         issuanceMgr.addToWhitelist(c.subscriber);
 
         // Anvil account[1] — its private key is printed in the Anvil banner. It exists so
@@ -391,13 +413,21 @@ contract DeployDevNet is Script {
             );
         }
 
-        // 5. The compliance oracle must be a real contract on production — never a mock,
+        // 5. The mint-path brake has a holder (audit FIND-001). A pausable contract whose
+        //    pauser role is unassigned is not pausable; asserting the grant in-band is what
+        //    stops that shipping again.
+        require(
+            issuanceMgr.hasRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), c.issuancePauser),
+            "DeployDevNet: ISSUANCE_PAUSER_ROLE has no holder"
+        );
+
+        // 6. The compliance oracle must be a real contract on production — never a mock,
         //    never an EOA, never an empty address that silently screens nothing.
         DeployGuards.requireProdContract(sanctionsOracle, "sanctions oracle");
         DeployGuards.requireProdNotMock(sanctionsOracle, type(MockSanctionsList).runtimeCode, "sanctions oracle");
         require(factory.sanctionsList() == sanctionsOracle, "DeployDevNet: factory sanctions oracle mismatch");
 
-        // 6. The publicly-known Anvil key is not an AP on a production chain.
+        // 7. The publicly-known Anvil key is not an AP on a production chain.
         if (!DeployGuards.isDevChain()) {
             require(
                 !issuanceMgr.whitelisted(DeployGuards.ANVIL_ACCOUNT_1),
@@ -421,6 +451,9 @@ contract DeployDevNet is Script {
             require(!im.hasRole(im.WHITELIST_ADMIN_ROLE(), deployer), "DeployDevNet: deployer kept WHITELIST_ADMIN_ROLE");
             require(!im.hasRole(im.SUBSCRIBER_ROLE(), deployer), "DeployDevNet: deployer kept SUBSCRIBER_ROLE");
             require(!im.hasRole(im.REDEEMER_ROLE(), deployer), "DeployDevNet: deployer kept REDEEMER_ROLE");
+            require(
+                !im.hasRole(im.ISSUANCE_PAUSER_ROLE(), deployer), "DeployDevNet: deployer kept ISSUANCE_PAUSER_ROLE"
+            );
         }
     }
 

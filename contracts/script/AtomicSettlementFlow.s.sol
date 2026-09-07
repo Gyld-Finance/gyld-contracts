@@ -100,6 +100,13 @@ contract AtomicSettlementFlow is Script {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), deployer);
 
+        // ISSUANCE_PAUSER_ROLE (audit FIND-001). Anvil-only, so this is topology parity
+        // rather than a control: the deployer is already every other role here. Granted to
+        // acct[3] anyway, so a local stack has the same mint-brake shape as production —
+        // a pauser distinct from the SUBSCRIBER key — and pauseIssuance() is exercisable
+        // against this stack instead of reverting for want of a holder.
+        issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), vm.addr(OPERATOR_PK));
+
         TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 

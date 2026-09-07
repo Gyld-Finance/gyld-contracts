@@ -153,6 +153,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     address constant SUBSCRIBER = address(0x5BC1);
     address constant REDEEMER = address(0xEDEE);
     address constant WHITELIST_ADMIN = address(0x117E);
+    address constant ISSUANCE_PAUSER = address(0xBA5E);
     address constant NAV_OWNER = address(0x0AC1);
     address constant TREASURER = address(0x77EA);
     address constant QUOTE_SIGNER = address(0x519E);
@@ -189,6 +190,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_devNet_sanctionsListWithoutCode);
         _run(this.reject_devNet_sanctionsListIsADevMock);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
+        _run(this.reject_devNet_issuancePauserEqualsSubscriber);
+        _run(this.reject_devNet_unsetIssuancePauserOnProd);
         _run(this.accept_devNet_productionHappyPath);
         _run(this.accept_devNet_anvilDevPathStillWorks);
         _run(this.accept_devNet_everySeriesTokenAdminIsTheTimelock);
@@ -307,6 +310,27 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         );
     }
 
+    /// Catches: pointing the mint-path brake at the very key it exists to stop. The pause
+    /// added for audit FIND-001 is only a control while a second party holds it.
+    function reject_devNet_issuancePauserEqualsSubscriber() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        _setAddr("ISSUANCE_PAUSER", SUBSCRIBER);
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "SUBSCRIBER_ADDRESS and ISSUANCE_PAUSER must be different addresses on production"
+        );
+    }
+
+    /// Catches the FIND-001 regression directly: ISSUANCE_PAUSER unset on production must
+    /// abort rather than deploy a "pausable" manager whose pauser role has no holder.
+    function reject_devNet_unsetIssuancePauserOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        vm.setEnv("ISSUANCE_PAUSER", "");
+        _expectRunRevert(address(new DeployDevNet()), "env var ISSUANCE_PAUSER is required on chainId 8453");
+    }
+
     /// Every bond series this run deploys must leave DEFAULT_ADMIN_ROLE with the timelock
     /// and NOT with the broadcaster — the per-token form of the GYL-1135 property
     /// (the other scenarios in this file assert it for IssuanceManager and the swap, but
@@ -348,6 +372,14 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         assertFalse(im.hasRole(im.SUBSCRIBER_ROLE(), DEFAULT_SENDER), "deployer kept SUBSCRIBER_ROLE");
         assertFalse(im.hasRole(im.REDEEMER_ROLE(), DEFAULT_SENDER), "deployer kept REDEEMER_ROLE");
         assertFalse(im.hasRole(im.REGISTRAR_ROLE(), DEFAULT_SENDER), "deployer kept REGISTRAR_ROLE");
+
+        // audit FIND-001: the mint-path brake must actually be held by the ops key, and not
+        // by the deployer. Shipped once with no holder at all, which made pauseIssuance()
+        // uncallable by anyone.
+        assertTrue(
+            im.hasRole(im.ISSUANCE_PAUSER_ROLE(), ISSUANCE_PAUSER), "ops key is not the issuance pauser"
+        );
+        assertFalse(im.hasRole(im.ISSUANCE_PAUSER_ROLE(), DEFAULT_SENDER), "deployer kept ISSUANCE_PAUSER_ROLE");
 
         // A timelock that gates nothing is the heart of the incident.
         assertEq(tl.getMinDelay(), 48 hours, "production timelock delay must be 48h");
@@ -631,6 +663,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _setAddr("SUBSCRIBER_ADDRESS", SUBSCRIBER);
         _setAddr("REDEEMER_ADDRESS", REDEEMER);
         _setAddr("WHITELIST_ADMIN", WHITELIST_ADMIN);
+        _setAddr("ISSUANCE_PAUSER", ISSUANCE_PAUSER);
         _setAddr("NAV_FEED_OWNER", NAV_OWNER);
         _setAddr("SANCTIONS_LIST", address(prodOracle));
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "172800");
@@ -701,12 +734,13 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// from the project root, and an empty value makes `vm.envAddress` / `vm.envUint`
     /// revert — exactly how an unset variable behaves.
     function _clearEnv() internal {
-        string[25] memory keys = [
+        string[26] memory keys = [
             "GOVERNANCE_MULTISIG",
             "OPS_MULTISIG",
             "SUBSCRIBER_ADDRESS",
             "REDEEMER_ADDRESS",
             "WHITELIST_ADMIN",
+            "ISSUANCE_PAUSER",
             "NAV_FEED_OWNER",
             "SANCTIONS_LIST",
             "TIMELOCK_DELAY_SECONDS",
