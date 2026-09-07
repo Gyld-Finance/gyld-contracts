@@ -258,6 +258,12 @@ GYL-1050 — ordering is load-bearing, see script lines 168–177) → allowlist
 `ALLOWED_TAKERS` → hand `DEFAULT_ADMIN_ROLE` to `TIMELOCK_ADDRESS` and revoke the
 deployer.
 
+**Step 1 is a hard prerequisite, not a convention.** `registerSeries` staticcall-probes
+the forwarder's `latestRoundData()` and reverts `NavFeedNotPriced(forwarder)` if the
+feed has never been pushed (audit FIND-002) — so running this script before the NAV
+push fails the broadcast here rather than producing a series that reads as registered
+and reverts `NoPriceSet` inside every later `executeSwap`.
+
 > **Set each series' notional cap before it trades (D-28).** The script does not do
 > this: a freshly registered series falls back to `DEFAULT_MAX_NAV_ROUND_NOTIONAL`
 > ($1M per NAV push), which is a conservative floor, not the operating value. Policy

@@ -188,6 +188,11 @@
     },
     {
       "check": "timestamp",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "registerSeries"
+    },
+    {
+      "check": "timestamp",
       "file": "contracts/IssuanceManager.sol",
       "element": "subscribe"
     },

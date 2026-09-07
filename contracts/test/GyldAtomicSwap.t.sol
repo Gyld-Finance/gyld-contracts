@@ -884,6 +884,91 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(0xD00D), address(navFeed));
     }
 
+    // ── FIND-002: the feed must be able to ANSWER, not just look like an oracle ──
+
+    /// The mechanism isolated: passes the decimals probe, reverts on the read path.
+    function test_registerSeries_forwarderThatCannotAnswer_reverts() public {
+        UnpricedNavForwarder unpriced = new UnpricedNavForwarder();
+        assertEq(unpriced.decimals(), 8, "the decimals probe must still pass, that is the point");
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, address(unpriced)));
+        swap.registerSeries(address(token), address(unpriced));
+
+        assertEq(swap.navForwarderOf(address(token)), address(navFeed), "series must keep its working forwarder");
+    }
+
+    /// Undecodable returndata is refused at admission, not decoded first in a taker's swap.
+    function test_registerSeries_forwarderWithShortReturnData_reverts() public {
+        MalformedNavForwarder malformed = new MalformedNavForwarder();
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, address(malformed)));
+        swap.registerSeries(address(token), address(malformed));
+    }
+
+    /// Non-positive NAV is refused on the same reading _checkQuoteBand takes (InvalidNav).
+    function test_registerSeries_nonPositiveNav_reverts() public {
+        MockNavForwarder zeroed = new MockNavForwarder(NAV);
+        zeroed.setAnswer(0);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, address(zeroed)));
+        swap.registerSeries(address(token), address(zeroed));
+
+        zeroed.setAnswer(-1);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, address(zeroed)));
+        swap.registerSeries(address(token), address(zeroed));
+    }
+
+    /// `updatedAt == 0` is the never-written sentinel: carried with a positive answer it
+    /// fails the age check forever, so the series would be structurally untradeable.
+    function test_registerSeries_zeroUpdatedAt_reverts() public {
+        MockNavForwarder unset = new MockNavForwarder(NAV);
+        unset.setUpdatedAt(0);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, address(unset)));
+        swap.registerSeries(address(token), address(unset));
+    }
+
+    /// A future-dated feed is refused OUTRIGHT by _checkQuoteBand (F-6), so admitting one
+    /// would register a series that cannot trade — the finding's own shape.
+    function test_registerSeries_futureDatedFeed_reverts() public {
+        MockNavForwarder ahead = new MockNavForwarder(NAV);
+        ahead.setUpdatedAt(block.timestamp + 1);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavFeedFutureDated.selector, address(ahead), block.timestamp + 1
+            )
+        );
+        swap.registerSeries(address(token), address(ahead));
+    }
+
+    /// The boundary itself is admissible: updatedAt == now is a feed pushed this block.
+    function test_registerSeries_updatedAtEqualToNow_registers() public {
+        MockNavForwarder now_ = new MockNavForwarder(NAV);
+        now_.setUpdatedAt(block.timestamp);
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(now_));
+        assertEq(swap.navForwarderOf(address(token)), address(now_), "a feed pushed this block registers");
+    }
+
+    /// Not a staleness check, deliberately: a stale-but-priced feed still registers, so
+    /// re-pointing a series during an incident is never blocked (D-32).
+    function test_registerSeries_stalePricedFeed_stillRegisters() public {
+        MockNavForwarder stale = new MockNavForwarder(NAV);
+        stale.setUpdatedAt(block.timestamp - (uint256(MAX_NAV_AGE) * 10));
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(stale));
+        assertEq(swap.navForwarderOf(address(token)), address(stale), "a stale but priced feed registers");
+    }
+
     // ── FIND-024: deregistration sweeps residual inventory ───────────────────
 
     /// Residual inventory is swept to the withdrawalWallet in the same call.
@@ -1940,5 +2025,30 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         swap.registerSeries(address(token), address(navFeed));
         assertEq(swap.maxNavAgeSecsFor(address(token)), MAX_NAV_AGE, "re-registration does not resurrect it");
+    }
+}
+
+/// @dev 8 decimals but a reverting read path — a NAVFeedForwarder in front of a fresh,
+///      never-pushed KaleidoscopeNAVFeed (audit FIND-002).
+contract UnpricedNavForwarder {
+    error NoPriceSet();
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function latestRoundData() external pure returns (uint80, int256, uint256, uint256, uint80) {
+        revert NoPriceSet();
+    }
+}
+
+/// @dev Answers decimals() but returns undecodable (short) latestRoundData returndata.
+contract MalformedNavForwarder {
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function latestRoundData() external pure returns (uint80) {
+        return 1;
     }
 }

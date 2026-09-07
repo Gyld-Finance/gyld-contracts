@@ -466,4 +466,60 @@ contract AtomicSettlementDeployTest is Test {
         swap.executeSwap(fresh, freshSig, _noPermit(), fresh.maxAmountIn);
         assertEq(token.balanceOf(taker), 10e18, "a refreshed real NAV must let the same wiring settle");
     }
+
+    // ── FIND-002: a series may not be registered before its feed has an answer ──
+
+    /// The finding's exact shape against real contracts: deployToken leaves the feed
+    /// UNPRICED, registration is a separate later tx, and decimals() cannot see that.
+    function test_registerSeries_unpricedRealFeed_reverts() public {
+        (address token2,, address forwarder2) = _deploySecondSeries();
+
+        // Well-formed (8dp) yet unable to answer — the whole point.
+        assertEq(NAVFeedForwarder(forwarder2).decimals(), 8, "forwarder must pass the decimals probe");
+        vm.expectRevert(KaleidoscopeNAVFeed.NoPriceSet.selector);
+        NAVFeedForwarder(forwarder2).latestRoundData();
+
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, forwarder2));
+        swap.registerSeries(token2, forwarder2);
+
+        assertFalse(swap.registeredSeries(token2), "an unpriced series must not be admitted");
+        assertEq(swap.navForwarderOf(token2), address(0), "no forwarder may be stored on a refused register");
+    }
+
+    /// The probe enforces deploy ORDER, not a new restriction: push NAV and it registers.
+    function test_registerSeries_afterFirstNavPush_succeeds() public {
+        (address token2, address feed2, address forwarder2) = _deploySecondSeries();
+
+        vm.prank(navFeedOwner);
+        KaleidoscopeNAVFeed(feed2).updateAnswer(NAV);
+
+        swap.registerSeries(token2, forwarder2);
+        assertTrue(swap.registeredSeries(token2), "a priced series must register");
+        assertEq(swap.navForwarderOf(token2), forwarder2, "forwarder must be stored");
+    }
+
+    /// Rotation runs the same probes, so a bad one cannot brick a live series.
+    function test_registerSeries_rotateOntoUnpricedForwarder_reverts() public {
+        (,, address forwarder2) = _deploySecondSeries();
+        address original = swap.navForwarderOf(address(token));
+
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.NavFeedNotPriced.selector, forwarder2));
+        swap.registerSeries(address(token), forwarder2);
+
+        assertEq(swap.navForwarderOf(address(token)), original, "a refused rotation must not move the series");
+        assertTrue(swap.registeredSeries(address(token)), "a refused rotation must not deregister");
+    }
+
+    /// A second real series straight out of the factory, feed unpriced.
+    function _deploySecondSeries() internal returns (address token2, address feed2, address forwarder2) {
+        return factory.deployToken(
+            "Boeing Co 5.15% 2030",
+            "097023DA5",
+            "US097023DA57",
+            1_909_180_800,
+            pauser,
+            address(issuanceMgr),
+            navFeedOwner
+        );
+    }
 }

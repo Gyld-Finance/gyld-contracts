@@ -331,6 +331,17 @@ contract GyldAtomicSwap is
     ///      "unset — fall back to DEFAULT_MAX_QUOTE_TTL", not zero seconds.
     error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
+    /// @dev FIND-002: the forwarder is well-formed but its upstream cannot serve a usable
+    ///      price — `latestRoundData()` reverts, returns too few bytes, or reports a
+    ///      non-positive answer or the `updatedAt == 0` never-written sentinel. Malformed
+    ///      returndata that is long enough but fails ABI validation reverts in the decoder
+    ///      with no reason data instead; it is refused either way, and `_checkQuoteBand`
+    ///      decodes identically, so nothing the probe admits can fail there on shape.
+    error NavFeedNotPriced(address forwarder);
+    /// @dev FIND-002: `updatedAt` ahead of the clock. Same invariant as F-6 at read time and
+    ///      NAVFeedForwarder's configuration-time probe — a future-dated feed is refused by
+    ///      `_checkQuoteBand` outright, so admitting one registers an untradeable series.
+    error NavFeedFutureDated(address forwarder, uint256 updatedAt);
     // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
     // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
@@ -749,12 +760,15 @@ contract GyldAtomicSwap is
     // ── Series registry ───────────────────────────────────────────────────────
 
     /// @notice Register a bond series so this contract can hold, value, and serve it.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Both probes are probe-before-store
-    ///         (house idiom): the forwarder is staticcall-probed for 8 decimals (the NAV
-    ///         scaling in _checkQuoteBand assumes 8dp) and the bond token for 18 decimals
-    ///         (F-1 — the /1e20 ladder assumes 18dp bond / 8dp NAV / 6dp USDC and
-    ///         mis-scales silently for anything else). Re-registering an active series
-    ///         just updates its forwarder.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Three probe-before-store checks (house
+    ///         idiom): forwarder `decimals() == 8` (the NAV scaling in _checkQuoteBand
+    ///         assumes 8dp), bond token `decimals() == 18` (F-1 — the /1e20 ladder assumes
+    ///         18dp bond / 8dp NAV / 6dp USDC and mis-scales silently otherwise), and a
+    ///         `latestRoundData()` that is readable, positive and not future-dated
+    ///         (FIND-002, D-32 — `updateAnswer()` must run first; that was a runbook step,
+    ///         now enforced on-chain).
+    ///         Re-registering an active series just updates its forwarder, under the same
+    ///         three probes, so a bad rotation leaves it pointed at the working one.
     /// @param token        GyldBondToken proxy address (18 decimals).
     /// @param navForwarder NAVFeedForwarder paired with the series (stable address).
     function registerSeries(address token, address navForwarder) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -767,6 +781,28 @@ contract GyldAtomicSwap is
         if (!tokenOk || tokenData.length != 32) revert InvalidTokenDecimals(token, 0);
         uint8 tokenDecimals = abi.decode(tokenData, (uint8));
         if (tokenDecimals != 18) revert InvalidTokenDecimals(token, tokenDecimals);
+        // Liveness, not shape (FIND-002): decimals() is `pure` on KaleidoscopeNAVFeed and
+        // delegated by the forwarder, so the probe above passes on a feed that has never
+        // been pushed — and every executeSwap on such a series reverts NoPriceSet at trade
+        // time. The three rejections below are exactly _checkQuoteBand's own structural
+        // ones (InvalidNav, F-6), so nothing admitted here can be refused there for a
+        // reason registration could have seen. Deliberately NOT an age check: staleness is
+        // per-read against maxNavAgeSecs and heals on the next push (D-32).
+        (bool navOk, bytes memory navData) =
+            navForwarder.staticcall(abi.encodeWithSignature("latestRoundData()"));
+        if (!navOk || navData.length < 160) revert NavFeedNotPriced(navForwarder);
+        // Decoded on the SAME terms as the hot path, deliberately: a looser decode here
+        // would admit a payload _checkQuoteBand then rejects — the divergence this finding
+        // is about. Malformed-but-long returndata therefore fails closed in the decoder.
+        (, int256 probeNav,, uint256 probeUpdatedAt,) =
+            abi.decode(navData, (uint80, int256, uint256, uint256, uint80));
+        // `updatedAt == 0` is the never-written sentinel (KaleidoscopeNAVFeed's NoPriceSet
+        // condition); carried with a positive answer it fails every age check forever.
+        if (probeNav <= 0 || probeUpdatedAt == 0) revert NavFeedNotPriced(navForwarder);
+        // Future-dated is refused OUTRIGHT by _checkQuoteBand (F-6), so a series admitted
+        // with one could never trade. Same invariant NAVFeedForwarder probes on its own
+        // upstream — this is the third place a bad upstream can enter, via a rotation.
+        if (probeUpdatedAt > block.timestamp) revert NavFeedFutureDated(navForwarder, probeUpdatedAt);
         GyldAtomicSwapStorage storage $ = _getStorage();
         if (!$.registeredSeries[token]) $.seriesList.push(token);
         $.registeredSeries[token] = true;

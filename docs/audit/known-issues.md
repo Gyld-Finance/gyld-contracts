@@ -10,7 +10,7 @@ this document and `ci/slither-baseline.json` are kept in step by the build.
 | solc | 0.8.28, `via_ir = true`, `optimizer_runs = 200` |
 | Command | `slither .` (unfiltered — see *The `--filter-paths` trap* below) |
 | Results, whole tree | **1,956** |
-| Results touching `contracts/*.sol` | **49** (45 unique fingerprints) |
+| Results touching `contracts/*.sol` | **50** (46 unique fingerprints) |
 | Live defects found | **0** |
 
 The other ~1,908 results are in `lib/` — OpenZeppelin v5.3.0 and forge-std. They
@@ -122,9 +122,10 @@ bytecode the factory itself just wrote — not attacker-controlled. There is no
 untrusted re-entry point, and `deployToken` is `onlyOwner` (the timelock in
 production) and `nonReentrant` besides.
 
-### `timestamp` ×12 — **False positive**
+### `timestamp` ×13 — **False positive**
 
-`GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
+`GyldAtomicSwap` (quote expiry, NAV age), `GyldAtomicSwap.registerSeries`
+(future-date probe, audit FIND-002), `KaleidoscopeNAVFeed` (update interval,
 freshness, and the emergency cooldown / signature deadline — audit FIND-003),
 `NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
 cap window, audit FIND-001), `IssuanceManager.subscribe` (per-series maturity
@@ -144,6 +145,17 @@ across that boundary would buy one emergency correction marginally early — and
 that correction still needs **both** keys and still lands inside $0.50-$2.00, so
 the latitude grants no capability the pair did not already have. The `deadline`
 comparison is the owner's own chosen expiry, measured in minutes to hours.
+
+The two future-date probes are the least latitude-sensitive of the set, because
+neither is a threshold anyone can straddle for gain: `updatedAt > block.timestamp`
+asks whether a feed is claiming a time that has not happened, and a proposer's few
+seconds of latitude can only move a feed that is *exactly* on the boundary — which
+is `updatedAt == block.timestamp`, a feed pushed in this very block, admitted by
+both probes by design. Reaching the rejecting side requires an upstream genuinely
+dating itself ahead, which is the condition being detected. `registerSeries` is
+`DEFAULT_ADMIN_ROLE` (the timelock) besides, so there is no unpermissioned caller
+to buy anything with the latitude, and the guard's purpose is diagnostic: F-6 in
+`_checkQuoteBand` refuses a future-dated feed at every read regardless.
 
 The two maturity comparisons are the loosest of all: `maturityTimestamp` is a bond
 maturity, months to years out. `TokenFactory.deployToken` compares it once at
@@ -200,6 +212,11 @@ force them to be well-behaved and destroy what they test.
 the count above does not move: this detector reports once per *function*, listing
 every low-level call inside it, so both probes land in the one result already
 recorded here.
+
+`registerSeries` likewise carries **three** probes since audit FIND-002 — forwarder
+`decimals()`, token `decimals()` and forwarder `latestRoundData()`, the third added
+because the first two cannot see whether the feed can answer at all — and for the same
+reason the count does not move.
 
 This is the repo's probe-before-store idiom: before storing an address that will
 be called on the hot path, staticcall it and require a well-formed answer, so a
