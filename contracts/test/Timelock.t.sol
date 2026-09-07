@@ -154,7 +154,7 @@ contract TimelockTest is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         address deployedToken;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] == keccak256("TokenDeployed(address,address,address,address)")) {
+            if (logs[i].topics[0] == keccak256("TokenDeployed(address,address,bytes32,address,address,string)")) {
                 deployedToken = address(uint160(uint256(logs[i].topics[1])));
                 break;
             }

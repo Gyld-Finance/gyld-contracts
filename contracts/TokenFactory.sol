@@ -51,12 +51,18 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// token address → its paired NAVFeedForwarder address (DeFi protocols integrate this)
     mapping(address => address) public forwarderOf;
 
-    /// ISIN bond-salt → whether this ISIN has been deployed on this chain.
-    /// Prevents any same-ISIN deployment regardless of name/symbol/maturity variations,
-    /// because CREATE2 address includes initcode (name+symbol+maturity) so a same-ISIN
-    /// deploy with different name/symbol would land at a different address — creating
-    /// two on-chain tokens for the same real-world bond.
-    mapping(bytes32 => bool) private _deployedIsins;
+    /// ISIN bond-salt (`_bondSalt`) → the token deployed for that ISIN on this chain,
+    /// `address(0)` if none. Prevents any same-ISIN deployment regardless of
+    /// name/symbol/maturity variations, because the CREATE2 address includes initcode
+    /// (name+symbol+maturity) so a same-ISIN deploy with different name/symbol would land
+    /// at a different address — creating two on-chain tokens for the same real-world bond.
+    ///
+    /// Stores the token address rather than a bool (audit FIND-018): a nonzero address
+    /// carries exactly the same "already deployed" meaning, so the duplicate guard is
+    /// unchanged, and the registry now answers the question it exists to support — which
+    /// token belongs to a given bond. `tokenByIsin` is the string-keyed front door;
+    /// this mapping is public for callers that already hold the key.
+    mapping(bytes32 => address) public tokenOfIsinKey;
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -72,11 +78,22 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// renounceOwnership() is disabled — the factory must never be left ownerless.
     error CannotRenounceOwnership();
 
+    /// audit FIND-018 — the deployment log now carries the bond identifier, so the
+    /// ISIN → token association is recoverable from logs alone.
+    /// `isinKey` is `_bondSalt(isin)` = keccak256(isin || chainId), indexed so an indexer
+    /// can pull a series' deployment in one filtered `getLogs`. `isin` rides in the data
+    /// as well, because an `indexed string` stores only its hash in the topic — filterable,
+    /// but not readable.
+    /// `forwarder` moved out of the topics to make room: the EVM allows three indexed
+    /// parameters and the bond identifier is the more useful filter. It is still in the
+    /// data, and still readable from state as `forwarderOf[token]`.
     event TokenDeployed(
         address indexed token,
         address indexed navFeed,
-        address indexed forwarder,
-        address issuanceManager
+        bytes32 indexed isinKey,
+        address forwarder,
+        address issuanceManager,
+        string isin
     );
 
     /// @param bondTokenLogic_ GyldBondToken implementation every proxy delegates to.
@@ -174,7 +191,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         // on-chain tokens for the same real-world bond. Keying by _bondSalt(isin)
         // (ISIN + chainId) catches every same-ISIN deployment regardless of other params.
         bytes32 isinKey = _bondSalt(isin);
-        if (_deployedIsins[isinKey]) revert IsinAlreadyDeployed(isin);
+        if (tokenOfIsinKey[isinKey] != address(0)) revert IsinAlreadyDeployed(isin);
 
         // Preflight: verify factory holds REGISTRAR_ROLE on the IssuanceManager
         // before spending gas on three contract deployments. Without this check,
@@ -196,6 +213,14 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (deployedToken == address(0)) revert ProxyDeployFailed();
         token = deployedToken;
 
+        // Claim the ISIN the instant the address exists, BEFORE any external call.
+        // This slot is read by the duplicate guard above, so writing it after the
+        // role-wiring and feed deployments would leave a checks-effects-interactions
+        // inversion — inert here (`onlyOwner` + `nonReentrant`, and every callee is
+        // bytecode this factory just wrote), but Slither is right to flag the shape
+        // and there is no reason to keep it.
+        tokenOfIsinKey[isinKey] = token;
+
         _wireRoles(token, issuanceManager, operator);
 
         // NAV emergency guardian = `operator`, the ops wallet that already holds
@@ -210,10 +235,9 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         // navFeed directly and has no control over the forwarder pointer.
         forwarder = address(new NAVFeedForwarder(navFeed, owner()));
 
-        _deployedIsins[isinKey] = true;
-        navFeedOf[token]        = navFeed;
-        forwarderOf[token]      = forwarder;
-        emit TokenDeployed(token, navFeed, forwarder, issuanceManager);
+        navFeedOf[token]   = navFeed;
+        forwarderOf[token] = forwarder;
+        emit TokenDeployed(token, navFeed, isinKey, forwarder, issuanceManager, isin);
         IssuanceManager(issuanceManager).registerToken(token);
     }
 
@@ -229,6 +253,16 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     ///         this guard lack it.
     function renounceOwnership() public virtual override {
         revert CannotRenounceOwnership();
+    }
+
+    /// @notice The GyldBondToken deployed for `isin` on this chain, `address(0)` if none.
+    /// @dev    audit FIND-018. The forward lookup — `GyldBondToken.isin()` only answers the
+    ///         reverse. Hashes the ISIN the same way `deployToken` does, so callers do not
+    ///         have to reproduce `keccak256(abi.encodePacked(isin, block.chainid))`
+    ///         themselves. Pairs with `navFeedOf` / `forwarderOf` to reach a series' feed
+    ///         and forwarder from the bond identifier alone.
+    function tokenByIsin(string memory isin) external view returns (address) {
+        return tokenOfIsinKey[_bondSalt(isin)];
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

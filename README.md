@@ -134,8 +134,11 @@ the `IssuanceManager`. Finally push the first NAV and point DeFi markets at the
 
 Token addresses are deterministic — `TokenFactory.predictTokenAddress()` returns the
 proxy address before deployment. The CREATE2 salt is derived from the ISIN **and**
-`block.chainid`, and a separate `_deployedIsins` registry rejects any repeat
-deployment of the same ISIN regardless of name, symbol or maturity.
+`block.chainid`, and a separate `tokenOfIsinKey` registry rejects any repeat
+deployment of the same ISIN regardless of name, symbol or maturity. That registry
+also runs the lookup forwards: `TokenFactory.tokenByIsin(isin)` returns the token
+deployed for a bond on this chain (`address(0)` if none), and every deployment log
+carries the ISIN in both filterable and readable form (audit FIND-018).
 
 **Deploy scripts fail closed (GYL-1135).** Dev chains are an *allowlist* — Anvil
 31337 and Ethereum Sepolia 11155111 only. Every other chain, including ones that do

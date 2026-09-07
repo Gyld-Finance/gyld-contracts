@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
@@ -56,8 +56,10 @@ contract TokenFactoryTest is Test {
     event TokenDeployed(
         address indexed token,
         address indexed navFeed,
-        address indexed forwarder,
-        address issuanceManager
+        bytes32 indexed isinKey,
+        address forwarder,
+        address issuanceManager,
+        string isin
     );
 
     GyldBondToken     bondTokenImpl;
@@ -234,7 +236,7 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sameIsin_differentNameSymbol_reverts() public {
         // Same ISIN + different name/symbol → different CREATE2 address (initcode
-        // includes name/symbol), but the _deployedIsins registry keys by ISIN only,
+        // includes name/symbol), but the ISIN registry keys by ISIN only,
         // so this is correctly caught regardless of what name/symbol is passed.
         _deploy();
         vm.expectRevert();
@@ -246,7 +248,7 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sameIsin_differentMaturity_reverts() public {
         // Same ISIN + different maturity → different CREATE2 address (initcode
-        // includes maturityTimestamp), but the _deployedIsins registry keys by ISIN
+        // includes maturityTimestamp), but the ISIN registry keys by ISIN
         // only, so this is correctly caught regardless of maturity.
         _deploy();
         vm.expectRevert();
@@ -254,6 +256,59 @@ contract TokenFactoryTest is Test {
             "Test Bond", "tBOND", TEST_ISIN, 9_999_999_999,
             operator, address(issuanceMgr), navFeedOwner
         );
+    }
+
+    // ── ISIN → token registry (audit FIND-018 / TEST-69) ──────────────────────
+
+    function test_tokenByIsin_resolvesTheDeployedToken() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "ISIN must resolve to its token");
+    }
+
+    function test_tokenByIsin_unknownIsinIsZero() public view {
+        assertEq(factory.tokenByIsin("US000000000"), address(0));
+    }
+
+    function test_tokenByIsin_zeroBeforeDeployment() public view {
+        assertEq(factory.tokenByIsin(TEST_ISIN), address(0));
+    }
+
+    /// The public mapping is the same answer for callers that already hold the key.
+    function test_tokenOfIsinKey_matchesTokenByIsin() public {
+        (address token,,) = _deploy();
+        bytes32 isinKey = keccak256(abi.encodePacked(TEST_ISIN, block.chainid));
+        assertEq(factory.tokenOfIsinKey(isinKey), token);
+    }
+
+    /// The registry closes the loop with the two token-keyed mappings: from the bond
+    /// identifier alone a caller reaches the token, its feed and its forwarder.
+    function test_tokenByIsin_reachesFeedAndForwarder() public {
+        (address token, address navFeed, address forwarder) = _deploy();
+        address resolved = factory.tokenByIsin(TEST_ISIN);
+        assertEq(resolved, token);
+        assertEq(factory.navFeedOf(resolved),   navFeed);
+        assertEq(factory.forwarderOf(resolved), forwarder);
+        assertEq(GyldBondToken(resolved).isin(), TEST_ISIN, "and the reverse still holds");
+    }
+
+    /// The key mixes in chainId, so the same ISIN is a different slot on another chain.
+    function test_tokenByIsin_isChainScoped() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token);
+        bytes32 otherChainKey = keccak256(abi.encodePacked(TEST_ISIN, uint256(block.chainid + 1)));
+        assertEq(factory.tokenOfIsinKey(otherChainKey), address(0));
+    }
+
+    /// Storing an address instead of a bool must not weaken the duplicate guard:
+    /// a nonzero address means exactly what `true` meant.
+    function test_tokenByIsin_duplicateGuardUnchanged() public {
+        (address token,,) = _deploy();
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.IsinAlreadyDeployed.selector, TEST_ISIN));
+        factory.deployToken(
+            "Another Name", "OTHER", TEST_ISIN, TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "registry unchanged by the rejected call");
     }
 
     // ── deployment ────────────────────────────────────────────────────────────
@@ -281,8 +336,36 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_emitsEvent() public {
         vm.expectEmit(false, false, false, false);
-        emit TokenDeployed(address(0), address(0), address(0), address(0));
+        emit TokenDeployed(address(0), address(0), bytes32(0), address(0), address(0), "");
         _deploy();
+    }
+
+    /// audit FIND-018 / TEST-69 — the log must carry the bond identifier, in both forms:
+    /// `isinKey` in a topic so an indexer can filter by bond, and the readable ISIN in the
+    /// data because an `indexed string` would only put its hash in the topic.
+    function test_deployToken_emitsEventCarryingTheIsin() public {
+        bytes32 expectedKey = keccak256(abi.encodePacked(TEST_ISIN, block.chainid));
+
+        vm.recordLogs();
+        (address token, address navFeed, address forwarder) = _deploy();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != keccak256("TokenDeployed(address,address,bytes32,address,address,string)")) continue;
+            found = true;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), token,   "topic1 token");
+            assertEq(address(uint160(uint256(logs[i].topics[2]))), navFeed, "topic2 navFeed");
+            assertEq(logs[i].topics[3], expectedKey, "topic3 must be the indexed isinKey");
+
+            (address fwd, address im, string memory loggedIsin) =
+                abi.decode(logs[i].data, (address, address, string));
+            assertEq(fwd, forwarder, "forwarder still in the data");
+            assertEq(im, address(issuanceMgr), "issuanceManager still in the data");
+            assertEq(loggedIsin, TEST_ISIN, "the ISIN must be readable, not just hashed");
+            break;
+        }
+        assertTrue(found, "TokenDeployed event not found");
     }
 
     function test_deployToken_tokenRegisteredWithIssuanceManager() public {
