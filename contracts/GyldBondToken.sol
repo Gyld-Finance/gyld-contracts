@@ -223,6 +223,9 @@ contract GyldBondToken is
     // whenNotPaused IS enforced — a paused contract stops all token movement including
     // primary issuance. This ensures a compromised SUBSCRIBER_ROLE or REDEEMER_ROLE key
     // cannot mint or burn after the ops multisig has triggered an emergency pause.
+    // Enforced HERE and only here (FIND-005): `IssuanceManager.subscribe`/`redeem` have no
+    // pause check of their own for the token, so a paused token surfaces as `EnforcedPause()`
+    // raised on this contract and bubbled up unchanged. See IGyldBondToken and the runbook.
     // Sanctions oracle is NOT checked here. IssuanceManager pre-screens APs off-chain.
 
     /// Mint `amount` tokens to `to`.

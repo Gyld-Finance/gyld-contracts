@@ -156,7 +156,9 @@ assertions that abort the deployment on a mismatch. See
   receiver **and spender** against the configured on-chain oracle. Fail-closed — if
   the oracle reverts, or its address is unset, the transfer reverts. No role bypasses this; the contract uses
   `AccessControl`, so there is no `owner` at all. Mint and burn skip the oracle
-  (`IssuanceManager` pre-screens APs off-chain) but still respect `whenNotPaused`.
+  (`IssuanceManager` pre-screens APs off-chain) but still respect `whenNotPaused` — a
+  paused token blocks `subscribe` and `redeem`, raising `EnforcedPause()` on the token
+  (FIND-005; see `IGyldBondToken` and the runbook).
 - **Pause:** `PAUSER_ROLE` halts mint, burn, transfer, transferFrom, approve and
   permit. Note that a pause also freezes DeFi liquidations.
 - **AP whitelist:** only whitelisted addresses may receive primary issuance or be a

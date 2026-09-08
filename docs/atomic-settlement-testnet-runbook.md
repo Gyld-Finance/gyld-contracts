@@ -742,6 +742,17 @@ What is actually available, and what each one costs:
   **global** — it closes every series at once, not the one you meant.
 - **`pause()` on the bond token** stops the one series, and costs the most: it gates
   `burn` as well, so it blocks `redeem`. See the cost note at the end of this section.
+  **FIND-005 — do not read the revert to tell which pause is set.** Both raise
+  `EnforcedPause()` and the payload is the bare 4-byte selector `0xd93c0665` with no
+  contract identity, byte-for-byte identical either way. **Read the state instead:**
+  `cast call <IssuanceManager> "paused()"` and `cast call <bondToken> "paused()"` — both
+  getters are public and independent. A trace also names the reverting frame (a manager
+  pause reverts at depth 1 with no inner call; a token pause shows the inner
+  `GyldBondToken::mint`). This matters because the remedies differ: the token is
+  `unpause()`, `PAUSER_ROLE`, ops multisig, immediate — the manager is
+  `unpauseIssuance()`, `DEFAULT_ADMIN_ROLE`, a 48 h timelock proposal. On `redeem` there
+  is no ambiguity to resolve: it has no pause of its own, so the token is the only
+  candidate.
 
 So an early close today means pausing that bond token or deregistering it, and both
 block the exit for holders — the pause by freezing transfers and burns, the
