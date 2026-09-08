@@ -27,7 +27,7 @@ contract ReentrantAttacker {
 
     function attack() external {
         // issuanceManager = address(this) so registerToken loops back here
-        malFactory.deployToken("Attacker Bond", "ATCK", "US000000001", 0, address(0x1), address(this), navFeedOwner);
+        malFactory.deployToken("Attacker Bond", "ATCK", "US0000000001", 0, address(0x1), address(this), navFeedOwner);
     }
 
     /// @dev Called by the factory during deployToken (step 6: registerToken).
@@ -35,7 +35,7 @@ contract ReentrantAttacker {
     function registerToken(address) external {
         if (!_done) {
             _done = true;
-            malFactory.deployToken("Reentrant Bond", "RENT", "US000000002", 0, address(0x1), address(this), navFeedOwner);
+            malFactory.deployToken("Reentrant Bond", "RENT", "US0000000002", 0, address(0x1), address(this), navFeedOwner);
         }
     }
 
@@ -225,22 +225,114 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_zeroOperator_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, address(0), address(issuanceMgr), navFeedOwner);
+        factory.deployToken("Bond", "BND", "US0000000001", 0, address(0), address(issuanceMgr), navFeedOwner);
     }
 
     function test_deployToken_zeroIssuanceManager_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, operator, address(0), navFeedOwner);
+        factory.deployToken("Bond", "BND", "US0000000001", 0, operator, address(0), navFeedOwner);
     }
 
     function test_deployToken_zeroNavFeedOwner_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, operator, address(issuanceMgr), address(0));
+        factory.deployToken("Bond", "BND", "US0000000001", 0, operator, address(issuanceMgr), address(0));
     }
 
     function test_deployToken_emptyIsin_reverts() public {
         vm.expectRevert(TokenFactory.EmptyIsin.selector);
         factory.deployToken("Bond", "BND", "", 0, operator, address(issuanceMgr), navFeedOwner);
+    }
+
+    // ── FIND-013: the ISIN must be canonical, not merely non-empty ────────────
+    //
+    // `_bondSalt` hashes the RAW string, and so does the duplicate guard that reads it.
+    // So "us14913ubf66" and "US14913UBF66 " are different keys for the SAME real bond:
+    // each one sails past `IsinAlreadyDeployed` and deploys a second token for a series
+    // that already exists. Format validation is what closes that, and these tests pin
+    // each way an operator's payload can arrive non-canonical.
+
+    /// THE headline case. A lowercase ISIN is the same identifier to a human and a
+    /// different salt to the EVM.
+    function test_deployToken_lowercaseIsin_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "us912797kr72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "us912797kr72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// Whitespace is invisible in a spreadsheet cell and load-bearing in a keccak256.
+    function test_deployToken_isinWithTrailingSpace_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR72 "));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR72 ", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// An ISIN is exactly 12 characters. Both sides of that boundary are malformed.
+    function test_deployToken_isinWrongLength_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR7"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR7", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR722"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR722", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// Length alone is not enough: 12 characters with a separator in them is still a
+    /// distinct salt for an existing bond.
+    function test_deployToken_isinWithPunctuation_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797-R72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797-R72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797_R72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797_R72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The empty string keeps its OWN error. `MalformedIsin` says "you typed it wrong";
+    /// `EmptyIsin` says "you typed nothing", and an operator reading a revert reason
+    /// needs to be told which. Covered for the success-of-the-old-guard side by
+    /// test_deployToken_emptyIsin_reverts; asserted here from the FIND-013 direction so
+    /// a future tightening of the format check cannot quietly swallow it.
+    function test_deployToken_emptyIsin_stillRevertsEmptyIsin() public {
+        vm.expectRevert(TokenFactory.EmptyIsin.selector);
+        factory.deployToken(
+            "Test Bond", "tBOND", "", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The finding end to end. Deploy the series with its canonical ISIN, then try the
+    /// case variant the way a re-keyed payload would arrive. Before FIND-013 this second
+    /// call hashed to a different `isinKey`, passed `IsinAlreadyDeployed`, and produced a
+    /// SECOND token for one real bond. It must now be refused on format, and the registry
+    /// must still resolve the one original token and nothing else.
+    function test_deployToken_caseVariantCannotDuplicateASeries() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "precondition: the series is registered");
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "us912797kr72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "us912797kr72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        // The canonical ISIN still resolves to the ONE token, and the variant resolves to
+        // nothing — no second series was created under a near-miss key.
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "the original must still be the answer");
+        assertEq(factory.tokenByIsin("us912797kr72"), address(0), "the variant must own no token");
     }
 
     function test_deployToken_duplicateIsin_reverts() public {
@@ -261,7 +353,7 @@ contract TokenFactoryTest is Test {
         TokenFactory freshFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
         vm.expectRevert();
         freshFactory.deployToken(
-            "Test Bond", "tBOND", "US000000001", 0,
+            "Test Bond", "tBOND", "US0000000001", 0,
             operator, address(issuanceMgr), navFeedOwner
         );
     }
@@ -309,7 +401,7 @@ contract TokenFactoryTest is Test {
     }
 
     function test_tokenByIsin_unknownIsinIsZero() public view {
-        assertEq(factory.tokenByIsin("US000000000"), address(0));
+        assertEq(factory.tokenByIsin("US0000000000"), address(0));
     }
 
     function test_tokenByIsin_zeroBeforeDeployment() public view {
@@ -556,10 +648,10 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sanctionsListSharedAcrossTokens() public {
         (address token1,,) = factory.deployToken(
-            "Bond A", "BONDA", "US000000001", 0, operator, address(issuanceMgr), navFeedOwner
+            "Bond A", "BONDA", "US0000000001", 0, operator, address(issuanceMgr), navFeedOwner
         );
         (address token2,,) = factory.deployToken(
-            "Bond B", "BONDB", "US000000002", 0, operator, address(issuanceMgr), navFeedOwner
+            "Bond B", "BONDB", "US0000000002", 0, operator, address(issuanceMgr), navFeedOwner
         );
         assertEq(address(GyldBondToken(token1).sanctionsList()), address(mockSanctions));
         assertEq(address(GyldBondToken(token2).sanctionsList()), address(mockSanctions));

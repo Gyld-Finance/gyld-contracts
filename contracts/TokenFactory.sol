@@ -70,6 +70,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// audit FIND-003 — navFeedOwner (KMS signer) must differ from operator (NAV guardian).
     error NavFeedOwnerIsOperator();
     error EmptyIsin();
+    /// audit FIND-013 — the ISIN is not 12 uppercase alphanumerics.
+    error MalformedIsin(string isin);
     error IsinAlreadyDeployed(string isin);
     error MaturityInPast(uint256 maturityTimestamp, uint256 nowTs);
     error MissingRegistrarRole(address factory, address issuanceManager);
@@ -146,6 +148,8 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         string memory isin,
         uint256 maturityTimestamp
     ) external view returns (address) {
+        // Audit FIND-013: same rule as deployToken — never quote an undeployable address.
+        _requireCanonicalIsin(isin);
         bytes32 salt = _tokenSalt(_bondSalt(isin));
         return address(uint160(uint256(keccak256(
             abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(_tokenInitCode(name, symbol, isin, maturityTimestamp)))
@@ -190,7 +194,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (navFeedOwner == address(0)    || navFeedOwner == address(this))    revert ZeroAddress();
         // The feed enforces this too; failing here names the variable to fix.
         if (navFeedOwner == operator)      revert NavFeedOwnerIsOperator();
-        if (bytes(isin).length == 0)       revert EmptyIsin();
+        _requireCanonicalIsin(isin);
 
         // A maturity already in the past has no legitimate use and signals a bad payload
         // (audit FIND-009). 0 stays valid — it is the documented open-ended sentinel.
@@ -296,6 +300,20 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         t.grantRole(t.DEFAULT_ADMIN_ROLE(), owner());
         t.revokeRole(t.PAUSER_ROLE(),       address(this));
         t.revokeRole(t.DEFAULT_ADMIN_ROLE(), address(this));
+    }
+
+    /// @dev Audit FIND-013. The salt hashes the raw string, so a case or whitespace variant
+    ///      would pass the duplicate guard and deploy a second token for the same bond.
+    function _requireCanonicalIsin(string memory isin_) internal pure {
+        bytes memory b = bytes(isin_);
+        if (b.length == 0) revert EmptyIsin();
+        if (b.length != 12) revert MalformedIsin(isin_);
+        for (uint256 i; i < 12; ++i) {
+            uint8 c = uint8(b[i]);
+            bool digit = c >= 0x30 && c <= 0x39;
+            bool upper = c >= 0x41 && c <= 0x5A;
+            if (!digit && !upper) revert MalformedIsin(isin_);
+        }
     }
 
     /// CREATE2 salt for a bond series: keccak256(isin || chainId).
