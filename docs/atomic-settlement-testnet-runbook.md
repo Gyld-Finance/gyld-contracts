@@ -616,7 +616,7 @@ evacuate funds, then fix under the timelock.
 | Kill every outstanding quote | `DEFAULT_ADMIN_ROLE` — timelock (schedule + execute) | timelock proposal calling `bumpQuoteEpoch()` on `$SWAP` | All quotes signed for the old epoch revert `QuoteEpochStale`; quote service must re-issue |
 | Cut off a taker | `ALLOWLIST_ADMIN_ROLE` — KMS allowlist key (hot, survives handover by design) | `cast send $SWAP "setAllowed(address,bool)" <taker> false --private-key $ALLOWLIST_ADMIN_KEY` | Immediate, no timelock delay — this is why GYL-1050 split the role |
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
-| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **A paused bond token blocks its own evacuation** — see "Evacuating a paused bond token" below |
+| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **Two things on the bond token can still block it**: the token's own pause (`EnforcedPause`) and sanctions screening of the swap or the `withdrawalWallet` (`AccountSanctioned`) — see "Evacuating a paused bond token" and "Evacuating when screening, not the pause, is the blocker" below |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
 | Correct a NAV that has **gapped >10 %** | **Two keys**: ops multisig (`emergencyUpdater`, immutable) **calls**; KMS signer **signs** | Full procedure in [§6.9](#69-signing-an-emergency-nav-correction-audit-find-003): `cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)"` for the digest, owner signs it raw, **dry-run with `cast call` before spending the Safe quorum**, then submit from the ops multisig | **Verify the true NAV from two sources first — this path skips the deviation cap, which is what normally catches a bad number.** Answer must land in **$0.50-$2.00** (`5e7`-`2e8`); outside that it reverts `EmergencyAnswerOutOfRange` and the ±10 %/h walk-back is the only route. Locks for `EMERGENCY_COOLDOWN` (1 h) afterwards — the same cadence as the routine path, so a cascading event can be corrected again within the hour. Full procedure: ARCHITECTURE.md §11.5 Case C (audit FIND-003) |
 | Correct a wrong NAV **within 10 %** (fat-finger) | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
@@ -634,8 +634,9 @@ blocks evacuation. But moving a bond token means calling that token's `transfer`
 swap.withdraw(bondToken, amt)
   └─ IERC20(bondToken).safeTransfer(withdrawalWallet, amt)
        └─ GyldBondToken.transfer  ← whenNotPaused  ← REVERTS EnforcedPause
-            (_update is never entered — the modifier reverts first, and _update
-             carries only the sanctions check, no pause gate)
+            (_update is never entered — the modifier reverts first. _update
+             carries no pause gate, but it DOES screen sanctions, which is a
+             second and independent blocker — see the next section)
 ```
 
 The revert comes from the **token**, not the swap. `cast` will show `EnforcedPause()`
@@ -697,6 +698,31 @@ a legitimate choice, and the swap's own pause already stops it being traded.
 Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
 `test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot` and
 `test_withdraw_bondToken_afterTokenUnpause_succeeds` in `GyldAtomicSwap.t.sol`.
+
+### Evacuating when screening, not the pause, is the blocker
+
+Past `whenNotPaused`, `GyldBondToken._update` screens **both sides** — the swap (`from`)
+and the `withdrawalWallet` (`to`). A flag on either, or an oracle that reverts, blocks
+evacuation with `AccountSanctioned` / `SanctionsListNotSet`. **Unpausing does nothing
+for this.** Read the revert first: `EnforcedPause` is the section above, this is not.
+
+```bash
+cast call $ORACLE "isSanctioned(address)(bool)" $SWAP
+cast call $ORACLE "isSanctioned(address)(bool)" $WITHDRAWAL_WALLET
+
+# (a) flag on the mirror's own list — keeper key
+cast send $ORACLE "removeFromSanctionsList(address[])" "[$SWAP]" --private-key $SANCTIONS_UPDATER_KEY
+
+# (b) flag from the forwarding oracle, or it reverts — compliance Safe
+cast send $ORACLE "setForwardingOracle(address)" $ZERO --private-key $COMPLIANCE_ADMIN_KEY
+```
+
+(a) does not clear an upstream flag — `isSanctioned` is true if *either* source says so.
+
+**No fast path if the mirror itself is faulty.** Only fix is `setSanctionsList` on every
+affected token, behind the 48 h timelock; a token upgrade is the same timelock. Accepted:
+a carve-out for the swap would give the compliance gate an address that walks through it.
+Revisiting it is a security-model change, not a doc fix. USDC is unaffected.
 
 ### Retiring a matured series
 

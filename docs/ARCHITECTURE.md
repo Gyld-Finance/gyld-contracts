@@ -1229,8 +1229,11 @@ Three deliberate properties:
   ignores the swap's. It cannot ignore the token's: moving a `GyldBondToken` calls
   its `transfer`, which is `whenNotPaused`, so the revert is `EnforcedPause` raised
   by that modifier on `GyldBondToken.transfer` itself — not in the swap, and not in
-  the token's `_update` (which carries only the sanctions check; the pause gate never
-  reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
+  the token's `_update` (no pause gate there). Easy to misattribute from a bare `cast`
+  error. `_update` does screen both `address(swap)` and the `withdrawalWallet`, though —
+  a **second, independent blocker** that reverts `AccountSanctioned` and that unpausing
+  does not fix; remedies in the runbook's **"Evacuating when screening, not the pause,
+  is the blocker"** (FIND-023). USDC has neither gate and
   evacuates normally with both switches pulled. This also gates the
   `deregisterSeries` **sweep** — a residual balance cannot leave until the token is
   unpaused, though an already-empty series retires fine while paused (FIND-024,

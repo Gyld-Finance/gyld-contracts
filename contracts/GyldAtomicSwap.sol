@@ -1059,17 +1059,24 @@ contract GyldAtomicSwap is
     ///         treasury drain must work during an incident pause so funds can be
     ///         evacuated.
     ///
-    ///         Scope of that exemption: it covers THIS contract's pause only. Moving a
-    ///         GyldBondToken calls its `transfer`, which is `whenNotPaused` on the token,
-    ///         so a paused bond token blocks its own evacuation — the revert is
-    ///         `EnforcedPause`, raised by that `whenNotPaused` modifier on
-    ///         GyldBondToken.transfer itself, not here and not in the token's
-    ///         `_update` (which carries only the sanctions check). That is a
-    ///         design requirement: a pause inventory can be moved through is not a pause,
-    ///         and the swap holds no privileged position on the token. Do not add a
-    ///         bypass. Operators unpause the token, withdraw, then re-pause (PAUSER_ROLE
-    ///         on the token — no admin, no timelock); see the runbook's "Evacuating a
-    ///         paused bond token". USDC has no pause and is unaffected.
+    ///         Scope of that exemption: it covers THIS contract's pause only. Two gates
+    ///         on the bond token can still block an evacuation:
+    ///
+    ///         (1) The token's pause — `transfer` is `whenNotPaused`, so the revert is
+    ///         `EnforcedPause` from the token, not here. Not a bug: a pause inventory can
+    ///         move through is not a pause. Unpause the token, withdraw, re-pause
+    ///         (PAUSER_ROLE, no timelock). Runbook: "Evacuating a paused bond token".
+    ///
+    ///         (2) Screening — `_update` screens `address(this)` AND the withdrawalWallet,
+    ///         so a flag on either, or a reverting oracle, gives `AccountSanctioned` and
+    ///         unpausing does not help (audit FIND-023). Fast levers, no timelock:
+    ///         `removeFromSanctionsList` (keeper) for a local flag,
+    ///         `setForwardingOracle(0)` (compliance Safe) for an upstream one. A faulty
+    ///         mirror is the exception: `setSanctionsList` per token behind the 48 h
+    ///         timelock, no faster path. Runbook: "Evacuating when screening, not the
+    ///         pause, is the blocker".
+    ///
+    ///         USDC has neither gate.
     ///
     ///         CEI: no state to write; single external transfer guarded by
     ///         nonReentrant (shared with executeSwap). The treasurer can never redirect
