@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
 import {NAVFeedForwarder} from "../NAVFeedForwarder.sol";
+import {IUpstreamOracle} from "../interfaces/AggregatorV3Interface.sol";
 
 contract NAVFeedForwarderTest is Test {
     event UpstreamOracleUpdated(address indexed previousOracle, address indexed newOracle);
@@ -319,7 +320,7 @@ contract NAVFeedForwarderTest is Test {
         );
         forwarder.setUpstreamOracle(address(bad));
 
-        // Rejected before any state change — the old upstream is still installed.
+        // The revert rolls the pointer back — the old upstream is still installed.
         assertEq(forwarder.upstreamOracle(), address(feedV1), "a rejected probe must not swap the pointer");
     }
 
@@ -366,6 +367,223 @@ contract NAVFeedForwarderTest is Test {
         forwarder.setUpstreamOracle(address(feedV2));
         assertEq(forwarder.upstreamOracle(), address(feedV2));
     }
+
+    // ── delegation cycles (audit FIND-019) ───────────────────────────────────
+
+    /// The defect: `newUpstream == address(this)` catches only a 1-cycle. With the
+    /// probes running BEFORE the pointer write, forwarder B (upstream = A) passes
+    /// every probe when offered to A, because B still resolves through A's OLD
+    /// pointer to the live feed. After the write, A→B→A recurses and every read
+    /// reverts — a bricked oracle behind a timelock. Probing AFTER the write makes
+    /// the same probe recurse, fail, and roll the write back.
+    function test_setUpstreamOracle_rejectsTwoCycle() public {
+        NAVFeedForwarder b = new NAVFeedForwarder(address(forwarder), forwarderOwner);
+
+        // Pre-write, B is indistinguishable from a good upstream — this is exactly
+        // what the old probe order saw, and why it passed.
+        assertEq(b.decimals(), 8, "B answers decimals() before the cycle closes");
+        assertEq(b.version(), 3, "B answers version() before the cycle closes");
+        (, int256 viaB,,,) = b.latestRoundData();
+        assertEq(viaB, ANSWER_V1, "B resolves to the live feed before the cycle closes");
+
+        vm.prank(forwarderOwner);
+        vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, address(b)));
+        forwarder.setUpstreamOracle(address(b));
+    }
+
+    /// Cycles longer than two: A→feedV1, B→A, C→B. Pointing A at C closes A→C→B→A.
+    /// No traversal logic is involved — the read through the new configuration
+    /// recurses whatever the cycle length.
+    function test_setUpstreamOracle_rejectsThreeCycle() public {
+        NAVFeedForwarder b = new NAVFeedForwarder(address(forwarder), forwarderOwner);
+        NAVFeedForwarder c = new NAVFeedForwarder(address(b), forwarderOwner);
+
+        assertEq(c.decimals(), 8, "C resolves to the live feed before the cycle closes");
+        (, int256 viaC,,,) = c.latestRoundData();
+        assertEq(viaC, ANSWER_V1, "C is a valid oracle right up to the moment A is repointed");
+
+        vm.prank(forwarderOwner);
+        vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, address(c)));
+        forwarder.setUpstreamOracle(address(c));
+    }
+
+    /// The revert must roll the pointer back, not leave it half-written — otherwise
+    /// the "failed configuration change" is still a bricked forwarder.
+    function test_setUpstreamOracle_cycleRevert_rollsBackPointer() public {
+        NAVFeedForwarder b = new NAVFeedForwarder(address(forwarder), forwarderOwner);
+
+        vm.prank(forwarderOwner);
+        vm.expectRevert(abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, address(b)));
+        forwarder.setUpstreamOracle(address(b));
+
+        assertEq(forwarder.upstreamOracle(), address(feedV1), "pointer must be the OLD address");
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, ANSWER_V1, "reads must still work after the failed call");
+        assertEq(forwarder.decimals(), 8);
+        assertEq(forwarder.latestAnswer(), ANSWER_V1);
+        (, int256 viaB,,,) = b.latestRoundData();
+        assertEq(viaB, ANSWER_V1, "the would-be cycle partner is undamaged too");
+
+        // And a legitimate swap still succeeds afterwards.
+        vm.prank(feedOwner);
+        feedV2.updateAnswer(ANSWER_V2);
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(feedV2));
+        assertEq(forwarder.upstreamOracle(), address(feedV2));
+    }
+
+    /// EIP-150: the staticcall forwards 63/64 of gas, so the OUTER frame keeps 1/64
+    /// — enough to abi-encode and return InvalidOracle. This cannot pass by accident:
+    /// an out-of-gas outer frame returns EMPTY returndata, so matching the exact
+    /// 36-byte custom error is the proof that the revert completed. Checked across
+    /// three budgets so it is not an artefact of one gas figure — and the logged
+    /// consumption shows the cost is NOT 63/64 of the transaction: the recursing frames
+    /// do almost no work, so the gas reserved at each level is returned. Depth follows
+    /// EIP-150's 63/64 decay and so grows with log(gas) (~450 frames and ~200k gas on a
+    /// 30M-gas tx); the innermost call dies of OOG, never the 1024-frame limit.
+    function test_setUpstreamOracle_cycleRevert_outerFrameCompletesItsRevert() public {
+        NAVFeedForwarder b = new NAVFeedForwarder(address(forwarder), forwarderOwner);
+        bytes memory payload = abi.encodeCall(NAVFeedForwarder.setUpstreamOracle, (address(b)));
+        bytes memory expected = abi.encodeWithSelector(NAVFeedForwarder.InvalidOracle.selector, address(b));
+
+        uint256[3] memory budgets = [uint256(200_000), 1_000_000, 30_000_000];
+        for (uint256 i; i < budgets.length; ++i) {
+            vm.prank(forwarderOwner);
+            uint256 before = gasleft();
+            (bool ok, bytes memory ret) = address(forwarder).call{gas: budgets[i]}(payload);
+            uint256 used = before - gasleft();
+
+            assertFalse(ok, "a cycle-creating call must fail");
+            assertEq(ret, expected, "outer frame must return InvalidOracle, not empty out-of-gas data");
+            assertEq(forwarder.upstreamOracle(), address(feedV1), "pointer must roll back");
+            emit log_named_uint("cycle call gas budget  ", budgets[i]);
+            emit log_named_uint("cycle call gas consumed", used);
+        }
+    }
+
+    /// Regression guard for the reorder: an upstream with NO price yet stays legal.
+    /// `_probeNotFutureDated` deliberately returns early when latestRoundData()
+    /// reverts, and moving it after the write must not change that.
+    function test_setUpstreamOracle_unpricedForwarderChain_stillAccepted() public {
+        // A forwarder in front of a price-less feed: answers decimals()/version(),
+        // reverts latestRoundData. Valid, terminating, not a cycle.
+        NAVFeedForwarder unpriced = new NAVFeedForwarder(address(feedV2), forwarderOwner);
+        assertEq(feedV2.stalenessSeconds(), type(uint256).max, "feedV2 must have no price for this test");
+
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(unpriced));
+        assertEq(forwarder.upstreamOracle(), address(unpriced), "an unpriced upstream must stay legal");
+
+        // The NoPriceSet revert propagates through both hops, as before.
+        vm.expectRevert(KaleidoscopeNAVFeed.NoPriceSet.selector);
+        forwarder.latestRoundData();
+
+        // Once the feed is priced, reads resolve through the chain.
+        vm.prank(feedOwner);
+        feedV2.updateAnswer(ANSWER_V2);
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, ANSWER_V2);
+    }
+
+    /// Control for the cycle tests: a forwarder is a perfectly legal upstream so long
+    /// as the chain terminates. The fix rejects cycles, not chains.
+    function test_setUpstreamOracle_acceptsNonCyclicForwarderChain() public {
+        vm.prank(feedOwner);
+        feedV2.updateAnswer(ANSWER_V2);
+        NAVFeedForwarder mid = new NAVFeedForwarder(address(feedV2), forwarderOwner);
+
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(mid));
+
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, ANSWER_V2, "A -> mid -> feedV2 must read through");
+        assertEq(forwarder.description(), "TLT / USD NAV v2");
+    }
+
+    // ── constant-metadata wrapper cycles (audit FIND-019, second round) ──────
+
+    /// ACCEPTED LIMIT (audit FIND-019). The write-first reorder catches a cycle only when
+    /// the candidate FORWARDS a probed call. A wrapper with constant metadata answers
+    /// decimals() and version() locally, so neither probe traverses, and latestRoundData()
+    /// is tolerated on failure — so this installs and the forwarder reads green on metadata
+    /// while every price call reverts. Pinned so it cannot be mistaken for coverage.
+    function test_setUpstreamOracle_constantMetadataWrapperCycle_isAdmitted_acceptedLimit() public {
+        ConstantMetadataWrapper w = new ConstantMetadataWrapper(address(forwarder));
+        assertEq(w.decimals(), 8, "wrapper answers metadata locally - no probe traverses it");
+        assertEq(w.version(), 3);
+
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(w)); // accepted
+
+        assertEq(forwarder.upstreamOracle(), address(w), "the cycle is installed");
+        assertEq(forwarder.decimals(), 8, "metadata reads green...");
+        vm.expectRevert(); // ...while the price path is dead
+        forwarder.latestRoundData();
+    }
+
+    /// A wrapper is a legitimate upstream when it terminates: same constant metadata,
+    /// pointed at a real feed. Wrappers as such are legal; only a cycle is rejected.
+    function test_setUpstreamOracle_acceptsAcyclicConstantMetadataWrapper() public {
+        vm.prank(feedOwner);
+        feedV2.updateAnswer(ANSWER_V2);
+        ConstantMetadataWrapper w = new ConstantMetadataWrapper(address(feedV2));
+
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(w));
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, ANSWER_V2);
+    }
+
+    /// The same wrapper in front of an UNPRICED feed is still installable — the tolerant
+    /// branch on a failed latestRoundData() is what keeps the deploy-before-first-push
+    /// sequence working, and is why the returndata-size rule was not kept.
+    function test_setUpstreamOracle_acceptsWrapperOverUnpricedFeed() public {
+        ConstantMetadataWrapper w = new ConstantMetadataWrapper(address(feedV2));
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(w));
+        assertEq(forwarder.upstreamOracle(), address(w));
+        vm.expectRevert(KaleidoscopeNAVFeed.NoPriceSet.selector);
+        forwarder.latestRoundData();
+    }
+
+    /// ACCEPTED LIMIT, constructor path. A candidate aimed at the CREATE-predicted forwarder
+    /// address yields a forwarder bricked from birth, repointable only by its owner. The
+    /// constructor's write-first reorder does not stop it for the constant-metadata shape,
+    /// for the same reason the setter does not: no probed call traverses.
+    function test_constructor_wrapperCycleThroughPredictedAddress_isAdmitted_acceptedLimit() public {
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        ConstantMetadataWrapper w = new ConstantMetadataWrapper(predicted);
+        assertEq(
+            vm.computeCreateAddress(address(this), vm.getNonce(address(this))),
+            predicted,
+            "the next CREATE must land on the address the wrapper points at"
+        );
+
+        NAVFeedForwarder born = new NAVFeedForwarder(address(w), forwarderOwner);
+        assertEq(address(born), predicted, "the cycle is closed");
+        vm.expectRevert(); // dead on arrival
+        born.latestRoundData();
+    }
+
+    /// RESIDUAL, asserted rather than hidden. latestAnswer(), getRoundData() and
+    /// description() are never probed. A wrapper whose latestRoundData() is constant too
+    /// leaves NO probed call that traverses, so a cycle reachable only through those
+    /// three still installs: latestRoundData() reads green, latestAnswer() reverts.
+    /// Closing it would mean probing latestAnswer()/getRoundData(), which modern
+    /// aggregators legitimately omit or revert on — the cure regresses Phase 2/3.
+    function test_setUpstreamOracle_residual_cycleOnlyViaUnprobedGetters() public {
+        UnprobedPathWrapper w = new UnprobedPathWrapper(address(forwarder));
+
+        vm.prank(forwarderOwner);
+        forwarder.setUpstreamOracle(address(w)); // accepted - documented residual
+
+        (, int256 answer,,,) = forwarder.latestRoundData();
+        assertEq(answer, 1e8, "the probed path answers, so monitors read green");
+        vm.expectRevert(); // latestAnswer() cycles and dies
+        forwarder.latestAnswer();
+        vm.expectRevert(); // so does getRoundData()
+        forwarder.getRoundData(1);
+    }
 }
 
 /// @dev Oracle stub with a settable `updatedAt`, used to test the future-dated probe.
@@ -404,4 +622,49 @@ contract MockWrongDecimals {
 ///      interface rejection. Passes the decimals check but fails the version() probe.
 contract MockPartialOracle {
     function decimals() external pure returns (uint8) { return 8; }
+}
+
+/// @dev The ordinary DeFi adapter shape: an oracle wrapper that knows its own output
+///      format, so decimals()/version() are constants and only the data calls forward.
+///      Neither metadata probe traverses it — the vehicle for the cycle that defeated
+///      the first FIND-019 fix.
+contract ConstantMetadataWrapper {
+    IUpstreamOracle private immutable _target;
+
+    constructor(address target_) { _target = IUpstreamOracle(target_); }
+
+    function decimals() external pure returns (uint8) { return 8; }
+    function version() external pure returns (uint256) { return 3; }
+    function description() external view returns (string memory) { return _target.description(); }
+    function latestAnswer() external view returns (int256) { return _target.latestAnswer(); }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return _target.latestRoundData();
+    }
+
+    function getRoundData(uint80 roundId) external view returns (uint80, int256, uint256, uint256, uint80) {
+        return _target.getRoundData(roundId);
+    }
+}
+
+/// @dev Answers every PROBED call from constants (decimals, version, latestRoundData)
+///      and forwards only the three that are never probed. Used to pin the residual.
+contract UnprobedPathWrapper {
+    IUpstreamOracle private immutable _target;
+
+    constructor(address target_) { _target = IUpstreamOracle(target_); }
+
+    function decimals() external pure returns (uint8) { return 8; }
+    function version() external pure returns (uint256) { return 3; }
+
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
+        return (1, 1e8, block.timestamp, block.timestamp, 1);
+    }
+
+    function description() external view returns (string memory) { return _target.description(); }
+    function latestAnswer() external view returns (int256) { return _target.latestAnswer(); }
+
+    function getRoundData(uint80 roundId) external view returns (uint80, int256, uint256, uint256, uint80) {
+        return _target.getRoundData(roundId);
+    }
 }

@@ -163,8 +163,12 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    /// @dev Written BEFORE the probe so the probe reads through the NEW pointer: a cycle
+    ///      then recurses, fails, and this revert rolls the write back (audit FIND-019, D-36).
     function _setForwardingOracle(address newOracle) internal {
         if (newOracle == address(this)) revert SelfReferenceOracle();
+        emit ForwardingOracleUpdated(address(forwardingOracle), newOracle);
+        forwardingOracle = ISanctionsList(newOracle);
         if (newOracle != address(0)) {
             // Probe: must implement isSanctioned(address) and return a
             // canonically-decodable bool. Uses the same gas cap and decode
@@ -176,7 +180,6 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
             if (!ok || data.length != 32) revert InvalidForwardingOracle(newOracle);
             abi.decode(data, (bool)); // canonical bool check — reverts on non-zero word > 1
         }
-        emit ForwardingOracleUpdated(address(forwardingOracle), newOracle);
-        forwardingOracle = ISanctionsList(newOracle);
     }
+
 }

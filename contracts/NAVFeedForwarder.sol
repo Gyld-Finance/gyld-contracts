@@ -77,6 +77,8 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     ///                         upgrades have a mandatory delay period.
     constructor(address initialUpstream, address initialOwner) Ownable(initialOwner) {
         if (initialUpstream == address(0)) revert UpstreamCannotBeZero();
+        // Written before the probes, same order as setUpstreamOracle (audit FIND-019).
+        _upstreamOracle = IUpstreamOracle(initialUpstream);
         (bool ok, bytes memory data) = initialUpstream.staticcall(abi.encodeWithSignature("decimals()"));
         if (!ok || data.length != 32 || uint8(data[31]) != 8) revert InvalidOracle(initialUpstream);
         // Also probe version() — pure constant on any AggregatorV3Interface implementation,
@@ -84,7 +86,6 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         (bool okV, bytes memory dataV) = initialUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(initialUpstream);
         _probeNotFutureDated(initialUpstream);
-        _upstreamOracle = IUpstreamOracle(initialUpstream);
         emit UpstreamOracleUpdated(address(0), initialUpstream);
     }
 
@@ -114,7 +115,11 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     function setUpstreamOracle(address newUpstream) external onlyOwner {
         if (newUpstream == address(0)) revert UpstreamCannotBeZero();
         if (newUpstream == address(this)) revert InvalidOracle(newUpstream);
-        // Verify the address implements the oracle interface before storing.
+        // Write FIRST so the probes below read through the NEW pointer: a cycle then
+        // recurses, fails, and this revert rolls the write back (audit FIND-019, D-36).
+        address previous = address(_upstreamOracle);
+        _upstreamOracle = IUpstreamOracle(newUpstream);
+        // Verify the address implements the oracle interface.
         // Uses decimals() — a pure view that never reverts for business-logic
         // reasons (unlike latestRoundData which reverts when no price is set yet).
         // staticcall handles both EOAs (success=true, data="") and wrong contracts
@@ -125,8 +130,6 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         (bool okV, bytes memory dataV) = newUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(newUpstream);
         _probeNotFutureDated(newUpstream);
-        address previous = address(_upstreamOracle);
-        _upstreamOracle = IUpstreamOracle(newUpstream);
         emit UpstreamOracleUpdated(previous, newUpstream);
     }
 

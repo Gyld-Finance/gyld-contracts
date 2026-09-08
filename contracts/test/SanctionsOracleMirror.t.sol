@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
 
 contract SanctionsOracleMirrorTest is Test {
     event SanctionedAddressesAdded(address[] addrs);
@@ -447,8 +448,8 @@ contract SanctionsOracleMirrorTest is Test {
     // ── forwarding oracle failure paths ───────────────────────────────────────
 
     // Forwarding oracle reverts at lookup time → isSanctioned reverts (fail-closed).
-    // Uses SelectiveRevertingOracle: passes the address(0) probe but reverts on all
-    // other addresses — so it can be set, but real lookups fail.
+    // Uses SelectiveRevertingOracle: answers both admission probes but reverts on every
+    // other address — so it can be set, but real lookups fail.
     function test_isSanctioned_forwardingOracleReverts_propagates() public {
         SelectiveRevertingOracle bad = new SelectiveRevertingOracle();
         vm.prank(admin); oracle.setForwardingOracle(address(bad));
@@ -520,6 +521,204 @@ contract SanctionsOracleMirrorTest is Test {
         assertGt(gasUsed, 25_000, "griefing oracle never burned its budget - test is vacuous");
     }
 
+    // ── audit FIND-019: forwarding cycles ─────────────────────────────────────
+
+    /// Builds a chain of real mirrors: mock ← a ← b ← ... and returns them.
+    /// Every link is installed through the normal constructor path.
+    function _chain(uint256 n, address tail)
+        internal
+        returns (SanctionsOracleMirror[] memory ms)
+    {
+        ms = new SanctionsOracleMirror[](n);
+        address prev = tail;
+        for (uint256 i = 0; i < n; i++) {
+            ms[i] = new SanctionsOracleMirror(admin, updater, prev);
+            prev = address(ms[i]);
+        }
+    }
+
+    // 2-cycle: a→mock, b→a. Closing a→b makes a→b→a. Rejected, and a keeps mock.
+    function test_setForwardingOracle_twoCycleRejected() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        mock.setSanctioned(sanctioned1, true);
+        SanctionsOracleMirror[] memory m = _chain(2, address(mock));
+        SanctionsOracleMirror a = m[0];
+        SanctionsOracleMirror b = m[1];
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(SanctionsOracleMirror.InvalidForwardingOracle.selector, address(b))
+        );
+        a.setForwardingOracle(address(b));
+
+        // Write rolled back and the chain still resolves.
+        assertEq(address(a.forwardingOracle()), address(mock));
+        assertTrue(a.isSanctioned(sanctioned1));
+        assertFalse(a.isSanctioned(clean));
+        assertTrue(b.isSanctioned(sanctioned1));
+    }
+
+    // 3-cycle: a→mock, b→a, c→b. Closing a→c makes a→c→b→a.
+    function test_setForwardingOracle_threeCycleRejected() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        mock.setSanctioned(sanctioned1, true);
+        SanctionsOracleMirror[] memory m = _chain(3, address(mock));
+        SanctionsOracleMirror a = m[0];
+        SanctionsOracleMirror c = m[2];
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(SanctionsOracleMirror.InvalidForwardingOracle.selector, address(c))
+        );
+        a.setForwardingOracle(address(c));
+
+        assertEq(address(a.forwardingOracle()), address(mock));
+        assertTrue(c.isSanctioned(sanctioned1));
+    }
+
+    // A non-cyclic chain of mirrors is still installable — the fix rejects cycles, not depth.
+    function test_setForwardingOracle_acyclicChainStillAllowed() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        mock.setSanctioned(sanctioned1, true);
+        SanctionsOracleMirror[] memory m = _chain(2, address(mock));
+
+        vm.prank(admin); oracle.setForwardingOracle(address(m[1])); // oracle→b→a→mock
+        assertEq(address(oracle.forwardingOracle()), address(m[1]));
+        assertTrue(oracle.isSanctioned(sanctioned1));
+        assertFalse(oracle.isSanctioned(clean));
+    }
+
+    // The failed probe returns ok == false rather than bubbling an out-of-gas: the whole
+    // rejected call stays inside a small multiple of FORWARDING_GAS.
+    function test_setForwardingOracle_cycleRejection_isCheap() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        SanctionsOracleMirror[] memory m = _chain(2, address(mock));
+
+        uint256 before = gasleft();
+        vm.prank(admin);
+        try m[0].setForwardingOracle{gas: 1_000_000}(address(m[1])) {
+            revert("cycle should have been rejected");
+        } catch {}
+        uint256 used = before - gasleft();
+        emit log_named_uint("FIND-019 rejected-cycle gas", used);
+        assertLt(used, 200_000);
+    }
+
+    // address(0) is "no forwarding": the probe is skipped, so it works even when the
+    // currently-installed oracle is dead. This is the escape hatch out of a bad config.
+    function test_setForwardingOracle_zeroSkipsProbe_evenWithDeadOracle() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+        vm.etch(address(mock), ""); // installed oracle now unreadable
+
+        vm.prank(admin); oracle.setForwardingOracle(address(0));
+        assertEq(address(oracle.forwardingOracle()), address(0));
+        assertFalse(oracle.isSanctioned(clean));
+    }
+
+    // ── audit FIND-019: constructor path ──────────────────────────────────────
+
+    // The constructor calls _setForwardingOracle too, so it now writes the pointer before
+    // probing. An oracle that reads back through its caller therefore hits an address with
+    // no code yet — staticcall succeeds with empty returndata, the callee reverts, the probe
+    // sees ok == false, and construction fails closed. No half-built mirror survives.
+    function test_constructor_oracleThatReadsBackThroughCaller_reverts() public {
+        CallerBackReferenceOracle back = new CallerBackReferenceOracle();
+        vm.expectRevert(
+            abi.encodeWithSelector(SanctionsOracleMirror.InvalidForwardingOracle.selector, address(back))
+        );
+        new SanctionsOracleMirror(admin, updater, address(back));
+    }
+
+    // Same oracle, post-construction: now address(this) HAS code, so the read back is real
+    // recursion. It still terminates on the gas cap and is still rejected.
+    function test_setForwardingOracle_oracleThatReadsBackThroughCaller_reverts() public {
+        CallerBackReferenceOracle back = new CallerBackReferenceOracle();
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        vm.prank(admin); oracle.setForwardingOracle(address(mock));
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(SanctionsOracleMirror.InvalidForwardingOracle.selector, address(back))
+        );
+        oracle.setForwardingOracle(address(back));
+
+        assertEq(address(oracle.forwardingOracle()), address(mock));
+        assertFalse(oracle.isSanctioned(clean));
+    }
+
+    // A mirror constructed onto a live chain of mirrors still works (constructor probe
+    // passes through two hops).
+    function test_constructor_withMirrorChain() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        mock.setSanctioned(sanctioned1, true);
+        SanctionsOracleMirror[] memory m = _chain(2, address(mock));
+        SanctionsOracleMirror top = new SanctionsOracleMirror(admin, updater, address(m[1]));
+        assertTrue(top.isSanctioned(sanctioned1));
+        assertFalse(top.isSanctioned(clean));
+    }
+
+    // ── audit FIND-019: per-address routing is NOT caught (accepted limit) ───
+
+    // ACCEPTED LIMIT. The probe asks one question — isSanctioned(address(0)). A candidate
+    // that short-circuits that address (defensible on its face: it is the mint/burn
+    // endpoint) and forwards every other address back into the mirror passes admission and
+    // then bricks screening for every real holder. A second, derived probe subject was
+    // tried and removed: a router sharding its keyspace on a property of the address
+    // (parity, bitmask) still passed ~55% of the time, so the extra subject bought a coin
+    // flip for permanent bytecode and gas. The control that actually works is a deploy-time
+    // and monitoring read of the INSTALLED oracle against a fresh subject — see D-36.
+    function test_setForwardingOracle_perAddressRouter_isAdmitted_acceptedLimit() public {
+        SelectiveRouter r = new SelectiveRouter();
+        r.shortCircuit(address(0));
+
+        vm.prank(admin);
+        oracle.setForwardingOracle(address(r)); // admitted
+        assertEq(address(oracle.forwardingOracle()), address(r));
+
+        vm.expectRevert(); // and every real holder is now unscreenable
+        oracle.isSanctioned(clean);
+    }
+
+    // ── audit FIND-019: head-first chaining is NOT caught (accepted limit) ────
+
+    // ACCEPTED LIMIT, and the more natural wiring order. Every mirror is deployed with
+    // forwardingOracle = 0, which skips the probe entirely; pointing each at the NEXT one
+    // means the candidate's own forwardingOracle is still zero when probed, so every probe
+    // is a trivial one-hop pass. No cycle is ever formed, yet the head bricks once the
+    // chain outgrows FORWARDING_GAS. Depth cannot be bounded at admission: a parent's view
+    // of depth goes stale the moment a child gains its own child.
+    function test_headFirstChain_everyProbePasses_thenHeadBricks_acceptedLimit() public {
+        uint256 n = 30; // warm-read depth; a cold read dies far shallower
+        SanctionsOracleMirror[] memory ms = new SanctionsOracleMirror[](n);
+        for (uint256 i = 0; i < n; i++) ms[i] = new SanctionsOracleMirror(admin, updater, address(0));
+
+        for (uint256 i = 0; i + 1 < n; i++) {
+            vm.prank(admin);
+            ms[i].setForwardingOracle(address(ms[i + 1])); // every one succeeds
+        }
+
+        vm.expectRevert(); // the head can no longer screen anybody
+        ms[0].isSanctioned(clean);
+    }
+
+    // ── audit FIND-019: no depth regression ──────────────────────────────────
+
+    // The reorder does not change what depth is admissible — the probe starts at the
+    // candidate in either order, and an acyclic candidate chain does not contain `this`.
+    function test_acyclicChainDepth_unchangedByTheReorder() public {
+        MockSanctionsList mock = new MockSanctionsList(address(this));
+        address prev = address(mock);
+        uint256 built;
+        for (uint256 i = 0; i < 32; i++) {
+            try new SanctionsOracleMirror(admin, updater, prev) returns (SanctionsOracleMirror m) {
+                prev = address(m); built = i + 1;
+            } catch { break; }
+        }
+        emit log_named_uint("FIND-019 max constructible chain depth", built);
+        assertGt(built, 4, "chain never got deep - test is vacuous");
+    }
+
     // ── fuzz: forwarding-path invariant ──────────────────────────────────────
 
     function testFuzz_forwardingOrLocalTrue_meansTrue(address addr) public {
@@ -587,3 +786,25 @@ contract GasGriefingOracle {
         return false;
     }
 }
+
+/// Reads back through whoever called it — the shape that closes a cycle without any
+/// mirror-specific knowledge. Used for the audit FIND-019 constructor test.
+contract CallerBackReferenceOracle {
+    function isSanctioned(address addr) external view returns (bool) {
+        return ISanctionsList(msg.sender).isSanctioned(addr);
+    }
+}
+
+/// Per-address routing: answers `false` for an explicit set of addresses and forwards
+/// everything else back to its caller. The shape that defeats a one-question probe.
+contract SelectiveRouter {
+    mapping(address => bool) private _short;
+
+    function shortCircuit(address addr) external { _short[addr] = true; }
+
+    function isSanctioned(address addr) external view returns (bool) {
+        if (_short[addr]) return false;
+        return ISanctionsList(msg.sender).isSanctioned(addr);
+    }
+}
+
