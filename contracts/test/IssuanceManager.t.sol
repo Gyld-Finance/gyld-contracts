@@ -724,6 +724,47 @@ contract IssuanceManagerTest is Test {
         mgr.setDailyCap(address(token), type(uint256).max);
     }
 
+    // ── Beneficiary is unconstrained on-chain (audit FIND-015 / TEST-79) ─────
+
+    /// TEST-79. The NatSpec used to claim a rogue REDEEMER_ROLE key "cannot redirect the
+    /// off-chain USDC payment" because settlement keys off the beneficiary in the Redeemed
+    /// event. It can: the beneficiary IS the caller's argument, so the event records the
+    /// attacker's own choice. Alice deposits, the redeemer names Mallory, and the event
+    /// says Mallory. Pinned so the corrected comment cannot silently regress.
+    function test_redeem_beneficiaryNeedNotBeTheDepositor() public {
+        address alice   = address(0xA11CE);
+        address mallory = address(0x4A110C);
+        vm.startPrank(whitelistAdmin);
+        mgr.addToWhitelist(alice);
+        mgr.addToWhitelist(mallory);
+        vm.stopPrank();
+
+        // Alice is the only depositor: minted to her, and she sends the tokens in.
+        vm.prank(subscriber); mgr.subscribe(address(token), alice, 10e18);
+        vm.prank(alice);      token.transfer(address(mgr), 10e18);
+
+        // The redeemer names Mallory instead. Nothing on-chain objects.
+        vm.expectEmit(true, true, false, true);
+        emit Redeemed(address(token), mallory, 10e18);
+        vm.prank(redeemer);
+        mgr.redeem(address(token), mallory, 10e18);
+
+        assertEq(token.balanceOf(address(mgr)), 0, "Alice's deposit was burned");
+    }
+
+    /// The one real on-chain constraint: the whitelist. A non-whitelisted beneficiary is
+    /// refused, capping the blast radius of a compromised key at KYC-approved addresses.
+    function test_redeem_beneficiaryMustStillBeWhitelisted() public {
+        address alice = address(0xA11CE);
+        vm.prank(whitelistAdmin); mgr.addToWhitelist(alice);
+        vm.prank(subscriber);     mgr.subscribe(address(token), alice, 10e18);
+        vm.prank(alice);          token.transfer(address(mgr), 10e18);
+
+        vm.prank(redeemer);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.NotWhitelisted.selector, outsider));
+        mgr.redeem(address(token), outsider, 10e18);
+    }
+
     // ── Pause ─────────────────────────────────────────────────────────────────
 
     function _grantPauser() internal {

@@ -228,18 +228,20 @@ contract IssuanceManager is
     ///
     ///         Tokens held by this contract during the window are inert — the contract
     ///         has no withdraw(), transfer(), or rescue() function, so they cannot be
-    ///         extracted without REDEEMER_ROLE calling redeem().  A rogue REDEEMER_ROLE
-    ///         key could burn tokens for a wrong beneficiary address, but cannot redirect
-    ///         the off-chain USDC payment — that settlement is handled by a separate
-    ///         backend service keyed to the beneficiary recorded in the Redeemed event.
-    ///         The beneficiary must also be whitelisted, limiting the blast radius of a
-    ///         compromised key to addresses already KYC-approved.
+    ///         extracted without REDEEMER_ROLE calling redeem().
+    ///
+    ///         `beneficiary` is a call argument, so `Redeemed` records the caller's own
+    ///         choice — an audit trail, not a control (audit FIND-015). A compromised
+    ///         REDEEMER_ROLE key can name any whitelisted address. Attribution to the real
+    ///         depositor is an OFF-CHAIN control; the whitelist is the only on-chain one,
+    ///         capping the blast radius at KYC-approved addresses.
     ///
     ///         Atomicity is not required because value does not move on-chain at redemption
     ///         time — USDC is sent off-chain after this call succeeds.
     ///
     /// @param token       A registered GyldBondToken proxy address.
-    /// @param beneficiary Whitelisted AP who sent the tokens (recorded in event for audit trail).
+    /// @param beneficiary Whitelisted AP the backend asserts sent the tokens — NOT verified
+    ///                    on-chain (FIND-015). Recorded in the event as an audit trail.
     /// @param amount      Token amount to burn. Must not exceed this contract's token balance.
     function redeem(address token, address beneficiary, uint256 amount)
         external
