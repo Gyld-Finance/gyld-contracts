@@ -183,9 +183,11 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         address issuanceManager,
         address navFeedOwner
     ) external onlyOwner nonReentrant returns (address token, address navFeed, address forwarder) {
-        if (operator == address(0) || operator == address(this)) revert ZeroAddress();
-        if (issuanceManager == address(0)) revert ZeroAddress();
-        if (navFeedOwner == address(0))    revert ZeroAddress();
+        // Audit FIND-011. `navFeedOwner == address(this)` would hand the factory ownership
+        // of a feed it cannot write to and cannot pass on; all three reject it, not just operator.
+        if (operator == address(0)        || operator == address(this))        revert ZeroAddress();
+        if (issuanceManager == address(0) || issuanceManager == address(this)) revert ZeroAddress();
+        if (navFeedOwner == address(0)    || navFeedOwner == address(this))    revert ZeroAddress();
         // The feed enforces this too; failing here names the variable to fix.
         if (navFeedOwner == operator)      revert NavFeedOwnerIsOperator();
         if (bytes(isin).length == 0)       revert EmptyIsin();

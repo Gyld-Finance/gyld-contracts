@@ -472,6 +472,11 @@ contract DeployDevNet is Script {
     ) internal {
         TimelockController tl = TimelockController(payable(factory_.owner()));
 
+        // Audit FIND-011. Fail before the timelock proposal is built, not after.
+        DeployGuards.requireNotSelf(operator,      address(factory_), "operator",      "the factory");
+        DeployGuards.requireNotSelf(issuanceMgr_,  address(factory_), "issuanceManager", "the factory");
+        DeployGuards.requireNotSelf(navFeedOwner,  address(factory_), "navFeedOwner",  "the factory");
+
         // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF62, CUSIP 14913UBF6, matures 2028-09-06)
         {
             address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_851_811_200);

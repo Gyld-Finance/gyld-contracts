@@ -512,6 +512,19 @@ contract TokenFactoryTest is Test {
         factory.deployToken("X", "X", "XX0000000001", 0, address(factory), address(issuanceMgr), navFeedOwner);
     }
 
+    /// audit FIND-011. The argument the guard was actually missing.
+    function test_deployToken_navFeedOwnerIsFactory_reverts() public {
+        vm.expectRevert(TokenFactory.ZeroAddress.selector);
+        factory.deployToken("X", "X", "XX0000000002", 0, operator, address(issuanceMgr), address(factory));
+    }
+
+    /// audit FIND-011. Already reverted before the guard, but with empty data from the
+    /// hasRole preflight — asserting the named error pins that the input check fires first.
+    function test_deployToken_issuanceManagerIsFactory_reverts() public {
+        vm.expectRevert(TokenFactory.ZeroAddress.selector);
+        factory.deployToken("X", "X", "XX0000000003", 0, operator, address(factory), navFeedOwner);
+    }
+
     function test_deployToken_factoryHasNoMintBurnRoles() public {
         (address token,,) = _deploy();
         GyldBondToken t = GyldBondToken(token);

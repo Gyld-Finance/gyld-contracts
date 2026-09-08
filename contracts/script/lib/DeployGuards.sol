@@ -197,6 +197,27 @@ library DeployGuards {
         }
     }
 
+    /// @notice `who` must not be `forbidden`. Not dev-gated, unlike {requireDistinct}: a role
+    ///         pointed at the contract that grants it is wrong on every chain (audit FIND-011).
+    function requireNotSelf(address who, address forbidden, string memory key, string memory forbiddenKey)
+        internal
+        view
+    {
+        if (who == forbidden) {
+            revert(
+                string.concat(
+                    "DeployGuards: ",
+                    key,
+                    " must not be ",
+                    forbiddenKey,
+                    " (",
+                    vm.toString(forbidden),
+                    ")"
+                )
+            );
+        }
+    }
+
     /// @notice On production, `target` must be a deployed contract — not an EOA.
     /// @dev    Catches a sanctions "oracle" or forwarder owner that is silently a wallet.
     function requireProdContract(address target, string memory label) internal view {
