@@ -218,6 +218,71 @@ library DeployGuards {
         }
     }
 
+    /// @notice `isin` must be a well-formed ISO 6166 identifier, check digit included.
+    /// @dev    Audit FIND-012. deployToken claims an ISIN permanently and nothing on-chain
+    ///         validates it, so a typo burns the identifier on that factory. Checked here,
+    ///         where a typo is still free. Not dev-gated: a malformed ISIN is malformed on
+    ///         every chain.
+    function requireValidIsin(string memory isin) internal pure {
+        bytes memory b = bytes(isin);
+        if (b.length != 12) revert("DeployGuards: ISIN must be 12 characters");
+
+        // Two-letter country prefix, 9 alphanumeric, 1 numeric check digit.
+        for (uint256 i; i < 2; ++i) {
+            if (b[i] < 0x41 || b[i] > 0x5A) revert("DeployGuards: ISIN prefix must be two A-Z letters");
+        }
+        for (uint256 i = 2; i < 11; ++i) {
+            bool digit = b[i] >= 0x30 && b[i] <= 0x39;
+            bool upper = b[i] >= 0x41 && b[i] <= 0x5A;
+            if (!digit && !upper) revert("DeployGuards: ISIN body must be 0-9 or A-Z");
+        }
+        if (b[11] < 0x30 || b[11] > 0x39) revert("DeployGuards: ISIN check digit must be numeric");
+
+        // Expand the 11-char body to digits (A=10..Z=35, each letter becoming two digits),
+        // then Luhn from the right. Same algorithm the check digit was issued under.
+        uint8[24] memory d;
+        uint256 n;
+        for (uint256 i; i < 11; ++i) {
+            uint8 c = uint8(b[i]);
+            if (c >= 0x30 && c <= 0x39) {
+                d[n++] = c - 0x30;
+            } else {
+                uint8 v = c - 0x41 + 10;
+                d[n++] = v / 10;
+                d[n++] = v % 10;
+            }
+        }
+        uint256 sum;
+        for (uint256 i; i < n; ++i) {
+            uint256 digit = d[n - 1 - i];
+            if (i % 2 == 0) {
+                digit *= 2;
+                if (digit > 9) digit -= 9;
+            }
+            sum += digit;
+        }
+        if ((10 - (sum % 10)) % 10 != uint8(b[11]) - 0x30) {
+            revert(string.concat("DeployGuards: ISIN ", isin, " has a bad check digit"));
+        }
+    }
+
+    /// @notice `factory` must not already have deployed `isin`.
+    /// @dev    Audit FIND-012. The claim is one-way, so hitting IsinAlreadyDeployed on-chain
+    ///         costs the identifier. Fail here, before the timelock proposal is built.
+    function requireIsinVacant(address factory, string memory isin) internal view {
+        (bool ok, bytes memory data) =
+            factory.staticcall(abi.encodeWithSignature("tokenByIsin(string)", isin));
+        if (!ok || data.length != 32) revert("DeployGuards: factory did not answer tokenByIsin");
+        address existing = abi.decode(data, (address));
+        if (existing != address(0)) {
+            revert(
+                string.concat(
+                    "DeployGuards: ISIN ", isin, " is already deployed at ", vm.toString(existing)
+                )
+            );
+        }
+    }
+
     /// @notice On production, `target` must be a deployed contract — not an EOA.
     /// @dev    Catches a sanctions "oracle" or forwarder owner that is silently a wallet.
     function requireProdContract(address target, string memory label) internal view {

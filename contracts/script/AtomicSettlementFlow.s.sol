@@ -10,6 +10,7 @@ import {TokenFactory} from "../TokenFactory.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
 import {MockSanctionsList} from "../test/MockSanctionsList.sol";
 import {MockUSDC} from "../test/MockUSDC.sol";
+import {DeployGuards} from "./lib/DeployGuards.sol";
 
 /// @title AtomicSettlementFlow
 /// @notice LOCAL / DEV DEMO — drives the COMPLETE self-custodial atomic-settlement flow
@@ -112,10 +113,13 @@ contract AtomicSettlementFlow is Script {
 
         // CAT-style series — deployer is factory owner so deployToken is called directly
         // (DEFAULT_ADMIN on the token is the deployer; fine for a dev demo).
+        // Audit FIND-012: the ISIN claim is one-way — validate and check vacancy first.
+        DeployGuards.requireValidIsin("US14913UBF66");
+        DeployGuards.requireIsinVacant(address(factory), "US14913UBF66");
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
-            "US14913UBF62",
+            "US14913UBF66",
             1_851_811_200,
             operator, // token operator / pauser (acct[3]; must differ from the NAV feed owner)
             address(issuanceMgr),

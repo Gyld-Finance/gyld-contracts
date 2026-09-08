@@ -90,7 +90,7 @@ contract AtomicSettlementDeployTest is Test {
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
-            "US14913UBF62",
+            "US14913UBF66",
             1_851_811_200,
             pauser,
             address(issuanceMgr),
