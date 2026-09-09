@@ -163,7 +163,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -181,7 +181,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(usdc),
             price: 100e6,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -426,6 +426,57 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
+    /// Audit FIND-014 / TEST-66. executeSwap reads the band, the NAV age and the TTL cap
+    /// from storage at fill time and the signed message carries none of them, so a setter
+    /// that moves one would otherwise judge outstanding quotes by a rule they were not
+    /// priced under. Each of the three setters bumps the epoch instead, and a quote signed
+    /// a moment earlier dies on the epoch gate.
+    function test_configChange_invalidatesQuotesSignedUnderPreviousSettings() public {
+        _approveTaker();
+
+        // 1. The quote-vs-NAV band.
+        GyldAtomicSwap.SwapMessage memory band = _buyQuote(201, 1_000e6);
+        bytes memory bandSig = _sign(band);
+        assertEq(band.epoch, 0, "fixture: signed under epoch 0");
+        vm.prank(admin);
+        swap.setMaxQuoteDeviationBps(300);
+        assertEq(swap.quoteEpoch(), 1, "setMaxQuoteDeviationBps must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(0), uint64(1)));
+        swap.executeSwap(band, bandSig, _noPermit(), band.maxAmountIn);
+
+        // 2. The NAV staleness bound.
+        GyldAtomicSwap.SwapMessage memory age = _buyQuote(202, 1_000e6);
+        age.epoch = 1;
+        bytes memory ageSig = _sign(age);
+        vm.prank(admin);
+        swap.setMaxNavAgeSecs(2 days); // widen: the direction the finding is about
+        assertEq(swap.quoteEpoch(), 2, "setMaxNavAgeSecs must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(1), uint64(2)));
+        swap.executeSwap(age, ageSig, _noPermit(), age.maxAmountIn);
+
+        // 3. The quote TTL cap.
+        GyldAtomicSwap.SwapMessage memory ttl = _buyQuote(203, 1_000e6);
+        ttl.epoch = 2;
+        bytes memory ttlSig = _sign(ttl);
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(120 seconds);
+        assertEq(swap.quoteEpoch(), 3, "setMaxQuoteTtl must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(2), uint64(3)));
+        swap.executeSwap(ttl, ttlSig, _noPermit(), ttl.maxAmountIn);
+
+        // Invalidation, not a brick: the quote service re-issues at the new epoch and the
+        // same trade settles. No id was consumed by any of the three reverts.
+        GyldAtomicSwap.SwapMessage memory reissued = _buyQuote(204, 1_000e6);
+        reissued.epoch = swap.quoteEpoch();
+        bytes memory reissuedSig = _sign(reissued);
+        vm.prank(taker);
+        swap.executeSwap(reissued, reissuedSig, _noPermit(), reissued.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(204), "a quote re-issued at the new epoch must settle");
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // I-5 — Epoch bump does not free quoteIds
     // ═════════════════════════════════════════════════════════════════════════
@@ -633,7 +684,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: V_BOND,
             price: 1e28,
             expiry: 1_750_000_900,
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         GyldAtomicSwap.SwapMessage memory v2 = GyldAtomicSwap.SwapMessage({
             quoteId: 257,
@@ -1279,7 +1330,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(evil),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         // The re-entrant call dies on the guard (the FIRST modifier), so the message and
         // signature never get validated — an empty signature is sufficient.
@@ -1308,7 +1359,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(evil),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         evil.armExecuteSwap(address(swap), rm, "", 1_000e6);
 
@@ -1466,7 +1517,7 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.startPrank(admin);
         swap.bumpQuoteEpoch();
         swap.bumpQuoteEpoch();
-        swap.bumpQuoteEpoch(); // quoteEpoch = 3
+        swap.bumpQuoteEpoch(); // quoteEpoch = 3; the two setters below bump it to 5 (FIND-014)
         swap.setMaxQuoteDeviationBps(0x0123); // 291 bps
         // GYL-1135: maxNavAgeSecs is now bounded by MAX_NAV_AGE_CEILING (72 h), so this
         // probe value can no longer be an arbitrary uint32. 0x0003F123 (258_339 s ≈
@@ -1478,7 +1529,7 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.stopPrank();
 
         uint256 slot0 = uint256(vm.load(address(swap), derived));
-        assertEq(uint64(slot0), uint64(3), "quoteEpoch must occupy B+0 offset 0 (8 bytes)");
+        assertEq(uint64(slot0), uint64(5), "quoteEpoch must occupy B+0 offset 0 (8 bytes)");
         assertEq(uint16(slot0 >> 64), uint16(0x0123), "maxQuoteDeviationBps must occupy B+0 offset 8 (2 bytes)");
         assertEq(uint32(slot0 >> 80), LAYOUT_NAV_AGE, "maxNavAgeSecs must occupy B+0 offset 10 (4 bytes)");
         assertEq(slot0 >> 112, 0, "bytes 14..31 of B+0 must remain free");
@@ -1515,7 +1566,7 @@ contract GyldAtomicSwapSpecTest is Test {
         assertEq(uint256(vm.load(address(swap), bytes32(uint256(derived) + 8))), 0, "slot must clear");
 
         // Getters agree with the raw slots.
-        assertEq(swap.quoteEpoch(), 3);
+        assertEq(swap.quoteEpoch(), 7); // 5, plus one per setMaxQuoteTtl call above
         assertEq(swap.maxQuoteDeviationBps(), 0x0123);
         assertEq(swap.maxNavAgeSecs(), LAYOUT_NAV_AGE);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
@@ -1606,7 +1657,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         bytes memory sig = _signFor(s, m, SIGNER_PK);
 

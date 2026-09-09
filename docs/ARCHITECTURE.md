@@ -1109,7 +1109,17 @@ per storage slot, indexed as word `quoteId >> 8`, bit `quoteId & 0xff`.
 `bumpQuoteEpoch()` (`DEFAULT_ADMIN_ROLE`) increments `quoteEpoch` by exactly one
 and kills every outstanding quote in one transaction — the signer-rotation and
 incident-response lever. Rotation is: grant the new `QUOTE_SIGNER_ROLE`, bump,
-revoke the old.
+revoke the old. It is no longer the only writer: `setMaxQuoteDeviationBps`,
+`setMaxNavAgeSecs`, `setMaxQuoteTtl`, `setMaxNavAgeSecsFor` and
+`setMaxNavRoundNotionalFor` each bump it too (audit FIND-014), because `executeSwap`
+reads all five at fill time and the quote signs none of them. Expect
+`QuoteEpochBumped` on routine config changes, not only on incidents.
+
+`registerSeries` deliberately does NOT bump, though re-registering rotates a live
+series' NAV forwarder and so has the same property: it runs once per series at
+deploy, and bumping there would move every fresh proxy off epoch 0. A forwarder
+rotation must pair `registerSeries` with `bumpQuoteEpoch()` in the same timelock
+batch.
 
 **The usage bitmap is NOT epoch-scoped.** `bumpQuoteEpoch` writes only
 `quoteEpoch`; it does not clear `usedQuoteWords`. A consumed id stays consumed

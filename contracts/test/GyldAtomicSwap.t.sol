@@ -151,7 +151,7 @@ contract GyldAtomicSwapTest is Test {
             tokenOut: address(token),
             price: 1e28, // amountOut per 1e18 tokenIn: 10e18 tokens / 1_000e6 USDC * 1e18
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -174,7 +174,7 @@ contract GyldAtomicSwapTest is Test {
             tokenOut: address(usdc),
             price: 100e6, // amountOut per 1e18 tokenIn: 1_000e6 USDC / 10e18 tokens * 1e18
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -709,7 +709,7 @@ contract GyldAtomicSwapTest is Test {
             tokenOut: address(token),
             price: price,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         bytes memory sig = _sign(m, SIGNER_PK);
         vm.prank(taker);
@@ -730,7 +730,7 @@ contract GyldAtomicSwapTest is Test {
             tokenOut: address(token),
             price: price,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         uint256 amountOut = _impliedAmountOut(m, m.maxAmountIn);
         uint256 navValue = (amountOut * uint256(NAV)) / 1e20;
@@ -1585,7 +1585,7 @@ contract GyldAtomicSwapTest is Test {
             tokenOut: address(evil),
             price: 1e28, // 10e18 EVIL per 1_000e6 USDC
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         bytes memory sig = _sign(m, SIGNER_PK);
 

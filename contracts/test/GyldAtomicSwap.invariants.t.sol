@@ -118,7 +118,7 @@ contract SwapFuzzTest is Test {
             tokenOut: address(token),
             price: 1e28, // 10e18 tokens per 1_000e6 USDC at NAV
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -135,7 +135,7 @@ contract SwapFuzzTest is Test {
             tokenOut: address(usdc),
             price: 100e6, // 1_000e6 USDC per 10e18 tokens at NAV
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -358,7 +358,7 @@ contract SwapHandler is CommonBase, StdCheats, StdUtils {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, swap.hashSwapMessage(m));
@@ -396,7 +396,7 @@ contract SwapHandler is CommonBase, StdCheats, StdUtils {
             tokenOut: address(usdc),
             price: 100e6,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, swap.hashSwapMessage(m));
@@ -447,7 +447,7 @@ contract SwapHandler is CommonBase, StdCheats, StdUtils {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, swap.hashSwapMessage(m));
@@ -843,7 +843,7 @@ contract GyldAtomicSwapNavRoundScaleTest is Test {
             tokenOut: address(token),
             price: 1e28, // on NAV: $100/token
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -856,7 +856,7 @@ contract GyldAtomicSwapNavRoundScaleTest is Test {
             tokenOut: address(usdc),
             price: 100e6,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 

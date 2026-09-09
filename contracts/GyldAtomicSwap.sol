@@ -753,6 +753,13 @@ contract GyldAtomicSwap is
     ///         or incident response). Quotes signed for the old epoch revert with
     ///         QuoteEpochStale; the quote service must re-issue against the new epoch.
     function bumpQuoteEpoch() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _bumpQuoteEpoch();
+    }
+
+    /// @dev Audit FIND-014. The band, NAV age and TTL guards are read at execution, not
+    ///      signed into the quote, so every setter that moves one must kill quotes priced
+    ///      under the old value rather than judge them by the new one.
+    function _bumpQuoteEpoch() private {
         uint64 next = ++_getStorage().quoteEpoch;
         emit QuoteEpochBumped(next);
     }
@@ -894,11 +901,13 @@ contract GyldAtomicSwap is
     ///         anything from zero to 2× NAV, i.e. no band at all. Since this band and the
     ///         quote TTL are the containment on a compromised quote-signer key, an admin
     ///         must not be able to widen it into a no-op. See the constant for why 10%.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newBps Band width in basis points, e.g. 200 = 2%. 0 <= newBps <= 1000.
     function setMaxQuoteDeviationBps(uint16 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newBps > MAX_QUOTE_DEVIATION_BPS_CEILING) revert InvalidDeviationBps(newBps);
         _getStorage().maxQuoteDeviationBps = newBps;
         emit MaxQuoteDeviationUpdated(newBps);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Set the max NAV feed age (seconds) before executeSwap fails closed.
@@ -912,11 +921,13 @@ contract GyldAtomicSwap is
     ///         guard, here "accept an arbitrarily old price". (For this setter and the
     ///         deviation band the restrictive end is a safe soft-pause; maxQuoteTtl
     ///         differs — its zero is the UNSET sentinel, not a pause.)
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecs = newSecs;
         emit MaxNavAgeUpdated(newSecs);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Hold ONE series to its own max NAV age instead of the global value.
@@ -938,6 +949,7 @@ contract GyldAtomicSwap is
     ///
     ///         Requires the series to be registered, so a typo cannot park an override
     ///         on an address that is not a series. `deregisterSeries` clears it again.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param token   Registered bond series to hold to its own threshold.
     /// @param newSecs Max feed age in seconds for this series, or 0 to clear the
     ///                override. Non-zero values must be <= MAX_NAV_AGE_CEILING (72 h).
@@ -946,6 +958,7 @@ contract GyldAtomicSwap is
         if (newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecsOf[token] = newSecs;
         emit MaxNavAgeForSeriesUpdated(token, newSecs);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Cap the USDC notional one series may settle against a single NAV round.
@@ -953,6 +966,7 @@ contract GyldAtomicSwap is
     ///         MAX_NAV_ROUND_NOTIONAL_CEILING; the permissive end is the guard as a no-op.
     ///         PASSING ZERO DOES NOT PAUSE ANYTHING — zero clears the override and the
     ///         series follows DEFAULT_MAX_NAV_ROUND_NOTIONAL. To halt swaps use `pause()`.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param token  Registered series to bound.
     /// @param newCap USDC (6dp) per NAV round. 0 clears; otherwise <= the ceiling.
     function setMaxNavRoundNotionalFor(address token, uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -960,6 +974,7 @@ contract GyldAtomicSwap is
         if (newCap > MAX_NAV_ROUND_NOTIONAL_CEILING) revert InvalidNavRoundNotional(newCap);
         _getStorage().maxNavRoundNotionalOf[token] = newCap;
         emit MaxNavRoundNotionalForSeriesUpdated(token, newCap);
+        _bumpQuoteEpoch();
     }
 
     /// @notice The max NAV age actually enforced for `token` by executeSwap.
@@ -1009,12 +1024,14 @@ contract GyldAtomicSwap is
     ///         life, it forbids prompt execution until the quote is nearly expired. Keep
     ///         this above the service's longest issued TTL (~60s class today). See the
     ///         constant for the full rationale.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newTtl Max quote lifetime in seconds (e.g. 90 = the shipped default).
     ///               0 resets to the default; otherwise 0 < newTtl <= 600 (10 min).
     function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newTtl > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(newTtl);
         _getStorage().maxQuoteTtl = newTtl;
         emit MaxQuoteTtlUpdated(newTtl);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Add or remove `account` from the executeSwap taker allowlist.
