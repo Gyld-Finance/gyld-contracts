@@ -371,6 +371,11 @@ contract GyldAtomicSwap is
     );
     event QuoteEpochBumped(uint64 indexed newEpoch);
     event SeriesRegistered(address indexed token, address indexed navForwarder);
+    /// Additional to SeriesRegistered when an already registered series is repointed at a
+    /// DIFFERENT forwarder (audit FIND-026); silent on a first or idempotent registration.
+    event SeriesForwarderRotated(
+        address indexed token, address indexed previousForwarder, address indexed newForwarder
+    );
     event SeriesDeregistered(address indexed token);
     event MaxQuoteDeviationUpdated(uint16 newBps);
     event MaxNavAgeUpdated(uint32 newSecs);
@@ -776,6 +781,9 @@ contract GyldAtomicSwap is
     ///         now enforced on-chain).
     ///         Re-registering an active series just updates its forwarder, under the same
     ///         three probes, so a bad rotation leaves it pointed at the working one.
+    ///         A rotation is DELIBERATELY not gated on a zero balance (audit FIND-026): that is
+    ///         the grief-able precondition FIND-024 removed, and it would guard the wrong leg.
+    ///         It DOES need `bumpQuoteEpoch()` in the same timelock batch (FIND-014).
     /// @param token        GyldBondToken proxy address (18 decimals).
     /// @param navForwarder NAVFeedForwarder paired with the series (stable address).
     function registerSeries(address token, address navForwarder) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -811,10 +819,16 @@ contract GyldAtomicSwap is
         // upstream — this is the third place a bad upstream can enter, via a rotation.
         if (probeUpdatedAt > block.timestamp) revert NavFeedFutureDated(navForwarder, probeUpdatedAt);
         GyldAtomicSwapStorage storage $ = _getStorage();
+        address previousForwarder = $.navForwarderOf[token];
         if (!$.registeredSeries[token]) $.seriesList.push(token);
         $.registeredSeries[token] = true;
         $.navForwarderOf[token] = navForwarder;
+        // SeriesRegistered fires on both paths so existing log indexing is unbroken.
+        // `previousForwarder != 0` IS "already registered" — the two are written together.
         emit SeriesRegistered(token, navForwarder);
+        if (previousForwarder != address(0) && previousForwarder != navForwarder) {
+            emit SeriesForwarderRotated(token, previousForwarder, navForwarder);
+        }
     }
 
     /// @notice Deregister a matured bond series, sweeping any residual inventory out.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {GyldAtomicSwap} from "../GyldAtomicSwap.sol";
@@ -1162,6 +1162,89 @@ contract GyldAtomicSwapTest is Test {
         assertEq(swap.navForwarderOf(address(token)), address(rotated), "forwarder must be rotated");
     }
 
+    // ── FIND-026: a forwarder rotation is distinguishable in the log stream ───
+
+    /// A repoint emits SeriesRegistered (log continuity) PLUS SeriesForwarderRotated
+    /// carrying the outgoing forwarder, so monitoring can tell a rotation from a first
+    /// registration without replaying every log since deployment.
+    function test_registerSeries_rotateLive_emitsRotationWithPreviousForwarder() public {
+        address original = swap.navForwarderOf(address(token));
+        MockNavForwarder rotated = new MockNavForwarder(NAV);
+
+        vm.expectEmit(true, true, false, false, address(swap));
+        emit GyldAtomicSwap.SeriesRegistered(address(token), address(rotated));
+        vm.expectEmit(true, true, true, false, address(swap));
+        emit GyldAtomicSwap.SeriesForwarderRotated(address(token), original, address(rotated));
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(rotated));
+    }
+
+    /// A FIRST registration must emit SeriesRegistered only — that is the whole point of
+    /// the second event. Recorded logs, not expectEmit, so an unexpected extra topic fails.
+    function test_registerSeries_firstRegistration_emitsNoRotation() public {
+        GyldBondToken fresh = _newSeries("GYLD-D");
+
+        vm.recordLogs();
+        vm.prank(admin);
+        swap.registerSeries(address(fresh), address(navFeed));
+
+        _assertRegisteredWithoutRotation("a first registration must not report a rotation");
+    }
+
+    /// Re-registering the SAME forwarder is an idempotent refresh, not a rotation: a
+    /// (previous == next) event would be noise and would train ops to ignore the signal.
+    function test_registerSeries_sameForwarder_emitsNoRotation() public {
+        address original = swap.navForwarderOf(address(token));
+
+        vm.recordLogs();
+        vm.prank(admin);
+        swap.registerSeries(address(token), original);
+
+        _assertRegisteredWithoutRotation("an unchanged forwarder is not a rotation");
+        assertEq(swap.navForwarderOf(address(token)), original, "forwarder must be unchanged");
+    }
+
+    /// Re-registering AFTER a deregistration is a first registration again, not a
+    /// rotation: deregisterSeries clears navForwarderOf, which is what the guard reads.
+    function test_registerSeries_afterDeregister_emitsNoRotation() public {
+        vm.startPrank(admin);
+        swap.deregisterSeries(address(token));
+
+        vm.recordLogs();
+        swap.registerSeries(address(token), address(navFeed));
+        vm.stopPrank();
+
+        _assertRegisteredWithoutRotation("a re-registration from empty is not a rotation");
+    }
+
+    /// Shared assertion for the three no-rotation paths. Requires SeriesRegistered to be
+    /// PRESENT before concluding SeriesForwarderRotated is absent — otherwise a test that
+    /// recorded no swap logs at all would pass vacuously and pin nothing.
+    function _assertRegisteredWithoutRotation(string memory reason) internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool sawRegistered;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(swap)) continue;
+            if (logs[i].topics[0] == GyldAtomicSwap.SeriesRegistered.selector) sawRegistered = true;
+            assertTrue(logs[i].topics[0] != GyldAtomicSwap.SeriesForwarderRotated.selector, reason);
+        }
+        assertTrue(sawRegistered, "precondition: the registration itself must have been logged");
+    }
+
+    /// The rotation is NOT gated on inventory (FIND-026): the swap holds 1_000e18 of the
+    /// series from setUp and the repoint still lands. Pins the choice, so a future
+    /// zero-balance precondition — which FIND-024 removed from deregisterSeries as racy
+    /// and grief-able — cannot be reintroduced here silently.
+    function test_registerSeries_rotateWithLiveInventory_isAllowed() public {
+        assertGt(token.balanceOf(address(swap)), 0, "precondition: swap holds inventory");
+        MockNavForwarder rotated = new MockNavForwarder(NAV);
+
+        vm.prank(admin);
+        swap.registerSeries(address(token), address(rotated));
+
+        assertEq(swap.navForwarderOf(address(token)), address(rotated), "inventory must not block a rotation");
+    }
+
     /// Deregistering a MIDDLE entry is swap-and-pop: the tail moves into the hole. This
     /// is exactly the position instability registeredSeriesList's NatSpec warns about,
     /// so pin it rather than leave it to be discovered against a live proxy.
@@ -2015,7 +2098,10 @@ contract GyldAtomicSwapTest is Test {
         vm.prank(admin);
         swap.setMaxNavAgeSecsFor(address(token), 3 hours);
 
-        // Drain inventory first — deregisterSeries refuses to orphan a balance.
+        // Drain inventory first so the sweep is a no-op and the override is what is under
+        // test. deregisterSeries no longer REFUSES on a balance — FIND-024 replaced that
+        // precondition with a sweep to withdrawalWallet; this line is convenience, not a
+        // requirement. (The stale wording here is what audit FIND-026 read as a guard.)
         vm.prank(treasurer);
         swap.withdraw(address(token), 1_000e18);
         vm.prank(admin);
