@@ -225,6 +225,15 @@ recorded here.
 because the first two cannot see whether the feed can answer at all — and for the same
 reason the count does not move.
 
+`GyldBondToken._requireAccess` is **not** on the list above, and audit FIND-025 read
+that absence as the protected call being recorded while the exposed one was not. The
+count does not move here either, for a structural reason rather than the per-function
+one above: `_requireAccess` calls the installed oracle with a *high-level* call, which
+is not in this detector's population at all, so no triage entry was ever skipped. It
+does forward all remaining gas, deliberately — the cap belongs on the third-party hop
+inside `SanctionsOracleMirror`, not on the token's call to its own oracle. Recorded as
+**D-38** in `ARCHITECTURE.md` §17.1, with the measurements and the two declined halves.
+
 This is the repo's probe-before-store idiom: before storing an address that will
 be called on the hot path, staticcall it and require a well-formed answer, so a
 misconfiguration fails at configuration time rather than on a user's transfer. A
