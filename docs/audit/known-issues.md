@@ -209,10 +209,10 @@ force them to be well-behaved and destroy what they test.
 
 The count fell by one at audit FIND-008: `GyldBondToken.initialize` and
 `setSanctionsList` each used to hold their own copy of the sanctions-oracle probe and
-were reported separately. Both now delegate to one `_probeSanctionsOracle`, which the
-`probeSanctionsOracle` / `probeInstalledSanctionsOracle` views also call, so admission
-and monitoring cannot drift apart. Two results collapse into one, and the shared helper
-is the reason the fix is a single site rather than four.
+were reported separately. Both now delegate to one `_requireValidSanctionsOracle`, so
+`initialize` and `setSanctionsList` cannot drift apart on admission terms. Two results
+collapse into one, and the shared helper is the reason the fix is a single site rather
+than four.
 
 `registerToken` carries **two** probes since audit FIND-009 — `MINTER_ROLE()` and
 `maturityTimestamp()`, the second added because `subscribe` now depends on it — but
