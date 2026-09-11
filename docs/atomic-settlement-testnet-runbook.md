@@ -173,7 +173,14 @@ both collapses it to a single key (audit FIND-003). `TokenFactory.deployToken`
 enforces the same rule on-chain with `NavFeedOwnerIsOperator`.
 `SANCTIONS_LIST` is required on production, must be a deployed **contract**, and is
 rejected if its bytecode matches this repo's `MockSanctionsList`; on a dev chain,
-unset still deploys the mock. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
+unset still deploys the mock. **`SANCTIONS_PROBE_FLAGGED` is also required on
+production** (audit FIND-006): an address on the **current** OFAC/SDN feed that the
+oracle must return `true` for. Every check above is structural — an unseeded mirror
+answers `false` for everyone and passes all of them — so this is the one that proves
+screening is actually on. Read it fresh at deploy time, never hardcode it (a
+delisting would then block the deploy), and prefer a long-standing designation over
+one added this week, or the keeper may not have loaded it yet. The known-clean half
+needs no config: the script uses the deployer. Unused on dev chains. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
 48 h on any other chain**, and on production `< 48 h` now **reverts before any gas is
 spent** (`requireProdMinDelay`) — `TIMELOCK_DELAY_SECONDS=0` is exactly how a
 deployment ends up with a timelock that gates nothing. On Sepolia it is still
@@ -227,6 +234,8 @@ be repointed afterwards.
 # with the 48h default the script stops after Phase 1 and prints Phase 2 instructions.
 # NOTE: 0 is accepted ONLY because Sepolia is a dev chain. On any production chain
 # requireProdMinDelay rejects anything below 48h before a single tx is sent.
+# On production, also export SANCTIONS_PROBE_FLAGGED=<address on today's SDN feed>
+# (audit FIND-006). Not needed here - the screen is a no-op on dev chains.
 TIMELOCK_DELAY_SECONDS=0 \
 forge script contracts/script/DeployDevNet.s.sol \
   --rpc-url $RPC --broadcast --private-key $PRIVKEY --verify
