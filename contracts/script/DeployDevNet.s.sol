@@ -26,6 +26,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   * every privileged env var below is REQUIRED and must not be the deployer EOA;
 ///   * TIMELOCK_DELAY_SECONDS is REQUIRED and must be >= 48h;
 ///   * SANCTIONS_LIST is REQUIRED and must be a contract (no mock is ever deployed);
+///   * SANCTIONS_PROBE_FLAGGED is REQUIRED — a live SDN designation the oracle must
+///     actually flag, which is what separates a working gate from an unseeded one;
 ///   * SUBSCRIBER_ADDRESS and REDEEMER_ADDRESS must differ (mint/burn quorum split);
 ///   * Anvil account[1] is NOT whitelisted (its private key is public);
 ///   * the final role topology is asserted in-band, inside the broadcast, so a
@@ -44,9 +46,21 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                           In prod: platform MPC wallet / Fordefi — burn quorum (separate)
 ///   WHITELIST_ADMIN      →  IssuanceManager WHITELIST_ADMIN_ROLE (AP whitelist mgmt)
 ///                           In prod: ops Gnosis Safe
-///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls)
+///   ISSUANCE_PAUSER      →  IssuanceManager ISSUANCE_PAUSER_ROLE (audit FIND-001). Halts
+///                           subscribe(); redeem() stays open. No delay — it is the brake
+///                           on a compromised SUBSCRIBER key, so it MUST differ from
+///                           SUBSCRIBER_ADDRESS or the same compromise holds the brake.
+///                           Unpause is DEFAULT_ADMIN (the timelock), deliberately not this.
+///                           In prod: ops hot key
+///   NAV_FEED_OWNER       →  KaleidoscopeNAVFeed owner (updateAnswer calls). MUST differ
+///                            from OPS_MULTISIG: the two form the 2-of-2 quorum on the
+///                            feed's emergency correction path (audit FIND-003).
 ///                           In prod: KMS signer
 ///   SANCTIONS_LIST       →  SanctionsOracleMirror (prod) / MockSanctionsList (dev)
+///   SANCTIONS_PROBE_FLAGGED → an address on the CURRENT OFAC/SDN feed. Read fresh at
+///                           deploy time, never hardcoded: a stored designation goes
+///                           stale on delisting and would then block the deploy
+///                           (audit FIND-006, D-33). Prod only — unused on dev chains.
 ///
 /// A TimelockController is deployed and wired as:
 ///   - DEFAULT_ADMIN_ROLE on each GyldBondToken
@@ -73,8 +87,10 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   export SUBSCRIBER_ADDRESS=<fordefi_mint_mpc_address>
 ///   export REDEEMER_ADDRESS=<fordefi_burn_mpc_address>
 ///   export WHITELIST_ADMIN=<gnosis_safe_address>
+///   export ISSUANCE_PAUSER=<ops_hot_key_address>
 ///   export NAV_FEED_OWNER=<kms_signer_address>
 ///   export SANCTIONS_LIST=<sanctions_oracle_mirror>
+///   export SANCTIONS_PROBE_FLAGGED=<address_on_todays_sdn_list>
 ///   export TIMELOCK_DELAY_SECONDS=172800
 ///   forge script contracts/script/DeployDevNet.s.sol \
 ///     --rpc-url $EVM_RPC_URL --broadcast --private-key $PRIVKEY_SIGNING_KEY
@@ -96,8 +112,13 @@ contract DeployDevNet is Script {
         address subscriber;
         address redeemer;
         address whitelistAdmin;
+        address issuancePauser;
         address navFeedOwner;
         address sanctionsList; // address(0) on a dev chain ⇒ deploy a MockSanctionsList
+        /// An address on the CURRENT OFAC/SDN feed, read at run time — the subject the
+        /// behavioural screen requires a `true` for. Audit FIND-006. Production only; the
+        /// guard is a no-op on dev chains, which cannot supply a live designation.
+        address sanctionsProbeFlagged;
         uint256 delay;
     }
 
@@ -155,7 +176,18 @@ contract DeployDevNet is Script {
         c.subscriber = DeployGuards.envAddressProdRequired("SUBSCRIBER_ADDRESS", c.deployer);
         c.redeemer = DeployGuards.envAddressProdRequired("REDEEMER_ADDRESS", c.deployer);
         c.whitelistAdmin = DeployGuards.envAddressProdRequired("WHITELIST_ADMIN", c.deployer);
+        c.issuancePauser = DeployGuards.envAddressProdRequired("ISSUANCE_PAUSER", c.deployer);
         c.navFeedOwner = DeployGuards.envAddressProdRequired("NAV_FEED_OWNER", c.deployer);
+
+        // audit FIND-003. The NAV feed's emergency path is a 2-of-2: navFeedOwner SIGNS,
+        // the ops multisig (passed to deployToken as `operator`) CALLS. The feed's
+        // constructor refuses a guardian equal to its owner, so on a dev chain — where
+        // BOTH of the above default to the deployer — deployToken would revert. Derive a
+        // distinct dev NAV owner instead. Production is unaffected: envAddressProdRequired
+        // ignores the fallback there and requireDistinct below is the real guard.
+        if (DeployGuards.isDevChain() && c.navFeedOwner == c.opsMultisig) {
+            c.navFeedOwner = vm.addr(uint256(keccak256("DeployDevNet:dev-nav-feed-owner")));
+        }
 
         // On production none of these may be the broadcasting EOA — that is precisely
         // the shape of the GYL-1135 incident, where "handover complete" meant nothing moved.
@@ -164,11 +196,21 @@ contract DeployDevNet is Script {
         DeployGuards.requireNotDeployer(c.subscriber, c.deployer, "SUBSCRIBER_ADDRESS");
         DeployGuards.requireNotDeployer(c.redeemer, c.deployer, "REDEEMER_ADDRESS");
         DeployGuards.requireNotDeployer(c.whitelistAdmin, c.deployer, "WHITELIST_ADMIN");
+        DeployGuards.requireNotDeployer(c.issuancePauser, c.deployer, "ISSUANCE_PAUSER");
         DeployGuards.requireNotDeployer(c.navFeedOwner, c.deployer, "NAV_FEED_OWNER");
 
         // Mint and burn are a deliberate two-key quorum; one address holding both
         // collapses it back into a single point of compromise.
         DeployGuards.requireDistinct(c.subscriber, c.redeemer, "SUBSCRIBER_ADDRESS", "REDEEMER_ADDRESS");
+
+        // audit FIND-001. ISSUANCE_PAUSER_ROLE exists to halt minting when the mint key is
+        // compromised. One address holding both means the attacker holds the brake too, so
+        // the pause is not a control — it is a formality.
+        DeployGuards.requireDistinct(c.subscriber, c.issuancePauser, "SUBSCRIBER_ADDRESS", "ISSUANCE_PAUSER");
+
+        // Same reasoning for the NAV emergency quorum (audit FIND-003): the key that signs
+        // a correction must not be the key that submits it.
+        DeployGuards.requireDistinct(c.opsMultisig, c.navFeedOwner, "OPS_MULTISIG", "NAV_FEED_OWNER");
 
         // Delay: required on production and never below 48h. On Anvil it defaults to 0
         // (instant schedule+execute for dev convenience); on any other dev chain, 48h.
@@ -187,6 +229,26 @@ contract DeployDevNet is Script {
             // otherwise sail through as SANCTIONS_LIST. Refuse this repo's mock by bytecode.
             DeployGuards.requireProdNotMock(
                 c.sanctionsList, type(MockSanctionsList).runtimeCode, "SANCTIONS_LIST"
+            );
+
+            // Audit FIND-006. Everything above is a STRUCTURAL check — it establishes that
+            // SANCTIONS_LIST is a contract, is not this repo's mock, and answers on the
+            // terms the transfer path decodes on. None of it can tell a working compliance
+            // gate from one that screens nobody: a freshly deployed, unseeded
+            // SanctionsOracleMirror satisfies every line above and answers `false` for
+            // every address. The behavioural screen below is the one that can, because a
+            // deploy script is the layer that can be handed a live SDN designation at run
+            // time — a fixture stored on-chain would go stale the moment OFAC delisted it.
+            //
+            // Also bounds the gas each answer costs, so an oracle with no margin left is
+            // refused here rather than on a holder's transfer. See SCREENING_GAS_BUDGET.
+            c.sanctionsProbeFlagged =
+                DeployGuards.envAddressProdRequired("SANCTIONS_PROBE_FLAGGED", address(0));
+            DeployGuards.requireSanctionsOracleAnswers(
+                c.sanctionsList,
+                c.sanctionsProbeFlagged,
+                c.deployer, // known-clean: the broadcaster is on no sanctions list
+                "SANCTIONS_LIST"
             );
         }
     }
@@ -301,6 +363,13 @@ contract DeployDevNet is Script {
         // The factory needs REGISTRAR_ROLE so deployToken can register tokens.
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
+        // ISSUANCE_PAUSER_ROLE (audit FIND-001). Granted here, before the deployer gives up
+        // DEFAULT_ADMIN: afterwards the grant would need a full timelock proposal, which is
+        // how the role shipped with NO holder at all and left pauseIssuance() uncallable.
+        // Not revoked in {_handOverToTimelock} — unlike the transient whitelist grant, this
+        // is a permanent operational role, and its whole point is to act without a delay.
+        issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), c.issuancePauser);
+
         issuanceMgr.addToWhitelist(c.subscriber);
 
         // Anvil account[1] — its private key is printed in the Anvil banner. It exists so
@@ -375,13 +444,21 @@ contract DeployDevNet is Script {
             );
         }
 
-        // 5. The compliance oracle must be a real contract on production — never a mock,
+        // 5. The mint-path brake has a holder (audit FIND-001). A pausable contract whose
+        //    pauser role is unassigned is not pausable; asserting the grant in-band is what
+        //    stops that shipping again.
+        require(
+            issuanceMgr.hasRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), c.issuancePauser),
+            "DeployDevNet: ISSUANCE_PAUSER_ROLE has no holder"
+        );
+
+        // 6. The compliance oracle must be a real contract on production — never a mock,
         //    never an EOA, never an empty address that silently screens nothing.
         DeployGuards.requireProdContract(sanctionsOracle, "sanctions oracle");
         DeployGuards.requireProdNotMock(sanctionsOracle, type(MockSanctionsList).runtimeCode, "sanctions oracle");
         require(factory.sanctionsList() == sanctionsOracle, "DeployDevNet: factory sanctions oracle mismatch");
 
-        // 6. The publicly-known Anvil key is not an AP on a production chain.
+        // 7. The publicly-known Anvil key is not an AP on a production chain.
         if (!DeployGuards.isDevChain()) {
             require(
                 !issuanceMgr.whitelisted(DeployGuards.ANVIL_ACCOUNT_1),
@@ -405,6 +482,9 @@ contract DeployDevNet is Script {
             require(!im.hasRole(im.WHITELIST_ADMIN_ROLE(), deployer), "DeployDevNet: deployer kept WHITELIST_ADMIN_ROLE");
             require(!im.hasRole(im.SUBSCRIBER_ROLE(), deployer), "DeployDevNet: deployer kept SUBSCRIBER_ROLE");
             require(!im.hasRole(im.REDEEMER_ROLE(), deployer), "DeployDevNet: deployer kept REDEEMER_ROLE");
+            require(
+                !im.hasRole(im.ISSUANCE_PAUSER_ROLE(), deployer), "DeployDevNet: deployer kept ISSUANCE_PAUSER_ROLE"
+            );
         }
     }
 
@@ -423,13 +503,22 @@ contract DeployDevNet is Script {
     ) internal {
         TimelockController tl = TimelockController(payable(factory_.owner()));
 
-        // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF62, CUSIP 14913UBF6, matures 2028-09-06)
+        // Audit FIND-011. Fail before the timelock proposal is built, not after.
+        DeployGuards.requireNotSelf(operator,      address(factory_), "operator",      "the factory");
+        DeployGuards.requireNotSelf(issuanceMgr_,  address(factory_), "issuanceManager", "the factory");
+        DeployGuards.requireNotSelf(navFeedOwner,  address(factory_), "navFeedOwner",  "the factory");
+
+        // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF66, CUSIP 14913UBF6, matures 2028-09-06)
         {
-            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62", 1_788_739_200);
+            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
+            // costs the identifier. Both are still free to fix here.
+            DeployGuards.requireValidIsin("US14913UBF66");
+            DeployGuards.requireIsinVacant(address(factory_), "US14913UBF66");
+            address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
-                ("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF62",
-                 1_788_739_200, operator, issuanceMgr_, navFeedOwner)
+                ("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66",
+                 1_851_811_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_cat"));
@@ -439,13 +528,17 @@ contract DeployDevNet is Script {
             console.log("FORWARDER_CAT=%s  (give this to Morpho/Aave)", factory_.forwarderOf(cat));
         }
 
-        // C — Citigroup Inc 3.887% 2028 (ISIN US172967LD16, CUSIP 172967LD1, matures 2028-01-10)
+        // C — Citigroup Inc 3.887% 2028 (ISIN US172967LD18, CUSIP 172967LD1, matures 2028-01-10)
         {
-            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16", 1_767_052_800);
+            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
+            // costs the identifier. Both are still free to fix here.
+            DeployGuards.requireValidIsin("US172967LD18");
+            DeployGuards.requireIsinVacant(address(factory_), "US172967LD18");
+            address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
-                ("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD16",
-                 1_767_052_800, operator, issuanceMgr_, navFeedOwner)
+                ("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18",
+                 1_831_075_200, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_c"));
@@ -455,13 +548,17 @@ contract DeployDevNet is Script {
             console.log("FORWARDER_C=%s  (give this to Morpho/Aave)", factory_.forwarderOf(c));
         }
 
-        // KO — Coca-Cola Co 2.25% 2032 (ISIN US191216DP29, CUSIP 191216DP2, matures 2032-09-01)
+        // KO — Coca-Cola Co 2.25% 2032 (ISIN US191216DP21, CUSIP 191216DP2, matures 2032-09-01)
         {
-            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29", 1_975_017_600);
+            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
+            // costs the identifier. Both are still free to fix here.
+            DeployGuards.requireValidIsin("US191216DP21");
+            DeployGuards.requireIsinVacant(address(factory_), "US191216DP21");
+            address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP21", 1_977_609_600);
             bytes memory data = abi.encodeCall(
                 factory_.deployToken,
-                ("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP29",
-                 1_975_017_600, operator, issuanceMgr_, navFeedOwner)
+                ("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP21",
+                 1_977_609_600, operator, issuanceMgr_, navFeedOwner)
             );
             tl.schedule(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"), 0);
             tl.execute(address(factory_), 0, data, bytes32(0), bytes32("deploy_ko"));

@@ -163,7 +163,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -181,7 +181,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(usdc),
             price: 100e6,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
     }
 
@@ -426,6 +426,57 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
     }
 
+    /// Audit FIND-014 / TEST-66. executeSwap reads the band, the NAV age and the TTL cap
+    /// from storage at fill time and the signed message carries none of them, so a setter
+    /// that moves one would otherwise judge outstanding quotes by a rule they were not
+    /// priced under. Each of the three setters bumps the epoch instead, and a quote signed
+    /// a moment earlier dies on the epoch gate.
+    function test_configChange_invalidatesQuotesSignedUnderPreviousSettings() public {
+        _approveTaker();
+
+        // 1. The quote-vs-NAV band.
+        GyldAtomicSwap.SwapMessage memory band = _buyQuote(201, 1_000e6);
+        bytes memory bandSig = _sign(band);
+        assertEq(band.epoch, 0, "fixture: signed under epoch 0");
+        vm.prank(admin);
+        swap.setMaxQuoteDeviationBps(300);
+        assertEq(swap.quoteEpoch(), 1, "setMaxQuoteDeviationBps must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(0), uint64(1)));
+        swap.executeSwap(band, bandSig, _noPermit(), band.maxAmountIn);
+
+        // 2. The NAV staleness bound.
+        GyldAtomicSwap.SwapMessage memory age = _buyQuote(202, 1_000e6);
+        age.epoch = 1;
+        bytes memory ageSig = _sign(age);
+        vm.prank(admin);
+        swap.setMaxNavAgeSecs(2 days); // widen: the direction the finding is about
+        assertEq(swap.quoteEpoch(), 2, "setMaxNavAgeSecs must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(1), uint64(2)));
+        swap.executeSwap(age, ageSig, _noPermit(), age.maxAmountIn);
+
+        // 3. The quote TTL cap.
+        GyldAtomicSwap.SwapMessage memory ttl = _buyQuote(203, 1_000e6);
+        ttl.epoch = 2;
+        bytes memory ttlSig = _sign(ttl);
+        vm.prank(admin);
+        swap.setMaxQuoteTtl(120 seconds);
+        assertEq(swap.quoteEpoch(), 3, "setMaxQuoteTtl must bump the epoch");
+        vm.prank(taker);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteEpochStale.selector, uint64(2), uint64(3)));
+        swap.executeSwap(ttl, ttlSig, _noPermit(), ttl.maxAmountIn);
+
+        // Invalidation, not a brick: the quote service re-issues at the new epoch and the
+        // same trade settles. No id was consumed by any of the three reverts.
+        GyldAtomicSwap.SwapMessage memory reissued = _buyQuote(204, 1_000e6);
+        reissued.epoch = swap.quoteEpoch();
+        bytes memory reissuedSig = _sign(reissued);
+        vm.prank(taker);
+        swap.executeSwap(reissued, reissuedSig, _noPermit(), reissued.maxAmountIn);
+        assertTrue(swap.isQuoteUsed(204), "a quote re-issued at the new epoch must settle");
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // I-5 — Epoch bump does not free quoteIds
     // ═════════════════════════════════════════════════════════════════════════
@@ -633,7 +684,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: V_BOND,
             price: 1e28,
             expiry: 1_750_000_900,
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         GyldAtomicSwap.SwapMessage memory v2 = GyldAtomicSwap.SwapMessage({
             quoteId: 257,
@@ -1279,7 +1330,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(evil),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         // The re-entrant call dies on the guard (the FIRST modifier), so the message and
         // signature never get validated — an empty signature is sufficient.
@@ -1288,6 +1339,33 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.prank(treasurer);
         vm.expectRevert(abi.encodeWithSignature("ReentrancyGuardReentrantCall()"));
         swap.withdraw(address(evil), 10e18);
+    }
+
+    /// The FIND-024 sweep is the third path that moves tokens out, so it carries the same
+    /// exclusion: a malicious series cannot use the sweep's transfer hook to enter
+    /// executeSwap. Same guard, so the re-entrant call dies before the message is read.
+    function test_deregisterSeriesSweep_cannotReenterExecuteSwap() public {
+        MockReentrantToken evil = new MockReentrantToken();
+        evil.mint(address(swap), 100e18); // mint BEFORE arming (the hook fires on mint too)
+
+        vm.prank(admin);
+        swap.registerSeries(address(evil), address(navFeed)); // reports 18 decimals
+
+        ISwapReentryTarget.SwapMessage memory rm = ISwapReentryTarget.SwapMessage({
+            quoteId: 998,
+            taker: taker,
+            tokenIn: address(usdc),
+            maxAmountIn: 1_000e6,
+            tokenOut: address(evil),
+            price: 1e28,
+            expiry: uint64(block.timestamp + 60 seconds),
+            epoch: swap.quoteEpoch()
+        });
+        evil.armExecuteSwap(address(swap), rm, "", 1_000e6);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("ReentrancyGuardReentrantCall()"));
+        swap.deregisterSeries(address(evil));
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1439,7 +1517,7 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.startPrank(admin);
         swap.bumpQuoteEpoch();
         swap.bumpQuoteEpoch();
-        swap.bumpQuoteEpoch(); // quoteEpoch = 3
+        swap.bumpQuoteEpoch(); // quoteEpoch = 3; the two setters below bump it to 5 (FIND-014)
         swap.setMaxQuoteDeviationBps(0x0123); // 291 bps
         // GYL-1135: maxNavAgeSecs is now bounded by MAX_NAV_AGE_CEILING (72 h), so this
         // probe value can no longer be an arbitrary uint32. 0x0003F123 (258_339 s ≈
@@ -1451,7 +1529,7 @@ contract GyldAtomicSwapSpecTest is Test {
         vm.stopPrank();
 
         uint256 slot0 = uint256(vm.load(address(swap), derived));
-        assertEq(uint64(slot0), uint64(3), "quoteEpoch must occupy B+0 offset 0 (8 bytes)");
+        assertEq(uint64(slot0), uint64(5), "quoteEpoch must occupy B+0 offset 0 (8 bytes)");
         assertEq(uint16(slot0 >> 64), uint16(0x0123), "maxQuoteDeviationBps must occupy B+0 offset 8 (2 bytes)");
         assertEq(uint32(slot0 >> 80), LAYOUT_NAV_AGE, "maxNavAgeSecs must occupy B+0 offset 10 (4 bytes)");
         assertEq(slot0 >> 112, 0, "bytes 14..31 of B+0 must remain free");
@@ -1488,7 +1566,7 @@ contract GyldAtomicSwapSpecTest is Test {
         assertEq(uint256(vm.load(address(swap), bytes32(uint256(derived) + 8))), 0, "slot must clear");
 
         // Getters agree with the raw slots.
-        assertEq(swap.quoteEpoch(), 3);
+        assertEq(swap.quoteEpoch(), 7); // 5, plus one per setMaxQuoteTtl call above
         assertEq(swap.maxQuoteDeviationBps(), 0x0123);
         assertEq(swap.maxNavAgeSecs(), LAYOUT_NAV_AGE);
         assertEq(swap.maxQuoteTtl(), swap.DEFAULT_MAX_QUOTE_TTL());
@@ -1579,7 +1657,7 @@ contract GyldAtomicSwapSpecTest is Test {
             tokenOut: address(token),
             price: 1e28,
             expiry: uint64(block.timestamp + 60 seconds),
-            epoch: 0
+            epoch: swap.quoteEpoch()
         });
         bytes memory sig = _signFor(s, m, SIGNER_PK);
 
@@ -1705,5 +1783,348 @@ contract GyldAtomicSwapSpecTest is Test {
             )
         );
         swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+    }
+
+    // ── FIND-021: aggregate notional cap per NAV round ─────────────────────────
+
+    /// TEST-72. Per-fill guards all pass; the round budget is what stops the run.
+    function test_navRoundCap_boundsTotalNotionalAgainstOneNavUpdate() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 2_500e6);
+
+        // Two full fills of $1,000 settle against the same NAV round.
+        for (uint256 i = 1; i <= 2; i++) {
+            GyldAtomicSwap.SwapMessage memory ok = _buyQuote(i, 1_000e6);
+            bytes memory okSig = _sign(ok); // sign first: hashSwapMessage would eat the prank
+            vm.prank(taker);
+            swap.executeSwap(ok, okSig, _noPermit(), ok.maxAmountIn);
+        }
+        (, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(drawn, 2_000e6, "two fills must have consumed $2,000 of the round budget");
+
+        // The third is individually legal — in band, unexpired, fresh quoteId — and is
+        // refused only because the round's remaining $500 cannot cover it.
+        GyldAtomicSwap.SwapMessage memory over = _buyQuote(3, 1_000e6);
+        bytes memory sig = _sign(over);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 500e6, 2_500e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(over, sig, _noPermit(), over.maxAmountIn);
+
+        // A draw that fits the remainder still settles, so the cap bounds notional
+        // rather than simply halting the series.
+        GyldAtomicSwap.SwapMessage memory fits = _buyQuote(4, 500e6);
+        bytes memory fitsSig = _sign(fits);
+        vm.prank(taker);
+        swap.executeSwap(fits, fitsSig, _noPermit(), fits.maxAmountIn);
+        (, drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(drawn, 2_500e6, "budget must be exactly exhausted, never overshot");
+    }
+
+    /// I-9: the cap check runs after _consumeQuote, so its revert unwinds the burn.
+    function test_navRoundCap_exceededQuoteIdSurvives() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_000e6);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(77, 1_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn); // exhausts the round
+
+        GyldAtomicSwap.SwapMessage memory blocked = _buyQuote(78, 1_000e6);
+        bytes memory blockedSig = _sign(blocked);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 0, 1_000e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(blocked, blockedSig, _noPermit(), blocked.maxAmountIn);
+
+        // Positive control: a SETTLED quote is burned, so the assertion below is not
+        // just "any revert leaves state untouched" — it pins the cap check after
+        // _consumeQuote rather than before it.
+        assertTrue(swap.isQuoteUsed(77), "control: a settled quote must be burned");
+        assertFalse(swap.isQuoteUsed(78), "a budget-refused quote must not be burned");
+
+        // ...but surviving the burn is bookkeeping hygiene, NOT a retry path. Rounds are
+        // >= MIN_UPDATE_INTERVAL (1 h) apart and a quote lives at most 10 min, so by the
+        // time the budget resets the quote is dead. The desk must re-issue, not resubmit.
+        vm.warp(block.timestamp + 1 hours);
+        navFeed.setUpdatedAt(block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.QuoteExpired.selector, blocked.expiry));
+        vm.prank(taker);
+        swap.executeSwap(blocked, blockedSig, _noPermit(), blocked.maxAmountIn);
+    }
+
+    function test_navRoundCap_resetsOnNewNavRound() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_000e6);
+
+        GyldAtomicSwap.SwapMessage memory first = _buyQuote(11, 1_000e6);
+        bytes memory firstSig = _sign(first);
+        vm.prank(taker);
+        swap.executeSwap(first, firstSig, _noPermit(), first.maxAmountIn);
+
+        uint64 firstRound;
+        (firstRound,) = swap.navRoundNotionalDrawn(address(token));
+
+        // A push carries a STRICTLY NEWER updatedAt; the counter is scoped to the old one.
+        // Quote built after the warp so it is not already expired.
+        vm.warp(block.timestamp + 1 hours);
+        navFeed.setUpdatedAt(block.timestamp);
+        GyldAtomicSwap.SwapMessage memory second = _buyQuote(12, 1_000e6);
+        bytes memory secondSig = _sign(second);
+        vm.prank(taker);
+        swap.executeSwap(second, secondSig, _noPermit(), second.maxAmountIn);
+
+        (uint64 nextRound, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        (,,, uint256 feedUpdatedAt,) = navFeed.latestRoundData();
+        assertTrue(nextRound != firstRound, "counter must re-key onto the new round");
+        assertEq(nextRound, uint64(feedUpdatedAt), "the round key must be the feed's updatedAt");
+        assertEq(drawn, 1_000e6, "a new round starts from this fill, not from the old total");
+    }
+
+    /// The cap is denominated in USDC so one number bounds both directions.
+    function test_navRoundCap_appliesToRedeemLeg() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_500e6);
+
+        GyldAtomicSwap.SwapMessage memory sell = _redeemQuote(21, 10e18); // → $1,000 out
+        bytes memory sellSig = _sign(sell);
+        vm.prank(taker);
+        swap.executeSwap(sell, sellSig, _noPermit(), sell.maxAmountIn);
+        (, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(drawn, 1_000e6, "redeem must charge the USDC leg, not the bond leg");
+
+        GyldAtomicSwap.SwapMessage memory over = _redeemQuote(22, 10e18);
+        bytes memory sig = _sign(over);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 500e6, 1_500e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(over, sig, _noPermit(), over.maxAmountIn);
+    }
+
+    /// Upgrade safety: an unwritten slot must mean "use the default", never zero.
+    function test_navRoundCap_unsetSlotFallsBackToDefault() public view {
+        assertEq(
+            swap.maxNavRoundNotionalFor(address(token)),
+            swap.DEFAULT_MAX_NAV_ROUND_NOTIONAL(),
+            "unset override must resolve to the compiled-in default"
+        );
+        assertTrue(
+            swap.DEFAULT_MAX_NAV_ROUND_NOTIONAL() <= swap.MAX_NAV_ROUND_NOTIONAL_CEILING(),
+            "the shipped default must itself sit under the ceiling"
+        );
+    }
+
+    function test_navRoundCap_setterBoundsAndClears() public {
+        uint256 ceiling = swap.MAX_NAV_ROUND_NOTIONAL_CEILING();
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidNavRoundNotional.selector, ceiling + 1));
+        swap.setMaxNavRoundNotionalFor(address(token), ceiling + 1);
+
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), ceiling);
+        assertEq(swap.maxNavRoundNotionalFor(address(token)), ceiling, "the ceiling itself must be settable");
+
+        // Zero is the unset sentinel, NOT a zero-notional soft-pause.
+        vm.expectEmit(true, false, false, true);
+        emit GyldAtomicSwap.MaxNavRoundNotionalForSeriesUpdated(address(token), 0);
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 0);
+        assertEq(
+            swap.maxNavRoundNotionalFor(address(token)),
+            swap.DEFAULT_MAX_NAV_ROUND_NOTIONAL(),
+            "zero must clear the override rather than freeze the series"
+        );
+    }
+
+    function test_navRoundCap_setterRejectsUnregisteredAndStranger() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.UnregisteredSeries.selector, address(usdc)));
+        swap.setMaxNavRoundNotionalFor(address(usdc), 1_000e6);
+
+        vm.prank(outsider);
+        vm.expectRevert();
+        swap.setMaxNavRoundNotionalFor(address(token), 1_000e6);
+    }
+
+    /// A re-registered token must not inherit a retired series' budget or its spend.
+    function test_navRoundCap_deregisterClearsCapAndCounter() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_000e6);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(31, 1_000e6);
+        bytes memory mSig = _sign(m);
+        vm.prank(taker);
+        swap.executeSwap(m, mSig, _noPermit(), m.maxAmountIn);
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+
+        assertEq(
+            swap.maxNavRoundNotionalFor(address(token)),
+            swap.DEFAULT_MAX_NAV_ROUND_NOTIONAL(),
+            "deregister must clear the per-series cap"
+        );
+        (uint64 round, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(round, 0, "deregister must clear the counter's round");
+        assertEq(drawn, 0, "deregister must clear the spent notional");
+    }
+
+    /// The FIND-021 fields must be APPENDED (B+10, B+11), never inserted above. An
+    /// insertion compiles clean and silently re-homes every mapping below it on a live
+    /// proxy, which is why the reference-type slots are pinned by value here.
+    function test_navRoundCap_storageLayoutAppendedAtTail() public {
+        bytes32 B = keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff));
+        _approveTaker();
+
+        vm.startPrank(admin);
+        // Populate B+9 too, or the negative probe below passes even if B+9/B+10 were
+        // swapped — an empty slot reads zero either way.
+        swap.setMaxNavAgeSecsFor(address(token), LAYOUT_NAV_AGE);
+        swap.setMaxNavRoundNotionalFor(address(token), 3_000e6);
+        vm.stopPrank();
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(41, 1_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 10)))),
+            3_000e6,
+            "maxNavRoundNotionalOf must occupy B+10"
+        );
+
+        // navRoundDrawOf (B+11): NavRoundDraw packs round (low 64b) then drawn (next 192b).
+        uint256 packed = uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 11))));
+        (uint64 round, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(uint64(packed), round, "round must occupy the low 64 bits of B+11");
+        assertEq(packed >> 64, drawn, "drawn must occupy the upper 192 bits of B+11");
+        assertEq(drawn, 1_000e6, "precondition: one $1,000 fill was charged to the round");
+
+        // NEGATIVE: the two new mappings must not be interchangeable.
+        assertEq(
+            uint256(vm.load(address(swap), keccak256(abi.encode(address(token), uint256(B) + 9)))),
+            LAYOUT_NAV_AGE,
+            "B+9 must still hold the age override, not the cap (B+9/B+10 swapped?)"
+        );
+    }
+
+    /// Regression for the non-monotone round key: a feed whose updatedAt moves BACKWARDS
+    /// must not re-open a spent budget (A -> B -> A would otherwise settle 2x the cap).
+    function test_navRoundCap_olderRoundDoesNotReopenBudget() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_000e6);
+
+        uint256 roundA = block.timestamp;
+        GyldAtomicSwap.SwapMessage memory first = _buyQuote(51, 1_000e6);
+        bytes memory firstSig = _sign(first);
+        vm.prank(taker);
+        swap.executeSwap(first, firstSig, _noPermit(), first.maxAmountIn); // exhausts A
+
+        // Rewind the feed below A. A plain `!=` reset would zero the counter here.
+        navFeed.setUpdatedAt(roundA - 10);
+        GyldAtomicSwap.SwapMessage memory replay = _buyQuote(52, 1_000e6);
+        bytes memory replaySig = _sign(replay);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 0, 1_000e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(replay, replaySig, _noPermit(), replay.maxAmountIn);
+
+        (uint64 round, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(round, uint64(roundA), "the counter must stay pinned to the highest round seen");
+        assertEq(drawn, 1_000e6, "a rewound feed must not zero the spent notional");
+    }
+
+    /// Both legs are denominated in USDC, so buy and redeem share ONE round budget.
+    function test_navRoundCap_buyAndRedeemShareOneBudget() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 1_500e6);
+
+        GyldAtomicSwap.SwapMessage memory buy = _buyQuote(61, 1_000e6);
+        bytes memory buySig = _sign(buy);
+        vm.prank(taker);
+        swap.executeSwap(buy, buySig, _noPermit(), buy.maxAmountIn);
+
+        // The redeem leg is charged against what the BUY already spent, not a fresh budget.
+        GyldAtomicSwap.SwapMessage memory sell = _redeemQuote(62, 10e18); // → $1,000 out
+        bytes memory sellSig = _sign(sell);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 500e6, 1_500e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(sell, sellSig, _noPermit(), sell.maxAmountIn);
+    }
+
+    /// The budget is charged the ACTUAL draw, not the signed ceiling.
+    function test_navRoundCap_chargesActualDrawNotCeiling() public {
+        _approveTaker();
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(71, 1_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), 400e6); // draw 40% of the ceiling
+
+        (, uint256 drawn) = swap.navRoundNotionalDrawn(address(token));
+        assertEq(drawn, 400e6, "an under-drawn quote must charge the draw, not maxAmountIn");
+    }
+
+    /// Lowering the cap below what is already drawn must saturate, not underflow.
+    function test_navRoundCap_loweredBelowDrawnSaturates() public {
+        _approveTaker();
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 3_000e6);
+
+        GyldAtomicSwap.SwapMessage memory m = _buyQuote(81, 2_000e6);
+        bytes memory sig = _sign(m);
+        vm.prank(taker);
+        swap.executeSwap(m, sig, _noPermit(), m.maxAmountIn);
+
+        vm.prank(admin);
+        swap.setMaxNavRoundNotionalFor(address(token), 500e6); // now below `drawn`
+
+        GyldAtomicSwap.SwapMessage memory next = _buyQuote(82, 1_000e6);
+        bytes memory nextSig = _sign(next);
+        // remaining saturates at 0 — a custom revert, never a panic.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldAtomicSwap.NavRoundNotionalExceeded.selector, address(token), 1_000e6, 0, 500e6
+            )
+        );
+        vm.prank(taker);
+        swap.executeSwap(next, nextSig, _noPermit(), next.maxAmountIn);
+    }
+
+    /// The cap's shipped numbers are policy, not incidental — pin them so a change is
+    /// deliberate. $1M is the unconfigured-series floor; each series is set to $10M at
+    /// deploy (D-28); $50M is the hard limit no admin call can pass.
+    function test_navRoundCap_shippedConstants() public view {
+        assertEq(swap.DEFAULT_MAX_NAV_ROUND_NOTIONAL(), 1_000_000e6, "fallback cap must be $1M");
+        assertEq(swap.MAX_NAV_ROUND_NOTIONAL_CEILING(), 50_000_000e6, "structural ceiling must be $50M");
+        assertTrue(
+            10_000_000e6 <= swap.MAX_NAV_ROUND_NOTIONAL_CEILING(),
+            "the $10M deploy policy must remain reachable without an upgrade"
+        );
     }
 }

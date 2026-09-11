@@ -46,6 +46,7 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
 
     error ZeroAddress();
     error CannotRenounceAdminRole();
+    error CannotRemoveLastAdmin(); // audit FIND-007
     error InvalidForwardingOracle(address addr);
     error SelfReferenceOracle();
 
@@ -108,6 +109,27 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
         super.renounceRole(role, callerConfirmation);
     }
 
+    /// @dev Audit FIND-007. `renounceRole` above refuses DEFAULT_ADMIN_ROLE, but the role
+    ///      admins itself, so the sole holder could self-revoke into the same bricked state.
+    ///      Guarding `_revokeRole` covers both paths. Removing a NON-last admin is untouched
+    ///      — that is the deploy handover (grant successor, then self-revoke).
+    ///      `<= 1` not `== 1`: a proxy upgraded to this code never wrote the slot, so it reads
+    ///      0 while holding one admin; blocking there is the safe direction.
+    uint256 public defaultAdminCount;
+
+    function _grantRole(bytes32 r, address a) internal override returns (bool granted) {
+        granted = super._grantRole(r, a);
+        if (granted && r == DEFAULT_ADMIN_ROLE) defaultAdminCount++;
+    }
+
+    function _revokeRole(bytes32 r, address a) internal override returns (bool revoked) {
+        revoked = super._revokeRole(r, a);
+        if (revoked && r == DEFAULT_ADMIN_ROLE) {
+            if (defaultAdminCount <= 1) revert CannotRemoveLastAdmin();
+            defaultAdminCount--;
+        }
+    }
+
     /// @notice Remove addresses from the sanctions list.
     ///         Called by the keeper bot when OFAC removes a designation.
     ///         Note: if an address is still flagged by the forwardingOracle,
@@ -141,8 +163,12 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    /// @dev Written BEFORE the probe so the probe reads through the NEW pointer: a cycle
+    ///      then recurses, fails, and this revert rolls the write back (audit FIND-019, D-36).
     function _setForwardingOracle(address newOracle) internal {
         if (newOracle == address(this)) revert SelfReferenceOracle();
+        emit ForwardingOracleUpdated(address(forwardingOracle), newOracle);
+        forwardingOracle = ISanctionsList(newOracle);
         if (newOracle != address(0)) {
             // Probe: must implement isSanctioned(address) and return a
             // canonically-decodable bool. Uses the same gas cap and decode
@@ -154,7 +180,6 @@ contract SanctionsOracleMirror is ISanctionsList, AccessControl {
             if (!ok || data.length != 32) revert InvalidForwardingOracle(newOracle);
             abi.decode(data, (bool)); // canonical bool check — reverts on non-zero word > 1
         }
-        emit ForwardingOracleUpdated(address(forwardingOracle), newOracle);
-        forwardingOracle = ISanctionsList(newOracle);
     }
+
 }

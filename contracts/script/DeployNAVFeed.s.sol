@@ -19,6 +19,11 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   OPERATOR_ADDRESS     Address that can call NAVFeed.updateAnswer()
 ///                        (your backend EOA or Gnosis Safe)
 ///   FEED_DESCRIPTION     Human-readable label, e.g. "TLT / USD NAV"
+///   NAV_GUARDIAN         Ops multisig that may CALL emergencyUpdateAnswer, co-signed by
+///                        OPERATOR_ADDRESS (audit FIND-003). MUST differ from
+///                        OPERATOR_ADDRESS — the emergency path is a 2-of-2 and one
+///                        address holding both roles collapses it to a 1-of-1.
+///                        Falls back to FORWARDER_OWNER on dev chains only.
 ///
 /// Required on PRODUCTION chains (optional on Anvil 31337 / Sepolia 11155111, where it
 /// falls back to OPERATOR_ADDRESS):
@@ -75,6 +80,18 @@ contract DeployNAVFeed is Script {
         // lending market reads, and that must not be one hot key away.
         DeployGuards.requireProdContract(forwarderOwner, "FORWARDER_OWNER");
 
+        // Emergency NAV guardian (audit FIND-003). Distinct from the operator by
+        // construction — the feed's constructor reverts InvalidEmergencyUpdater otherwise,
+        // but failing here names the variable the deployer actually has to fix.
+        // Dev fallback is a derived address, NOT the operator or the forwarder owner: on a
+        // dev chain both of those collapse back to OPERATOR_ADDRESS, and the feed's
+        // constructor rightly refuses a guardian equal to its owner. On production
+        // envAddressProdRequired ignores the fallback and demands the variable.
+        address navGuardian = DeployGuards.envAddressProdRequired(
+            "NAV_GUARDIAN", vm.addr(uint256(keccak256("DeployNAVFeed:dev-nav-guardian")))
+        );
+        DeployGuards.requireDistinct(operator, navGuardian, "OPERATOR_ADDRESS", "NAV_GUARDIAN");
+
         vm.startBroadcast();
 
         // 1. Deploy the NAV feed (operator pushes prices here). The salt carries the feed
@@ -82,9 +99,11 @@ contract DeployNAVFeed is Script {
         feed = new KaleidoscopeNAVFeed{
             salt: DeployGuards.vacantSalt(
                 string.concat("DeployNAVFeed:KaleidoscopeNAVFeed:", feedDescription),
-                abi.encodePacked(type(KaleidoscopeNAVFeed).creationCode, abi.encode(operator, feedDescription))
+                abi.encodePacked(
+                    type(KaleidoscopeNAVFeed).creationCode, abi.encode(operator, feedDescription, navGuardian)
+                )
             )
-        }(operator, feedDescription);
+        }(operator, feedDescription, navGuardian);
 
         // 2. Deploy the forwarder pointing at the NAV feed
         //    DeFi protocols always integrate this address — never the feed directly

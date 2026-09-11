@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
@@ -27,7 +27,7 @@ contract ReentrantAttacker {
 
     function attack() external {
         // issuanceManager = address(this) so registerToken loops back here
-        malFactory.deployToken("Attacker Bond", "ATCK", "US000000001", 0, address(0x1), address(this), navFeedOwner);
+        malFactory.deployToken("Attacker Bond", "ATCK", "US0000000001", 0, address(0x1), address(this), navFeedOwner);
     }
 
     /// @dev Called by the factory during deployToken (step 6: registerToken).
@@ -35,7 +35,7 @@ contract ReentrantAttacker {
     function registerToken(address) external {
         if (!_done) {
             _done = true;
-            malFactory.deployToken("Reentrant Bond", "RENT", "US000000002", 0, address(0x1), address(this), navFeedOwner);
+            malFactory.deployToken("Reentrant Bond", "RENT", "US0000000002", 0, address(0x1), address(this), navFeedOwner);
         }
     }
 
@@ -56,8 +56,10 @@ contract TokenFactoryTest is Test {
     event TokenDeployed(
         address indexed token,
         address indexed navFeed,
-        address indexed forwarder,
-        address issuanceManager
+        bytes32 indexed isinKey,
+        address forwarder,
+        address issuanceManager,
+        string isin
     );
 
     GyldBondToken     bondTokenImpl;
@@ -176,26 +178,161 @@ contract TokenFactoryTest is Test {
         new TokenFactory(address(bondTokenImpl), wrongContract, address(this));
     }
 
+    /// Audit FIND-008. The oracle is baked into every token this factory deploys, so the
+    /// factory's admission must be no looser than GyldBondToken's. A reply that is 32 bytes
+    /// long but not a canonical bool passed the old length-only check here and then reverted
+    /// the ABI validator on every transfer of every series the factory produced.
+    function test_constructor_nonCanonicalBool_sanctionsList_reverts() public {
+        address bad = address(new NonCanonicalSanctionsOracle());
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.NotValidSanctionsList.selector, bad));
+        new TokenFactory(address(bondTokenImpl), bad, address(this));
+    }
+
+    /// The factory's constructor holds its own copy of the admission logic — it cannot call
+    /// the token's helper before any token exists — so nothing but this test stops the two
+    /// from drifting. That is the failure class D-20 and the shared `ISanctionsList`
+    /// declaration exist to prevent, and a copy the compiler cannot check needs an assertion
+    /// that it still agrees. Every candidate the token would admit, the factory must admit,
+    /// and every one it refuses, the factory must refuse.
+    function test_constructorProbe_agreesWithBondTokenProbe() public {
+        address[4] memory candidates = [
+            address(mockSanctions),
+            address(0xEEEE),
+            address(new MockWrongSanctionsList()),
+            address(new NonCanonicalSanctionsOracle())
+        ];
+        GyldBondToken impl = new GyldBondToken();
+        for (uint256 i; i < candidates.length; ++i) {
+            // What the token itself does with this candidate, via a real initialize.
+            bool tokenAccepts;
+            try new ERC1967Proxy(
+                address(impl),
+                abi.encodeCall(GyldBondToken.initialize, (
+                    "Test Bond", "TST", "XX0000000001", 0,
+                    address(0xAD), address(0xAD), candidates[i]
+                ))
+            ) { tokenAccepts = true; } catch { tokenAccepts = false; }
+
+            try new TokenFactory(address(bondTokenImpl), candidates[i], address(this)) {
+                assertTrue(tokenAccepts, "factory admitted what GyldBondToken rejects");
+            } catch {
+                assertFalse(tokenAccepts, "factory rejected what GyldBondToken admits");
+            }
+        }
+    }
+
     // ── deployToken input guards ──────────────────────────────────────────────
 
     function test_deployToken_zeroOperator_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, address(0), address(issuanceMgr), navFeedOwner);
+        factory.deployToken("Bond", "BND", "US0000000001", 0, address(0), address(issuanceMgr), navFeedOwner);
     }
 
     function test_deployToken_zeroIssuanceManager_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, operator, address(0), navFeedOwner);
+        factory.deployToken("Bond", "BND", "US0000000001", 0, operator, address(0), navFeedOwner);
     }
 
     function test_deployToken_zeroNavFeedOwner_reverts() public {
         vm.expectRevert(TokenFactory.ZeroAddress.selector);
-        factory.deployToken("Bond", "BND", "US000000001", 0, operator, address(issuanceMgr), address(0));
+        factory.deployToken("Bond", "BND", "US0000000001", 0, operator, address(issuanceMgr), address(0));
     }
 
     function test_deployToken_emptyIsin_reverts() public {
         vm.expectRevert(TokenFactory.EmptyIsin.selector);
         factory.deployToken("Bond", "BND", "", 0, operator, address(issuanceMgr), navFeedOwner);
+    }
+
+    // ── FIND-013: the ISIN must be canonical, not merely non-empty ────────────
+    //
+    // `_bondSalt` hashes the RAW string, and so does the duplicate guard that reads it.
+    // So "us14913ubf66" and "US14913UBF66 " are different keys for the SAME real bond:
+    // each one sails past `IsinAlreadyDeployed` and deploys a second token for a series
+    // that already exists. Format validation is what closes that, and these tests pin
+    // each way an operator's payload can arrive non-canonical.
+
+    /// THE headline case. A lowercase ISIN is the same identifier to a human and a
+    /// different salt to the EVM.
+    function test_deployToken_lowercaseIsin_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "us912797kr72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "us912797kr72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// Whitespace is invisible in a spreadsheet cell and load-bearing in a keccak256.
+    function test_deployToken_isinWithTrailingSpace_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR72 "));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR72 ", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// An ISIN is exactly 12 characters. Both sides of that boundary are malformed.
+    function test_deployToken_isinWrongLength_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR7"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR7", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797KR722"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797KR722", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// Length alone is not enough: 12 characters with a separator in them is still a
+    /// distinct salt for an existing bond.
+    function test_deployToken_isinWithPunctuation_reverts() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797-R72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797-R72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "US912797_R72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "US912797_R72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The empty string keeps its OWN error. `MalformedIsin` says "you typed it wrong";
+    /// `EmptyIsin` says "you typed nothing", and an operator reading a revert reason
+    /// needs to be told which. Covered for the success-of-the-old-guard side by
+    /// test_deployToken_emptyIsin_reverts; asserted here from the FIND-013 direction so
+    /// a future tightening of the format check cannot quietly swallow it.
+    function test_deployToken_emptyIsin_stillRevertsEmptyIsin() public {
+        vm.expectRevert(TokenFactory.EmptyIsin.selector);
+        factory.deployToken(
+            "Test Bond", "tBOND", "", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The finding end to end. Deploy the series with its canonical ISIN, then try the
+    /// case variant the way a re-keyed payload would arrive. Before FIND-013 this second
+    /// call hashed to a different `isinKey`, passed `IsinAlreadyDeployed`, and produced a
+    /// SECOND token for one real bond. It must now be refused on format, and the registry
+    /// must still resolve the one original token and nothing else.
+    function test_deployToken_caseVariantCannotDuplicateASeries() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "precondition: the series is registered");
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "us912797kr72"));
+        factory.deployToken(
+            "Test Bond", "tBOND", "us912797kr72", TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+
+        // The canonical ISIN still resolves to the ONE token, and the variant resolves to
+        // nothing — no second series was created under a near-miss key.
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "the original must still be the answer");
+        assertEq(factory.tokenByIsin("us912797kr72"), address(0), "the variant must own no token");
     }
 
     function test_deployToken_duplicateIsin_reverts() public {
@@ -216,7 +353,7 @@ contract TokenFactoryTest is Test {
         TokenFactory freshFactory = new TokenFactory(address(bondTokenImpl), address(mockSanctions), address(this));
         vm.expectRevert();
         freshFactory.deployToken(
-            "Test Bond", "tBOND", "US000000001", 0,
+            "Test Bond", "tBOND", "US0000000001", 0,
             operator, address(issuanceMgr), navFeedOwner
         );
     }
@@ -234,7 +371,7 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sameIsin_differentNameSymbol_reverts() public {
         // Same ISIN + different name/symbol → different CREATE2 address (initcode
-        // includes name/symbol), but the _deployedIsins registry keys by ISIN only,
+        // includes name/symbol), but the ISIN registry keys by ISIN only,
         // so this is correctly caught regardless of what name/symbol is passed.
         _deploy();
         vm.expectRevert();
@@ -246,7 +383,7 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sameIsin_differentMaturity_reverts() public {
         // Same ISIN + different maturity → different CREATE2 address (initcode
-        // includes maturityTimestamp), but the _deployedIsins registry keys by ISIN
+        // includes maturityTimestamp), but the ISIN registry keys by ISIN
         // only, so this is correctly caught regardless of maturity.
         _deploy();
         vm.expectRevert();
@@ -254,6 +391,59 @@ contract TokenFactoryTest is Test {
             "Test Bond", "tBOND", TEST_ISIN, 9_999_999_999,
             operator, address(issuanceMgr), navFeedOwner
         );
+    }
+
+    // ── ISIN → token registry (audit FIND-018 / TEST-69) ──────────────────────
+
+    function test_tokenByIsin_resolvesTheDeployedToken() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "ISIN must resolve to its token");
+    }
+
+    function test_tokenByIsin_unknownIsinIsZero() public view {
+        assertEq(factory.tokenByIsin("US0000000000"), address(0));
+    }
+
+    function test_tokenByIsin_zeroBeforeDeployment() public view {
+        assertEq(factory.tokenByIsin(TEST_ISIN), address(0));
+    }
+
+    /// The public mapping is the same answer for callers that already hold the key.
+    function test_tokenOfIsinKey_matchesTokenByIsin() public {
+        (address token,,) = _deploy();
+        bytes32 isinKey = keccak256(abi.encodePacked(TEST_ISIN, block.chainid));
+        assertEq(factory.tokenOfIsinKey(isinKey), token);
+    }
+
+    /// The registry closes the loop with the two token-keyed mappings: from the bond
+    /// identifier alone a caller reaches the token, its feed and its forwarder.
+    function test_tokenByIsin_reachesFeedAndForwarder() public {
+        (address token, address navFeed, address forwarder) = _deploy();
+        address resolved = factory.tokenByIsin(TEST_ISIN);
+        assertEq(resolved, token);
+        assertEq(factory.navFeedOf(resolved),   navFeed);
+        assertEq(factory.forwarderOf(resolved), forwarder);
+        assertEq(GyldBondToken(resolved).isin(), TEST_ISIN, "and the reverse still holds");
+    }
+
+    /// The key mixes in chainId, so the same ISIN is a different slot on another chain.
+    function test_tokenByIsin_isChainScoped() public {
+        (address token,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), token);
+        bytes32 otherChainKey = keccak256(abi.encodePacked(TEST_ISIN, uint256(block.chainid + 1)));
+        assertEq(factory.tokenOfIsinKey(otherChainKey), address(0));
+    }
+
+    /// Storing an address instead of a bool must not weaken the duplicate guard:
+    /// a nonzero address means exactly what `true` meant.
+    function test_tokenByIsin_duplicateGuardUnchanged() public {
+        (address token,,) = _deploy();
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.IsinAlreadyDeployed.selector, TEST_ISIN));
+        factory.deployToken(
+            "Another Name", "OTHER", TEST_ISIN, TEST_MATURITY,
+            operator, address(issuanceMgr), navFeedOwner
+        );
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "registry unchanged by the rejected call");
     }
 
     // ── deployment ────────────────────────────────────────────────────────────
@@ -281,8 +471,36 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_emitsEvent() public {
         vm.expectEmit(false, false, false, false);
-        emit TokenDeployed(address(0), address(0), address(0), address(0));
+        emit TokenDeployed(address(0), address(0), bytes32(0), address(0), address(0), "");
         _deploy();
+    }
+
+    /// audit FIND-018 / TEST-69 — the log must carry the bond identifier, in both forms:
+    /// `isinKey` in a topic so an indexer can filter by bond, and the readable ISIN in the
+    /// data because an `indexed string` would only put its hash in the topic.
+    function test_deployToken_emitsEventCarryingTheIsin() public {
+        bytes32 expectedKey = keccak256(abi.encodePacked(TEST_ISIN, block.chainid));
+
+        vm.recordLogs();
+        (address token, address navFeed, address forwarder) = _deploy();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != keccak256("TokenDeployed(address,address,bytes32,address,address,string)")) continue;
+            found = true;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), token,   "topic1 token");
+            assertEq(address(uint160(uint256(logs[i].topics[2]))), navFeed, "topic2 navFeed");
+            assertEq(logs[i].topics[3], expectedKey, "topic3 must be the indexed isinKey");
+
+            (address fwd, address im, string memory loggedIsin) =
+                abi.decode(logs[i].data, (address, address, string));
+            assertEq(fwd, forwarder, "forwarder still in the data");
+            assertEq(im, address(issuanceMgr), "issuanceManager still in the data");
+            assertEq(loggedIsin, TEST_ISIN, "the ISIN must be readable, not just hashed");
+            break;
+        }
+        assertTrue(found, "TokenDeployed event not found");
     }
 
     function test_deployToken_tokenRegisteredWithIssuanceManager() public {
@@ -298,6 +516,34 @@ contract TokenFactoryTest is Test {
         assertEq(feed.owner(), navFeedOwner);
     }
 
+    /// audit FIND-003. The factory is what wires the feed's emergency guardian, and it
+    /// wires it to `operator` — the ops wallet that already holds PAUSER_ROLE. Nothing
+    /// else asserted this, so the whole 2-of-2 could have been mis-wired at deploy while
+    /// every feed-level test kept passing.
+    function test_deployToken_wiresOperatorAsTheNavEmergencyGuardian() public {
+        (address token,,) = _deploy();
+        KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
+
+        assertEq(feed.emergencyUpdater(), operator, "guardian must be the ops operator");
+        assertEq(feed.owner(), navFeedOwner, "and the signer must be the KMS feed owner");
+        assertTrue(feed.emergencyUpdater() != feed.owner(), "the 2-of-2 must not collapse");
+    }
+
+    /// The same address in both roles would make the emergency path a 1-of-1. The feed's
+    /// constructor refuses it too; the factory refuses it FIRST so the revert names the
+    /// parameter a deployer has to fix (audit FIND-003).
+    function test_deployToken_rejectsNavFeedOwnerEqualToOperator() public {
+        vm.expectRevert(TokenFactory.NavFeedOwnerIsOperator.selector);
+        factory.deployToken(
+            "Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY, operator, address(issuanceMgr), operator
+        );
+
+        // Control: the identical call with a distinct feed owner succeeds, so the revert
+        // above is the collision guard and not some unrelated input check.
+        (address token,,) = _deploy();
+        assertTrue(token != address(0));
+    }
+
     function test_deployToken_navFeedDescriptionMatchesSymbol() public {
         (address token,,) = _deploy();
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
@@ -308,9 +554,9 @@ contract TokenFactoryTest is Test {
         (address token,,) = _deploy();
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
         vm.prank(navFeedOwner);
-        feed.updateAnswer(9_542_000_000);
+        feed.updateAnswer(95_420_000);
         (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, 9_542_000_000);
+        assertEq(answer, 95_420_000);
     }
 
     function test_deployToken_operatorCannotPushPrice() public {
@@ -318,7 +564,7 @@ contract TokenFactoryTest is Test {
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(factory.navFeedOf(token));
         vm.prank(operator);
         vm.expectRevert();
-        feed.updateAnswer(9_542_000_000);
+        feed.updateAnswer(95_420_000);
     }
 
     // ── role assignment ───────────────────────────────────────────────────────
@@ -358,6 +604,19 @@ contract TokenFactoryTest is Test {
         factory.deployToken("X", "X", "XX0000000001", 0, address(factory), address(issuanceMgr), navFeedOwner);
     }
 
+    /// audit FIND-011. The argument the guard was actually missing.
+    function test_deployToken_navFeedOwnerIsFactory_reverts() public {
+        vm.expectRevert(TokenFactory.ZeroAddress.selector);
+        factory.deployToken("X", "X", "XX0000000002", 0, operator, address(issuanceMgr), address(factory));
+    }
+
+    /// audit FIND-011. Already reverted before the guard, but with empty data from the
+    /// hasRole preflight — asserting the named error pins that the input check fires first.
+    function test_deployToken_issuanceManagerIsFactory_reverts() public {
+        vm.expectRevert(TokenFactory.ZeroAddress.selector);
+        factory.deployToken("X", "X", "XX0000000003", 0, operator, address(factory), navFeedOwner);
+    }
+
     function test_deployToken_factoryHasNoMintBurnRoles() public {
         (address token,,) = _deploy();
         GyldBondToken t = GyldBondToken(token);
@@ -389,10 +648,10 @@ contract TokenFactoryTest is Test {
 
     function test_deployToken_sanctionsListSharedAcrossTokens() public {
         (address token1,,) = factory.deployToken(
-            "Bond A", "BONDA", "US000000001", 0, operator, address(issuanceMgr), navFeedOwner
+            "Bond A", "BONDA", "US0000000001", 0, operator, address(issuanceMgr), navFeedOwner
         );
         (address token2,,) = factory.deployToken(
-            "Bond B", "BONDB", "US000000002", 0, operator, address(issuanceMgr), navFeedOwner
+            "Bond B", "BONDB", "US0000000002", 0, operator, address(issuanceMgr), navFeedOwner
         );
         assertEq(address(GyldBondToken(token1).sanctionsList()), address(mockSanctions));
         assertEq(address(GyldBondToken(token2).sanctionsList()), address(mockSanctions));
@@ -739,12 +998,62 @@ contract TokenFactoryTest is Test {
 
     // ── fuzz: maturity timestamp ──────────────────────────────────────────────
 
-    function testFuzz_deployToken_maturityTimestamp_anyValue(uint256 maturity) public {
+    /// Any future value is stored verbatim. Bounded because deployToken now rejects a past
+    /// maturity (FIND-009); the reverting half is covered by the two tests below.
+    function testFuzz_deployToken_maturityTimestamp_anyFutureValue(uint256 maturity) public {
+        maturity = bound(maturity, block.timestamp + 1, type(uint256).max);
         // Each fuzz iteration gets a fresh EVM snapshot, so reusing the same ISIN is safe.
         (address token,,) = factory.deployToken(
             "Fuzz Bond", "FZZ", "US999999FZ99", maturity, operator, address(issuanceMgr), navFeedOwner
         );
         assertEq(GyldBondToken(token).maturityTimestamp(), maturity);
+    }
+
+    // ── FIND-009: maturity is validated at deploy, never enforced afterwards ───
+
+    /// 0 is the documented open-ended sentinel and must survive the past-maturity check.
+    function test_deployToken_maturityZero_allowed() public {
+        (address token,,) = factory.deployToken(
+            "Perp Bond", "PERP", "US999999PP99", 0, operator, address(issuanceMgr), navFeedOwner
+        );
+        assertEq(GyldBondToken(token).maturityTimestamp(), 0, "open-ended sentinel not stored");
+    }
+
+    function testFuzz_deployToken_maturityInPast_reverts(uint256 maturity) public {
+        vm.warp(1_800_000_000); // 2027-01-15, so there is a past range to fuzz over
+        maturity = bound(maturity, 1, block.timestamp); // 0 is the sentinel, excluded
+        vm.expectRevert(
+            abi.encodeWithSelector(TokenFactory.MaturityInPast.selector, maturity, block.timestamp)
+        );
+        factory.deployToken(
+            "Past Bond", "PAST", "US999999PS99", maturity, operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// The boundary: maturity == block.timestamp is already matured and must be rejected.
+    function test_deployToken_maturityExactlyNow_reverts() public {
+        vm.warp(1_800_000_000);
+        vm.expectRevert(
+            abi.encodeWithSelector(TokenFactory.MaturityInPast.selector, block.timestamp, block.timestamp)
+        );
+        factory.deployToken(
+            "Now Bond", "NOW", "US999999NW99", block.timestamp, operator, address(issuanceMgr), navFeedOwner
+        );
+    }
+
+    /// Where the maturity gate does NOT live (audit FIND-009). The token itself never reads
+    /// its own maturity: `mint` is MINTER_ROLE-gated to the IssuanceManager, and that is the
+    /// layer that refuses a matured series — see
+    /// `IssuanceManagerTest.test_subscribe_revertsOnceSeriesHasMatured` (TEST-61). Keeping the
+    /// token layer open is deliberate: it means correcting a wrong maturity never requires
+    /// upgrading a live bond proxy. This pins that split so a reader does not assume the gate
+    /// is here, and so removing it from IssuanceManager cannot pass unnoticed.
+    function test_tokenLayerDoesNotGateMintOnMaturity() public {
+        (address token,,) = _deploy();
+        vm.warp(TEST_MATURITY + 365 days);
+        vm.prank(address(issuanceMgr));
+        GyldBondToken(token).mint(operator, 1e18);
+        assertEq(GyldBondToken(token).balanceOf(operator), 1e18, "the token must not gate mint");
     }
 
     // ── same operator, multiple tokens ───────────────────────────────────────
@@ -1122,3 +1431,11 @@ contract MockSanctionsListTest is Test {
 
 /// @dev A contract with no isSanctioned() — used to test the factory constructor oracle probe.
 contract MockWrongSanctionsList {}
+
+
+/// @dev Returns a full word whose value is 2 — well-formed length, invalid bool (FIND-008).
+contract NonCanonicalSanctionsOracle {
+    fallback() external {
+        assembly { mstore(0, 2) return(0, 32) }
+    }
+}

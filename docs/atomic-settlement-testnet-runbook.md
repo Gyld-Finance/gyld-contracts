@@ -82,14 +82,26 @@ would drift out of step with them.
 > from the one at that address; do not reason from the source you can read.
 > Deploy a fresh sanctions oracle (platform `SanctionsOracleMirror`, GYL-1051, or
 > a freshly deployed owner-gated mock for pure dev) and pass it as
-> `SANCTIONS_LIST`. The oracle is baked into each token at `deployToken` time and
-> cannot be repointed afterwards, so this decision is unrecoverable once tokens
-> exist — see the TODO(compliance) below and readiness gap 5.
+> `SANCTIONS_LIST`. The factory's own `sanctionsList` is immutable, so the choice is
+> permanent for every series this factory goes on to deploy — but it is *not*
+> unrecoverable per token: `GyldBondToken.setSanctionsList` re-points an already-deployed
+> series behind the timelock, which is the compliance recovery path. Get it right up
+> front regardless; correcting it later costs one timelocked transaction per live series.
+> Since audit FIND-008 the deploy scripts assert the oracle's ANSWERS, not just its
+> interface: `DeployGuards.requireSanctionsOracleAnswers(oracle, knownFlagged, knownClean,
+> label)` requires `true` for an address you take from the **current** OFAC/SDN feed at run
+> time and `false` for a known-clean one, and it fails loudly if the oracle cannot answer at
+> all. Supply `knownFlagged` fresh each run — never hardcode it, since designations are
+> revoked. This is the check that refuses a freshly deployed, **unseeded**
+> `SanctionsOracleMirror`, which answers `false` for everything and passes every structural
+> check while screening nobody. The token's own admission probe cannot catch that: it asks
+> about `address(0)`, whose correct answer is also `false`.
+> See the TODO(compliance) below and readiness gap 5.
 
 - **TODO(compliance):** decide the sanctions oracle for the fresh testnet stack —
   platform `SanctionsOracleMirror` (GYL-1051) or a freshly deployed owner-gated
-  `MockSanctionsList` for pure dev — **before** step 0. It is baked into each token at
-  `deployToken` time and cannot be repointed afterwards.
+  `MockSanctionsList` for pure dev — **before** step 0. It is fixed for the factory, and
+  changing it per token afterwards costs one timelocked `setSanctionsList` per live series.
 
 ---
 
@@ -154,9 +166,21 @@ Config that must still be added even for Sepolia:
 `OPS_MULTISIG`, `SUBSCRIBER_ADDRESS`, `REDEEMER_ADDRESS`, `WHITELIST_ADMIN`,
 `NAV_FEED_OWNER` — all **required on any production chain** and each asserted
 `!= deployer` there; on Anvil/Sepolia they still fall back to the deployer.
+`NAV_FEED_OWNER` is additionally asserted `!= OPS_MULTISIG` on production, and is
+given a derived dev address if the two would collide on Anvil: the two form the
+**2-of-2 quorum** on the feed's emergency correction path, and one address holding
+both collapses it to a single key (audit FIND-003). `TokenFactory.deployToken`
+enforces the same rule on-chain with `NavFeedOwnerIsOperator`.
 `SANCTIONS_LIST` is required on production, must be a deployed **contract**, and is
 rejected if its bytecode matches this repo's `MockSanctionsList`; on a dev chain,
-unset still deploys the mock. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
+unset still deploys the mock. **`SANCTIONS_PROBE_FLAGGED` is also required on
+production** (audit FIND-006): an address on the **current** OFAC/SDN feed that the
+oracle must return `true` for. Every check above is structural — an unseeded mirror
+answers `false` for everyone and passes all of them — so this is the one that proves
+screening is actually on. Read it fresh at deploy time, never hardcode it (a
+delisting would then block the deploy), and prefer a long-standing designation over
+one added this week, or the keeper may not have loaded it yet. The known-clean half
+needs no config: the script uses the deployer. Unused on dev chains. `TIMELOCK_DELAY_SECONDS` defaults to **0 on Anvil and
 48 h on any other chain**, and on production `< 48 h` now **reverts before any gas is
 spent** (`requireProdMinDelay`) — `TIMELOCK_DELAY_SECONDS=0` is exactly how a
 deployment ends up with a timelock that gates nothing. On Sepolia it is still
@@ -185,7 +209,7 @@ CLI-level (from `.env.example` — all still placeholders there): `PRIVKEY`
 
 ```bash
 forge build            # must compile clean at solc 0.8.28
-forge test             # 524 tests must pass
+forge test             # 646 tests must pass
 python3 ci/check_chain_guards.py      # every deploy script carries an allowlist guard
 cast chain-id --rpc-url $RPC          # expect 11155111
 cast balance $WALLET --rpc-url $RPC   # expect enough for ~15–20 txs
@@ -210,6 +234,8 @@ be repointed afterwards.
 # with the 48h default the script stops after Phase 1 and prints Phase 2 instructions.
 # NOTE: 0 is accepted ONLY because Sepolia is a dev chain. On any production chain
 # requireProdMinDelay rejects anything below 48h before a single tx is sent.
+# On production, also export SANCTIONS_PROBE_FLAGGED=<address on today's SDN feed>
+# (audit FIND-006). Not needed here - the screen is a no-op on dev chains.
 TIMELOCK_DELAY_SECONDS=0 \
 forge script contracts/script/DeployDevNet.s.sol \
   --rpc-url $RPC --broadcast --private-key $PRIVKEY --verify
@@ -231,8 +257,8 @@ a fresh positive answer (`AtomicSettlementFlow.s.sol` lines 34–37 document thi
 enforcement is `GyldAtomicSwap._checkQuoteBand`). Push before registering/settling:
 
 ```bash
-# $100.00 at 8 decimals; sender must be the NAV feed owner (NAV_FEED_OWNER key)
-cast send $NAVFEED_CAT "updateAnswer(int256)" 10000000000 \
+# $1.00 at 8 decimals — the NAV-per-token standard; sender must be the NAV feed owner (NAV_FEED_OWNER key)
+cast send $NAVFEED_CAT "updateAnswer(int256)" 100000000 \
   --rpc-url $RPC --private-key $NAV_FEED_OWNER_KEY
 ```
 
@@ -240,7 +266,7 @@ Verify:
 
 ```bash
 cast call $FORWARDER_CAT "latestRoundData()(uint80,int256,uint256,uint256,uint80)" --rpc-url $RPC
-# expected: second value 10000000000, fourth value = recent unix timestamp
+# expected: second value 100000000, fourth value = recent unix timestamp
 ```
 
 ### Step 2 — deploy the swap (`DeployAtomicSettlement.s.sol`)
@@ -252,6 +278,21 @@ an AP on IssuanceManager (skipped with printed instructions if the broadcaster l
 GYL-1050 — ordering is load-bearing, see script lines 168–177) → allowlist
 `ALLOWED_TAKERS` → hand `DEFAULT_ADMIN_ROLE` to `TIMELOCK_ADDRESS` and revoke the
 deployer.
+
+**Step 1 is a hard prerequisite, not a convention.** `registerSeries` staticcall-probes
+the forwarder's `latestRoundData()` and reverts `NavFeedNotPriced(forwarder)` if the
+feed has never been pushed (audit FIND-002) — so running this script before the NAV
+push fails the broadcast here rather than producing a series that reads as registered
+and reverts `NoPriceSet` inside every later `executeSwap`.
+
+> **Set each series' notional cap before it trades (D-28).** The script does not do
+> this: a freshly registered series falls back to `DEFAULT_MAX_NAV_ROUND_NOTIONAL`
+> ($1M per NAV push), which is a conservative floor, not the operating value. Policy
+> today is **$10M per series**, set with `setMaxNavRoundNotionalFor(token, 10_000_000e6)`.
+> Do it while the deployer still holds `DEFAULT_ADMIN_ROLE` — afterwards it is a 48 h
+> timelock proposal, and there is no same-day path to raise a cap that turns out to be
+> too tight. Size it to the series' busiest expected day, not its typical one; $50M
+> (`MAX_NAV_ROUND_NOTIONAL_CEILING`) is the hard limit no admin call can exceed.
 
 ```bash
 export USDC_ADDRESS=$USDC                 # Circle Sepolia USDC
@@ -320,7 +361,7 @@ deposit function; the contract prices whatever it holds):
 
 ```bash
 # 10,000 USDC (6 decimals) — sourced from the Circle faucet to the funding wallet
-cast send $USDC_ADDRESS "transfer(address,uint256)" $SWAP 10000000000 \
+cast send $USDC_ADDRESS "transfer(address,uint256)" $SWAP 100000000 \
   --rpc-url $RPC --private-key $FUNDING_KEY
 ```
 
@@ -330,7 +371,7 @@ Verify:
 cast call $TOKEN_CAT "balanceOf(address)(uint256)" $SWAP --rpc-url $RPC
 # expected: 100000000000000000000
 cast call $USDC_ADDRESS "balanceOf(address)(uint256)" $SWAP --rpc-url $RPC
-# expected: 10000000000
+# expected: 100000000
 ```
 
 ---
@@ -364,9 +405,9 @@ manual `cast` flow below. Do not simply delete the `require`.
 raw 32-byte digest:
 
 ```bash
-# BUY example at NAV $100: taker pays up to 1,000 USDC for 10 CAT.
-# price = amountOut per 1e18 tokenIn = 10e18 * 1e18 / 1000e6 = 1e28
-QUOTE="(1,$TAKER,$USDC_ADDRESS,1000000000,$TOKEN_CAT,10000000000000000000000000000,$EXPIRY,0)"
+# BUY example at NAV $1.00: taker pays up to 10 USDC for 10 CAT.
+# price = amountOut per 1e18 tokenIn = 10e18 * 1e18 / 10e6 = 1e30
+QUOTE="(1,$TAKER,$USDC_ADDRESS,10000000,$TOKEN_CAT,1000000000000000000000000000000,$EXPIRY,0)"
 # EXPIRY = unix now + 900; final 0 = epoch (must equal cast call $SWAP "quoteEpoch()")
 
 DIGEST=$(cast call $SWAP \
@@ -404,7 +445,7 @@ cast send $SWAP \
   --rpc-url $RPC --private-key $TAKER_KEY
 ```
 
-Expected after the buy: taker `TOKEN_CAT` balance `+10e18`; swap USDC `+1000e6`; swap
+Expected after the buy: taker `TOKEN_CAT` balance `+10e18`; swap USDC `+10e6`; swap
 `TOKEN_CAT` `-10e18`; `cast call $SWAP "isQuoteUsed(uint256)(bool)" 1` → `true`;
 `totalSupply` of the token unchanged (settlement moves inventory, never mints).
 Note `requestedAmountIn` may be less than `maxAmountIn` but at least 1% of it
@@ -413,8 +454,8 @@ Note `requestedAmountIn` may be less than `maxAmountIn` but at least 1% of it
 **Execute the REDEEM** (mirror direction, fresh `quoteId`):
 
 ```bash
-# price = 1000e6 * 1e18 / 10e18 = 1e8 (USDC out per 1e18 token in, at NAV $100)
-REDEEM="(2,$TAKER,$TOKEN_CAT,10000000000000000000,$USDC_ADDRESS,100000000,$EXPIRY,0)"
+# price = 10e6 * 1e18 / 10e18 = 1e6 (USDC out per 1e18 token in, at NAV $1.00)
+REDEEM="(2,$TAKER,$TOKEN_CAT,10000000000000000000,$USDC_ADDRESS,1000000,$EXPIRY,0)"
 # sign as above; then:
 cast send $TOKEN_CAT "approve(address,uint256)" $SWAP 10000000000000000000 \
   --rpc-url $RPC --private-key $TAKER_KEY
@@ -422,7 +463,7 @@ cast send $SWAP "executeSwap(...)" "$REDEEM" $SIG2 "(0,0,0,0x00...,0x00...)" 100
   --rpc-url $RPC --private-key $TAKER_KEY   # same full signature string as the buy
 ```
 
-Expected: taker made whole in USDC (`+1000e6`), tokens back in the swap,
+Expected: taker made whole in USDC (`+10e6`), tokens back in the swap,
 `isQuoteUsed(2)` → `true`. Both legs settle within the 2% NAV band or revert
 `QuotePriceOutOfBand`; if the NAV push is older than `MAX_NAV_AGE_SECS`, expect
 `StaleNav` — push NAV again (step 1) and retry.
@@ -487,6 +528,92 @@ $TREASURER_KEY` → funds land at `withdrawalWallet()`, nowhere else.
 
 ---
 
+### 6.9 Signing an emergency NAV correction (audit FIND-003)
+
+`emergencyUpdateAnswer` is a **2-of-2**, and the split is the same one the swap already
+runs every trade:
+
+| | Swap (today, in production) | NAV emergency correction |
+|---|---|---|
+| **Signs** the EIP-712 message | Quote-service **KMS** key | Feed-owner **KMS** key (`NAV_FEED_OWNER`) |
+| **Submits** the transaction | The taker | **Fordefi MPC ops wallet** (`emergencyUpdater`) |
+| Sets the expiry | Quote service, via `expiry` | KMS signer, via `deadline` |
+
+Keeping the signing on KMS is deliberate: it reuses machinery already proven on every
+swap, and it means the submitter never needs to produce an EIP-712 signature at all.
+
+> **Roadmap conflict — decide before Phase 2.** ARCHITECTURE §6.1 currently plans to
+> migrate the *feed owner* from KMS to Fordefi MPC. If that happens, **signing moves to
+> Fordefi** and the split above no longer holds. To keep signing on KMS, leave the feed
+> owner on KMS and use Fordefi only as the `emergencyUpdater`. That choice also removes
+> the one unverified item below (Fordefi's `v`/low-`s` encoding), because a submitter
+> never signs.
+
+Full incident context is ARCHITECTURE.md §11.5 Case C.
+
+**Step 1 — ask the contract for the digest.** Never rebuild the EIP-712 domain by hand;
+`hashEmergencyUpdate` reads the live `emergencyNonce` itself, so a stale nonce, wrong
+`chainId` or wrong `verifyingContract` is impossible. Same contract as
+`hashSwapMessage` in §5.2, and the same reason.
+
+```bash
+ANSWER=60000000                      # $0.60 at 8dp — must be within $0.50-$2.00
+DEADLINE=$(( $(date +%s) + 1800 ))   # 30 min. Keep it SHORT: an unused signature
+                                     # stands until it expires (D-29 residual (d)).
+DIGEST=$(cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)(bytes32)" \
+  $ANSWER $DEADLINE --rpc-url $RPC)
+```
+
+**Step 2 — sign the raw 32 bytes.** No EIP-191 prefix, no second hash.
+
+| Signer | How |
+|---|---|
+| Local key (testnet) | `cast wallet sign --no-hash $DIGEST --private-key $NAV_FEED_OWNER_KEY` |
+| **AWS KMS** (Phase 1) | `kms:Sign` with `MessageType=DIGEST`. Then **DER-decode** to `(r,s)`, **normalise `s` to the low half** — KMS can return high-s and OZ's `ECDSA` rejects it as malleable — and recover `v` by trying `27` then `28` against the known owner address. |
+| **Fordefi MPC** (Phase 2) | Use `eth_signTypedData_v4` via the official `@fordefi/web3-provider` (EIP-1193) and hand it the typed-data JSON — this skips the digest/DER/`v` work entirely. Or `POST /api/v1/transactions` with `type: "evm_message"`, `details.type: "typed_message_type"`; that returns `signatures[0].data` **base64**, not hex. |
+
+**Fordefi specifics, verified.** An EVM vault is a **Standard EOA**, so `ecrecover`
+works and no ERC-1271 is involved. Two cautions: **do not enable EIP-7702 Smart Account
+mode on the feed-owner vault** — the address would gain code and flip
+`SignatureChecker` onto the ERC-1271 branch; and signing is **asynchronous**
+(`waiting_for_approval` → `approved` → `signed`), so if your policy requires a human
+approver you have added a second quorum ahead of the Safe's. Scope a narrow
+auto-approve rule to `domain.name == "KaleidoscopeNAVFeed"` + `primaryType ==
+"EmergencyUpdate"` rather than blanket-approving message signing.
+
+**Two things about Fordefi output are UNCONFIRMED**: whether `v` is `27/28` or `0/1`
+(OZ rejects `0/1` — fix is `v += 27`), and whether `s` is normalised low. Both present
+as the same opaque `EmergencySignerNotOwner`. **Rehearse once before Phase 2 cutover,
+not during an incident**: have the vault sign a throwaway payload, inspect the last byte
+and `s`, and run step 3 against a testnet feed.
+
+**Step 3 — dry-run BEFORE spending the Safe quorum.** This is the highest-value step
+here: it verifies the signature without a transaction that could revert after m-of-n
+signers have already approved it.
+
+```bash
+cast call $NAVFEED "emergencyUpdateAnswer(int256,uint256,bytes)" \
+  $ANSWER $DEADLINE $SIG --from $OPS_MULTISIG --rpc-url $RPC
+# silence = it would succeed. Any revert here is the real reason it would fail.
+```
+
+**Step 4 — submit as a Safe transaction** from `$OPS_MULTISIG` (the immutable
+`emergencyUpdater`) and collect its own m-of-n. The signature is **inert in transit** —
+only the guardian can submit it — so it is safe to paste into an ops channel.
+
+**Reading the revert:**
+
+| Revert | Cause |
+|---|---|
+| `NotEmergencyUpdater` | Not sent from the ops multisig |
+| `EmergencySignerNotOwner` | Wrong signer, stale nonce, signature over a different `answer`, wrong chain/feed, high-`s`, `v` not 27/28, or owner rotated after signing |
+| `EmergencySignatureExpired` | `deadline` passed — re-sign |
+| `EmergencyAnswerOutOfRange` | Outside $0.50-$2.00; use the ±10 %/h path |
+| `EmergencyCooldownActive` | Within `EMERGENCY_COOLDOWN` (1 h) of the last one |
+| `NoPriceSet` | Feed never initialised; the first push must be `updateAnswer` |
+
+---
+
 ## 7. Rollback / incident procedure
 
 There is no "undeploy". Incident response is: stop the hot path, invalidate paper,
@@ -498,8 +625,11 @@ evacuate funds, then fix under the timelock.
 | Kill every outstanding quote | `DEFAULT_ADMIN_ROLE` — timelock (schedule + execute) | timelock proposal calling `bumpQuoteEpoch()` on `$SWAP` | All quotes signed for the old epoch revert `QuoteEpochStale`; quote service must re-issue |
 | Cut off a taker | `ALLOWLIST_ADMIN_ROLE` — KMS allowlist key (hot, survives handover by design) | `cast send $SWAP "setAllowed(address,bool)" <taker> false --private-key $ALLOWLIST_ADMIN_KEY` | Immediate, no timelock delay — this is why GYL-1050 split the role |
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
-| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **A paused bond token blocks its own evacuation** — see "Evacuating a paused bond token" below |
+| Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **Two things on the bond token can still block it**: the token's own pause (`EnforcedPause`) and sanctions screening of the swap or the `withdrawalWallet` (`AccountSanctioned`) — see "Evacuating a paused bond token" and "Evacuating when screening, not the pause, is the blocker" below |
+| Rotate a series' NAV forwarder | `DEFAULT_ADMIN_ROLE` — timelock (schedule + execute) | timelock **batch**: `registerSeries(token, newForwarder)` **and** `bumpQuoteEpoch()` in the same proposal | Repoints the price source for a live series. **The `bumpQuoteEpoch()` is not optional and is not enforced on-chain** — quotes sign no forwarder, so without it every outstanding quote is band-checked against the new feed for the rest of its TTL. Runs all five registration probes, so a rotation onto an unpriced or future-dated forwarder reverts and leaves the series on the working one. **Not gated on inventory** (audit FIND-026, D-37) — deliberate, so dust cannot pin a series to a broken feed. Emits `SeriesForwarderRotated(token, previous, new)` alongside `SeriesRegistered`; also note a newer `updatedAt` opens a fresh per-round notional budget immediately |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
+| Correct a NAV that has **gapped >10 %** | **Two keys**: ops multisig (`emergencyUpdater`, immutable) **calls**; KMS signer **signs** | Full procedure in [§6.9](#69-signing-an-emergency-nav-correction-audit-find-003): `cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)"` for the digest, owner signs it raw, **dry-run with `cast call` before spending the Safe quorum**, then submit from the ops multisig | **Verify the true NAV from two sources first — this path skips the deviation cap, which is what normally catches a bad number.** Answer must land in **$0.50-$2.00** (`5e7`-`2e8`); outside that it reverts `EmergencyAnswerOutOfRange` and the ±10 %/h walk-back is the only route. Locks for `EMERGENCY_COOLDOWN` (1 h) afterwards — the same cadence as the routine path, so a cascading event can be corrected again within the hour. Full procedure: ARCHITECTURE.md §11.5 Case C (audit FIND-003) |
+| Correct a wrong NAV **within 10 %** (fat-finger) | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
 
 ### Evacuating a paused bond token
 
@@ -514,8 +644,9 @@ blocks evacuation. But moving a bond token means calling that token's `transfer`
 swap.withdraw(bondToken, amt)
   └─ IERC20(bondToken).safeTransfer(withdrawalWallet, amt)
        └─ GyldBondToken.transfer  ← whenNotPaused  ← REVERTS EnforcedPause
-            (_update is never entered — the modifier reverts first, and _update
-             carries only the sanctions check, no pause gate)
+            (_update is never entered — the modifier reverts first. _update
+             carries no pause gate, but it DOES screen sanctions, which is a
+             second and independent blocker — see the next section)
 ```
 
 The revert comes from the **token**, not the swap. `cast` will show `EnforcedPause()`
@@ -556,8 +687,10 @@ calls in one transaction. So the window between steps 2 and 4 is real.
 
 **The swap's inventory is not exposed during that window.** Only two paths move tokens
 out of this contract: `executeSwap` (`whenNotPaused` on the **swap**, which stays paused
-throughout — `GyldAtomicSwap.sol:452`) and `withdraw` (`TREASURER_ROLE` only, destination
-fixed to `withdrawalWallet` — `:790`). There is no third path. What the window does expose
+throughout — `GyldAtomicSwap.sol:470`) and `withdraw` (`TREASURER_ROLE` only, destination
+fixed to `withdrawalWallet` — `:895`). Since FIND-024, `deregisterSeries` (`:696`) also
+moves tokens — `DEFAULT_ADMIN_ROLE`, and to that same fixed `withdrawalWallet`, so the
+guarantee is unchanged: nothing leaves for an attacker-chosen destination. What the window does expose
 is **every other holder** of that bond token, who can transfer freely while the pause is
 lifted. Keep it short, and prefer a single full-balance withdrawal over several partial
 ones. If the incident is *itself* a reason the token must not move (a compromised holder
@@ -575,6 +708,174 @@ a legitimate choice, and the swap's own pause already stops it being traded.
 Pinned by `test_withdraw_bondToken_blockedByTokenPause`,
 `test_withdraw_bothPaused_usdcEvacuatesBondTokenDoesNot` and
 `test_withdraw_bondToken_afterTokenUnpause_succeeds` in `GyldAtomicSwap.t.sol`.
+
+### Evacuating when screening, not the pause, is the blocker
+
+Past `whenNotPaused`, `GyldBondToken._update` screens **both sides** — the swap (`from`)
+and the `withdrawalWallet` (`to`). A flag on either, or an oracle that reverts, blocks
+evacuation with `AccountSanctioned` / `SanctionsListNotSet`. **Unpausing does nothing
+for this.** Read the revert first: `EnforcedPause` is the section above, this is not.
+
+```bash
+cast call $ORACLE "isSanctioned(address)(bool)" $SWAP
+cast call $ORACLE "isSanctioned(address)(bool)" $WITHDRAWAL_WALLET
+
+# (a) flag on the mirror's own list — keeper key
+cast send $ORACLE "removeFromSanctionsList(address[])" "[$SWAP]" --private-key $SANCTIONS_UPDATER_KEY
+
+# (b) flag from the forwarding oracle, or it reverts — compliance Safe
+cast send $ORACLE "setForwardingOracle(address)" $ZERO --private-key $COMPLIANCE_ADMIN_KEY
+```
+
+(a) does not clear an upstream flag — `isSanctioned` is true if *either* source says so.
+
+**No fast path if the mirror itself is faulty.** Only fix is `setSanctionsList` on every
+affected token, behind the 48 h timelock; a token upgrade is the same timelock. Accepted:
+a carve-out for the swap would give the compliance gate an address that walks through it.
+Revisiting it is a security-model change, not a doc fix. USDC is unaffected.
+
+### Retiring a matured series
+
+Retirement has two halves that are separately gated and should be reasoned about
+separately: **closing primary issuance** on the `IssuanceManager`, and **retiring
+the series from the swap** with `deregisterSeries`. Neither one needs the bond
+token paused, and pausing it to achieve either is the expensive mistake — see the
+note at the end of this section.
+
+**Primary issuance closes itself at maturity.** Since audit **FIND-009**,
+`IssuanceManager.subscribe` reads the token's `maturityTimestamp()` and reverts
+`SeriesMatured(token, maturity, now)` once `block.timestamp >= maturity`, so for a
+series that has actually reached its stated maturity there is **nothing to do** —
+no proposal, no key, no window. `0` is the open-ended sentinel and skips the gate,
+so an open-ended series never closes on its own. Confirm which case you are in
+before scheduling anything:
+
+```bash
+cast call $TOKEN "maturityTimestamp()(uint256)"                          # 0 = open-ended, never auto-closes
+cast call $EVM_ISSUANCE_MANAGER "registeredTokens(address)(bool)" $TOKEN # subscribe and redeem both need this
+```
+
+The gate is **mint-path only**: `redeem` does not read the maturity, and the token's
+`transfer`, `transferFrom` and `mint` are untouched, so a series closing at its
+maturity never strands a holder or an AP mid-redemption. Pinned by
+`test_redeemAndTransferStayOpenAfterMaturity` in `IssuanceManager.t.sol`.
+
+**Closing a series *early*, ahead of its maturity, is the case with no good lever.**
+There is deliberately nothing on the `IssuanceManager` that closes one series and
+only that series to new issuance: FIND-009 asked for enforcement on the mint path,
+the maturity gate is that enforcement, and it fires on a date rather than on command.
+What is actually available, and what each one costs:
+
+- **`deregisterToken(token)`** is the registry check `subscribe` and `redeem`
+  **share**, so deregistering closes redemption too and strands whoever has already
+  transferred tokens in for burn. In production no live key holds `REGISTRAR_ROLE`
+  besides the immutable `TokenFactory`, which never calls it, so reaching for this
+  means first granting the role.
+- **`setDailyCap(token, 0)`** does not do what it looks like: zero *restores* the
+  1,000,000e18 default rather than disabling minting. It is not an off switch, and
+  reading it as one is the failure mode to avoid here.
+- **`pauseIssuance()`** does stop `subscribe` and leaves `redeem` open, but it is
+  **global** — it closes every series at once, not the one you meant.
+- **`pause()` on the bond token** stops the one series, and costs the most: it gates
+  `burn` as well, so it blocks `redeem`. See the cost note at the end of this section.
+  **FIND-005 — do not read the revert to tell which pause is set.** Both raise
+  `EnforcedPause()` and the payload is the bare 4-byte selector `0xd93c0665` with no
+  contract identity, byte-for-byte identical either way. **Read the state instead:**
+  `cast call <IssuanceManager> "paused()"` and `cast call <bondToken> "paused()"` — both
+  getters are public and independent. A trace also names the reverting frame (a manager
+  pause reverts at depth 1 with no inner call; a token pause shows the inner
+  `GyldBondToken::mint`). This matters because the remedies differ: the token is
+  `unpause()`, `PAUSER_ROLE`, ops multisig, immediate — the manager is
+  `unpauseIssuance()`, `DEFAULT_ADMIN_ROLE`, a 48 h timelock proposal. On `redeem` there
+  is no ambiguity to resolve: it has no pause of its own, so the token is the only
+  candidate.
+
+So an early close today means pausing that bond token or deregistering it, and both
+block the exit for holders — the pause by freezing transfers and burns, the
+deregistration by closing the shared registry check. Weigh either against simply
+letting the series run to its stated maturity, which now closes issuance by itself
+and costs a holder nothing.
+
+**Retiring from the swap.** `deregisterSeries(token)` is a `DEFAULT_ADMIN_ROLE`
+timelock proposal — 48 h from schedule to execute. Since audit **FIND-024** it
+**sweeps** any residual balance of the series to the `withdrawalWallet` in the same
+call rather than requiring the balance to already be zero, so a leftover position no
+longer blocks retirement and cannot be used to stall it.
+
+**Why that mattered.** The old form required `balanceOf(swap) == 0` *at execution
+time*. `GyldBondToken` screens transfers against Chainalysis and nothing else —
+there is no transfer allowlist — so **any** unsanctioned holder could send **one
+wei** to the swap in the 48 h window and force the whole cycle to start over: a
+fresh treasurer withdrawal plus a fresh 48 h proposal, each time, for the cost of
+one ERC-20 transfer.
+
+**Preflight before scheduling the proposal:**
+
+```bash
+cast call $SWAP  "registeredSeries(address)(bool)" $TOKEN   # expected: true
+cast call $SWAP  "withdrawalWallet()(address)"              # must NOT be 0x0 if a balance remains
+cast call $TOKEN "balanceOf(address)(uint256)" $SWAP        # the amount that will be swept
+cast call $TOKEN "paused()(bool)"                           # see below
+```
+
+Two ways it can still revert:
+
+- **`ZeroAddress`** — there is a residual balance and no `withdrawalWallet` is set.
+  Fail-closed, matching `withdraw`: inventory is never burned to `address(0)`. Set
+  the wallet first (itself a timelock action — schedule both together).
+- **`EnforcedPause`** — there is a residual balance and the **bond token** is
+  paused, so the sweep's `transfer` reverts on the token. Raised by
+  `GyldBondToken.transfer`, not by the swap. With a **zero** balance there is no
+  transfer and a paused token is no obstacle at all.
+
+**The hardened sequence — use this ONLY when a griefer is actively re-seeding dust,
+not as the routine retirement path:**
+
+```bash
+# 1. Clear the balance the normal way.
+cast send $SWAP "withdraw(address,uint256)" $TOKEN <full-balance> --private-key $TREASURER_KEY
+
+# 2. Pause the BOND TOKEN. PAUSER_ROLE on the token — no admin, no timelock.
+#    This blocks the dust refill outright; nobody can transfer the token at all.
+#    Read the cost note below before doing this.
+cast send $TOKEN "pause()" --private-key $PAUSER_KEY
+
+# 3. Execute the timelock proposal. deregisterSeries only READS the balance —
+#    with a zero balance it performs no transfer, so the token's pause does not
+#    block it.
+cast call $TOKEN "balanceOf(address)(uint256)" $SWAP        # expected: 0
+# ... execute the scheduled deregisterSeries(token) proposal ...
+cast call $SWAP "registeredSeries(address)(bool)" $TOKEN    # expected: false
+```
+
+This sequence needs no code and closes the griefing window completely, but **step 2
+is not free**, and an earlier revision of this runbook said it was. `pause()` gates
+`transfer`, `transferFrom`, `mint` **and** `burn` on `GyldBondToken`, so it freezes
+every holder in place — no secondary transfer, and no `IssuanceManager.redeem`,
+because `redeem` burns. Pausing to stop issuance on a matured series is using the
+one lever that also blocks the exit, and for a matured series it is now simply
+unnecessary: maturity stops `subscribe` by itself. For an *early* close it stays one
+of the only two levers there are, at exactly this cost — see the list above. Reserve the pause for what it is good at — an active dust
+griefer, or a compromise that warrants freezing the series outright — and unpause as
+soon as step 3 executes. The sweep in step 3 is the belt to this braces; either
+alone is sufficient against dust, so on a quiet series skip the pause entirely.
+
+**On success** the series is gone from `registeredSeries`, `navForwarderOf` and
+`maxNavAgeSecsOf` (the per-series age override, D-23, is cleared so it cannot
+outlive the series), plus `maxNavRoundNotionalOf` and `navRoundDrawOf` (the
+per-series notional cap and its spent-this-round counter, D-28 — cleared for the
+same reason, and so a re-registered token does not inherit a retired series'
+already-spent budget). A sweep emits `Withdrawn(token, withdrawalWallet, amount)` —
+the same event the withdrawal path emits, so existing log indexing picks it up with
+no change. Re-registering the same token later is supported and restores
+tradability from a clean slate.
+
+Pinned by `test_deregisterSeries_sweepsResidualInventory`,
+`test_deregisterSeries_dustRefillCannotGrief`,
+`test_deregisterSeries_withdrawalWalletUnset_bothBranches`,
+`test_deregisterSeries_pausedTokenZeroBalance_succeeds` and
+`test_deregisterSeries_pausedTokenWithResidual_revertsEnforcedPause` in
+`GyldAtomicSwap.t.sol`.
 
 Notes:
 

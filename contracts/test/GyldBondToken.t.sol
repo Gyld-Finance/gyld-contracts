@@ -7,6 +7,7 @@ import {GyldBondToken} from "../GyldBondToken.sol";
 import {IERC1643} from "../interfaces/IERC1643.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
 
 // ── V2 stub for upgrade test ──────────────────────────────────────────────────
 
@@ -495,6 +496,95 @@ contract GyldBondTokenTest is Test {
         token.setSanctionsList(address(newOracle));
     }
 
+    // ── Sanctions-oracle admission: interface check (audit FIND-008) ─────────
+    //
+    // The probe used to check only that the reply was 32 bytes long. It now also requires
+    // a contract, and a canonical `false` — the same terms `_requireAccess` decodes on,
+    // since that is a HIGH-LEVEL call and solc's ABI bool validator reverts with no reason
+    // data on any word above 1. A length-only probe admitted such an oracle and then
+    // reverted EVERY transfer of the series.
+    //
+    // It is an INTERFACE check by design, not a compliance control (D-33): it proves the
+    // oracle answers, not that its list is right. The last two tests pin that accepted
+    // limit so it cannot later be mistaken for coverage.
+
+    function test_setSanctionsList_nonCanonicalBool_reverts() public {
+        address bad = address(new NonCanonicalSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad);
+    }
+
+    function test_initialize_nonCanonicalBool_sanctionsList_reverts() public {
+        GyldBondToken impl = new GyldBondToken();
+        address bad = address(new NonCanonicalSanctionsList());
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Test Bond", "TST", "XX0000000001", 0,
+                address(0xAD), address(0xAD), bad
+            ))
+        );
+    }
+
+    /// The always-`true` oracle from the finding. `address(0)` is the canonical clean
+    /// address — `SanctionsOracleMirror.addToSanctionsList` cannot even hold it — so an
+    /// oracle flagging it flags everything. Caught with no fixture and nothing to go stale.
+    function test_setSanctionsList_alwaysTrueOracle_reverts() public {
+        address bad = address(new AlwaysTrueSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad);
+    }
+
+    /// An oracle that reverts the read is refused, not stored.
+    function test_setSanctionsList_revertingOracle_reverts() public {
+        address bad = address(new RevertingSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
+    }
+
+    /// Returndata shorter than a word is refused.
+    function test_setSanctionsList_shortReturnData_reverts() public {
+        address bad = address(new ShortReturnSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad);
+    }
+
+    /// ACCEPTED LIMIT (D-33), not a bug. An oracle wired to `false` is well-formed, so it is
+    /// admitted and screening is silently off. Nothing on this contract can tell it from a
+    /// healthy oracle: admission asks about `address(0)`, whose correct answer is also
+    /// `false`. Catching it needs a genuinely flagged address, which is why that assertion
+    /// lives in DeployGuards and in keeper-side reconciliation, not here.
+    function test_setSanctionsList_alwaysFalseOracle_isAdmitted_acceptedLimit() public {
+        AlwaysFalseSanctionsList blind = new AlwaysFalseSanctionsList();
+        vm.prank(admin); token.setSanctionsList(address(blind));
+
+        // The real list flags 0xB0B; the blind oracle does not, and the transfer settles.
+        mockSanctions.setSanctioned(address(0xB0B), true);
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+        vm.prank(ap); token.transfer(address(0xB0B), 1e18);
+        assertEq(token.balanceOf(address(0xB0B)), 1e18, "screening is silently off");
+    }
+
+    /// The same limit in its second shape: admission screens `address(0)` only, so an oracle
+    /// answering canonically for that one address and garbage for every other is admitted and
+    /// still reverts every transfer. Screening a second fixed address would not close it —
+    /// the oracle chooses its answer per address.
+    function test_setSanctionsList_canonicalOnlyForZero_acceptedLimit() public {
+        address dirty = address(new DirtyForNonZeroSanctionsList());
+        vm.prank(admin); token.setSanctionsList(dirty);
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+
+        vm.prank(ap);
+        vm.expectRevert(); // ABI bool validator, no reason data
+        token.transfer(address(0xB0B), 1e18);
+    }
+
     // ── Fail-closed on an unset sanctions list (audit §4.1) ───────────────────
     //
     // `_requireAccess` used to read
@@ -594,6 +684,32 @@ contract GyldBondTokenTest is Test {
         vm.prank(pauser2);
         token.renounceRole(pauserRole, pauser2);
         assertFalse(token.hasRole(pauserRole, pauser2));
+    }
+
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = token.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(token.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(GyldBondToken.CannotRemoveLastAdmin.selector);
+        token.revokeRole(adminRole, admin);
+        assertTrue(token.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = token.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); token.grantRole(adminRole, timelock);
+        vm.prank(admin); token.revokeRole(adminRole, admin);
+        assertFalse(token.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(GyldBondToken.CannotRemoveLastAdmin.selector);
+        token.revokeRole(adminRole, timelock);
     }
 
     // ── decimals() is a cross-contract invariant ──────────────────────────────
@@ -864,3 +980,52 @@ contract GyldBondTokenTest is Test {
 
 /// @dev A deployed contract with no isSanctioned() function — used to test the probe rejection.
 contract MockWrongContract {}
+
+
+// ── Sanctions-oracle doubles for the admission probe (audit FIND-008) ─────────
+
+/// @dev Reverts on every screen — a broken, paused or self-destructed oracle.
+contract RevertingSanctionsList is ISanctionsList {
+    error Down();
+    function isSanctioned(address) external pure override returns (bool) { revert Down(); }
+}
+
+/// @dev Replies with 16 bytes. Written in assembly on purpose: any Solidity return type
+///      narrower than a word is still ABI-padded to 32 bytes, so it could not produce this.
+contract ShortReturnSanctionsList {
+    fallback() external {
+        assembly { mstore(0, 1) return(0, 16) }
+    }
+}
+
+/// @dev Replies with a full word whose value is 2. Length-correct, so the old probe took
+///      it; the hot path's ABI bool validator rejects it, so every transfer reverted.
+contract NonCanonicalSanctionsList {
+    fallback() external {
+        assembly { mstore(0, 2) return(0, 32) }
+    }
+}
+
+/// @dev Canonical for `address(0)` — the only address admission screens — and dirty for
+///      every other. Passes both probes, reverts every real transfer.
+contract DirtyForNonZeroSanctionsList {
+    fallback() external {
+        assembly {
+            switch calldataload(4)
+            case 0 { mstore(0, 0) }
+            default { mstore(0, 2) }
+            return(0, 32)
+        }
+    }
+}
+
+
+/// @dev Answers `false` for everything — the silent case. Well-formed, so admitted (D-33).
+contract AlwaysFalseSanctionsList is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) { return false; }
+}
+
+/// @dev Flags every address, `address(0)` included — the always-`true` case (FIND-008).
+contract AlwaysTrueSanctionsList is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) { return true; }
+}

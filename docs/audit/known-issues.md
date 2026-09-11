@@ -10,7 +10,7 @@ this document and `ci/slither-baseline.json` are kept in step by the build.
 | solc | 0.8.28, `via_ir = true`, `optimizer_runs = 200` |
 | Command | `slither .` (unfiltered — see *The `--filter-paths` trap* below) |
 | Results, whole tree | **1,956** |
-| Results touching `contracts/*.sol` | **48** (44 unique fingerprints) |
+| Results touching `contracts/*.sol` | **49** (45 unique fingerprints) |
 | Live defects found | **0** |
 
 The other ~1,908 results are in `lib/` — OpenZeppelin v5.3.0 and forge-std. They
@@ -44,16 +44,23 @@ unit of precision. The error is ≤ 1 unit of USDC (1e-6 USD) on a *tolerance
 band*, not on a transferred amount. No value moves on this number — it only
 widens or narrows the window a signed quote must fall inside.
 
-### `incorrect-equality` ×5 — `KaleidoscopeNAVFeed` — **False positive**
+### `incorrect-equality` ×6 — `KaleidoscopeNAVFeed` — **False positive**
 
-`getRoundData`, `isFresh`, `latestAnswer`, `latestRoundData`, `stalenessSeconds`,
-all on `_updatedAt == 0`.
+`getRoundData`, `isFresh`, `latestAnswer`, `latestRoundData`, `stalenessSeconds`
+and `emergencyUpdateAnswer`, all on `_updatedAt == 0` (`emergencyUpdateAnswer`
+additionally on `lastEmergencyAt != 0`, the same never-written sentinel shape —
+audit FIND-003).
 
 The detector looks for strict equality against a value an attacker can land on.
 `_updatedAt` is a `block.timestamp` written on every push, and `0` is its
 *never-written sentinel* — the feed reverts `NoPriceSet` on it. Timestamp 0 is
 not reachable on any live chain, so there is no equality to grind toward. A `<= 0`
 or `< 1` rewrite would be strictly less clear and no safer.
+
+`lastEmergencyAt != 0` is the same pattern one step over: zero means "no emergency
+correction has ever run", and the guard exists so the **first** one is not refused
+by a cooldown measured against an unset slot. Reaching it would require
+`block.timestamp == 0`.
 
 ### `unused-return` — `GyldAtomicSwap._checkQuoteBand` — **Accepted, D-18**
 
@@ -115,15 +122,65 @@ bytecode the factory itself just wrote — not attacker-controlled. There is no
 untrusted re-entry point, and `deployToken` is `onlyOwner` (the timelock in
 production) and `nonReentrant` besides.
 
-### `timestamp` ×9 — **False positive**
+### `timestamp` ×13 — **False positive**
 
-`GyldAtomicSwap` (quote expiry, NAV age), `KaleidoscopeNAVFeed` (update interval,
-freshness), `NAVFeedForwarder` (future-date probe).
+`GyldAtomicSwap` (quote expiry, NAV age), `GyldAtomicSwap.registerSeries`
+(future-date probe, audit FIND-002), `KaleidoscopeNAVFeed` (update interval,
+freshness, and the emergency cooldown / signature deadline — audit FIND-003),
+`NAVFeedForwarder` (future-date probe), `IssuanceManager` (daily mint
+cap window, audit FIND-001), `IssuanceManager.subscribe` (per-series maturity
+gate, audit FIND-009), `TokenFactory.deployToken` (past-maturity check, audit
+FIND-009).
 
 Every comparison is on an **hour-to-day** scale: `MIN_UPDATE_INTERVAL` is 1 hour,
-`maxNavAgeSecs` is ceilinged at 72 hours, quote TTL at 10 minutes. Proposer
-timestamp latitude is seconds. There is no threshold here a validator could
-straddle to gain anything.
+`EMERGENCY_COOLDOWN` is 1 hour, `maxNavAgeSecs` is ceilinged at 72 hours, quote
+TTL at 10 minutes, and the issuance `CAP_WINDOW` is 24 hours. Proposer timestamp
+latitude is seconds. There is no threshold here a validator could straddle to gain
+anything.
+
+`emergencyUpdateAnswer` deserves the explicit note, because it is the one function
+that *skips* `MIN_UPDATE_INTERVAL` and so has no rate guard of its own besides the
+1 h cooldown. A proposer with seconds of latitude who moved `block.timestamp`
+across that boundary would buy one emergency correction marginally early — and
+that correction still needs **both** keys and still lands inside $0.50-$2.00, so
+the latitude grants no capability the pair did not already have. The `deadline`
+comparison is the owner's own chosen expiry, measured in minutes to hours.
+
+The two future-date probes are the least latitude-sensitive of the set, because
+neither is a threshold anyone can straddle for gain: `updatedAt > block.timestamp`
+asks whether a feed is claiming a time that has not happened, and a proposer's few
+seconds of latitude can only move a feed that is *exactly* on the boundary — which
+is `updatedAt == block.timestamp`, a feed pushed in this very block, admitted by
+both probes by design. Reaching the rejecting side requires an upstream genuinely
+dating itself ahead, which is the condition being detected. `registerSeries` is
+`DEFAULT_ADMIN_ROLE` (the timelock) besides, so there is no unpermissioned caller
+to buy anything with the latitude, and the guard's purpose is diagnostic: F-6 in
+`_checkQuoteBand` refuses a future-dated feed at every read regardless.
+
+The two maturity comparisons are the loosest of all: `maturityTimestamp` is a bond
+maturity, months to years out. `TokenFactory.deployToken` compares it once at
+deployment to reject a date already in the past; `IssuanceManager.subscribe`
+compares it on every mint and refuses a series whose maturity has passed (audit
+FIND-009, D-30). It is the same argument in both places — a proposer with seconds
+of latitude cannot move a date months to years away across that boundary in either
+direction. The `>=` in `subscribe` is deliberately the complement of the `>` in
+`deployToken`, so the boundary second is closed rather than falling through a gap
+between two contracts, but that is an off-by-one concern, not a timestamp-latitude
+one: straddling it would buy one extra subscription at the instant of maturity, and
+`subscribe` is `onlyRole(SUBSCRIBER_ROLE)` (`deployToken` is `onlyOwner`, the
+timelock) so there is no unpermissioned caller to buy it. The mint-path maturity
+gate is a real control rather than a payload sanity gate, but nothing about it is
+reachable by moving the clock a few seconds.
+
+The issuance window deserves the explicit version, because it is the one where
+straddling a boundary *does* buy something: a mint at the end of one window and
+another at the start of the next yields two daily budgets, so the real bound is
+2× the cap per rolling 24 h. That is a property of a fixed resetting window, not
+of timestamp latitude — it holds at any clock precision, and moving the boundary
+by a few seconds neither creates nor widens it. The same design ships in Ondo's
+`InstantMintTimeBasedRateLimiter`. It is documented on `CAP_WINDOW` and in the
+FIND-001 remediation; the answer if a hard 1× bound is ever required is to halve
+the cap, not to chase sub-second accuracy.
 
 ---
 
@@ -144,11 +201,38 @@ They are all deliberately non-conforming: the doubles exist to return malformed
 data, revert selectively, or grief on gas. Making them `is ISanctionsList` would
 force them to be well-behaved and destroy what they test.
 
-### `low-level-calls` ×11 — **Accepted**
+### `low-level-calls` ×10 — **Accepted**
 
 `staticcall` probes in `GyldAtomicSwap.initialize` / `registerSeries`,
-`GyldBondToken.initialize` / `setSanctionsList`, `IssuanceManager.registerToken`,
+`GyldBondToken._requireValidSanctionsOracle`, `IssuanceManager.registerToken`,
 `NAVFeedForwarder` ×3, `SanctionsOracleMirror` ×2, `TokenFactory.constructor`.
+
+The count fell by one at audit FIND-008: `GyldBondToken.initialize` and
+`setSanctionsList` each used to hold their own copy of the sanctions-oracle probe and
+were reported separately. Both now delegate to one `_requireValidSanctionsOracle`, so
+`initialize` and `setSanctionsList` cannot drift apart on admission terms. Two results
+collapse into one, and the shared helper is the reason the fix is a single site rather
+than four.
+
+`registerToken` carries **two** probes since audit FIND-009 — `MINTER_ROLE()` and
+`maturityTimestamp()`, the second added because `subscribe` now depends on it — but
+the count above does not move: this detector reports once per *function*, listing
+every low-level call inside it, so both probes land in the one result already
+recorded here.
+
+`registerSeries` likewise carries **three** probes since audit FIND-002 — forwarder
+`decimals()`, token `decimals()` and forwarder `latestRoundData()`, the third added
+because the first two cannot see whether the feed can answer at all — and for the same
+reason the count does not move.
+
+`GyldBondToken._requireAccess` is **not** on the list above, and audit FIND-025 read
+that absence as the protected call being recorded while the exposed one was not. The
+count does not move here either, for a structural reason rather than the per-function
+one above: `_requireAccess` calls the installed oracle with a *high-level* call, which
+is not in this detector's population at all, so no triage entry was ever skipped. It
+does forward all remaining gas, deliberately — the cap belongs on the third-party hop
+inside `SanctionsOracleMirror`, not on the token's call to its own oracle. Recorded as
+**D-38** in `ARCHITECTURE.md` §17.1, with the measurements and the two declined halves.
 
 This is the repo's probe-before-store idiom: before storing an address that will
 be called on the hot path, staticcall it and require a well-formed answer, so a

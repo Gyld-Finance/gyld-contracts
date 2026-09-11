@@ -7,6 +7,7 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {DeployGuards} from "../script/lib/DeployGuards.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
 import {DeployDevNet} from "../script/DeployDevNet.s.sol";
 import {DeployTimelock} from "../script/DeployTimelock.s.sol";
 import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
@@ -19,6 +20,10 @@ import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
+// Audit FIND-006. Imported rather than re-declared: a second copy of a griefer would have
+// to relearn the `RETURN_RESERVE` lesson recorded on the original, and a griefer that
+// quietly stops griefing makes its test vacuous instead of failing it.
+import {GasGriefingOracle} from "./SanctionsOracleMirror.t.sol";
 import {MockUSDC} from "./MockUSDC.sol";
 
 /// @dev External wrapper around the library.
@@ -35,13 +40,51 @@ contract GuardsHarness {
     function saltFor(string memory name) external view returns (bytes32) {
         return DeployGuards.saltFor(name);
     }
+
+    /// The guard is `internal view` on a library, so a test can only reach it through a
+    /// wrapper — and it has to be an EXTERNAL one for the same CHAINID reason as above:
+    /// {DeployGuards.requireSanctionsOracleAnswers} short-circuits on `isDevChain()`.
+    function requireSanctionsOracleAnswers(
+        address oracle,
+        address knownFlagged,
+        address knownClean,
+        string memory label
+    ) external view {
+        DeployGuards.requireSanctionsOracleAnswers(oracle, knownFlagged, knownClean, label);
+    }
+
+    /// The ISIN guards (audit FIND-012) are not chain-gated, so these wrappers exist for
+    /// the OTHER reason a wrapper is needed: an `internal` library function is unreachable
+    /// from a test contract, and routing through an EXTERNAL one is what lets
+    /// {DeployGuardsTest._expectIsinRevert} staticcall it and read the revert REASON rather
+    /// than merely assert that something reverted.
+    function requireValidIsin(string memory isin) external pure {
+        DeployGuards.requireValidIsin(isin);
+    }
+
+    function requireIsinVacant(address factory, string memory isin) external view {
+        DeployGuards.requireIsinVacant(factory, isin);
+    }
 }
 
 /// @title DeployGuardsTest
 /// @notice Pure guard-library semantics. Touches no environment variables, so unlike
 ///         {DeployScriptsTest} it is safe to split into as many test functions as useful.
-contract DeployGuardsTest is Test {
+contract DeployGuardsTest is ScriptRevertAsserts {
     GuardsHarness harness;
+
+    uint256 constant PROD_L2 = 8453; // a production L2 that a `!= 1` denylist lets through
+    uint256 constant ANVIL = 31337;
+
+    /// Stand-ins for the two run-time inputs the deploy script takes from the operator:
+    /// an address on the CURRENT SDN feed, and one that must not be flagged.
+    address constant KNOWN_FLAGGED = address(0x5D4);
+    address constant KNOWN_CLEAN = address(0xC1EA);
+
+    /// A real, independently-issued ISIN (Apple Inc). Used as the well-formed input the
+    /// {requireIsinVacant} cases vary the FACTORY around, and as the base the malformed
+    /// {requireValidIsin} fixtures are derived from one character at a time.
+    string constant APPLE = "US0378331005";
 
     function setUp() public {
         harness = new GuardsHarness();
@@ -108,9 +151,295 @@ contract DeployGuardsTest is Test {
         );
     }
 
+    // ── requireSanctionsOracleAnswers (audit FIND-008) ────────────────────────
+
+    /// The shape a production deploy is supposed to be given: the real mirror, seeded by
+    /// the keeper, answering `true` for a live designation and `false` for everyone else.
+    function test_requireSanctionsOracleAnswers_acceptsACorrectlySeededOracle() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        vm.chainId(PROD_L2);
+        harness.requireSanctionsOracleAnswers(address(oracle), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+    }
+
+    /// THE headline case, and the one {GyldBondToken}'s own admission probe structurally
+    /// cannot catch: a freshly deployed {SanctionsOracleMirror} with an empty local list
+    /// and no forwarding oracle. It has code, it is not a dev mock, it implements the
+    /// interface, and it answers `false` for `address(0)` exactly as a working oracle
+    /// does — so every structural guard passes while it screens nobody at all.
+    function test_requireSanctionsOracleAnswers_rejectsAnUnseededMirror() public {
+        SanctionsOracleMirror oracle = new SanctionsOracleMirror(address(this), address(this), address(0));
+
+        // The probe the token performs cannot tell this apart from a working oracle.
+        assertFalse(oracle.isSanctioned(address(0)), "unseeded mirror should answer false for address(0)");
+
+        _expectGuardRevert(address(oracle), "does NOT flag known-sanctioned");
+    }
+
+    /// The opposite failure: an oracle wired to `true` passes the "does it flag anyone"
+    /// half and would then revert every single transfer.
+    function test_requireSanctionsOracleAnswers_rejectsAnAlwaysTrueOracle() public {
+        _expectGuardRevert(address(new AlwaysSanctionedOracle()), "flags known-clean");
+    }
+
+    /// Fail-loud, not fail-open. A staticcall that reverts must NOT be read as "does not
+    /// flag" — that would turn an unreachable oracle into a silently disabled one.
+    function test_requireSanctionsOracleAnswers_failsLoudWhenTheOracleReverts() public {
+        _expectGuardRevert(address(new RevertingOracle()), "sanctions oracle did not answer");
+    }
+
+    /// Same property for a well-behaved-looking call that returns fewer than 32 bytes:
+    /// `abi.decode` would read past the buffer, so the length is checked first.
+    function test_requireSanctionsOracleAnswers_failsLoudOnShortReturnData() public {
+        _expectGuardRevert(address(new ShortAnswerOracle()), "sanctions oracle did not answer");
+    }
+
+    /// An address with no code staticcalls "successfully" with zero-length returndata —
+    /// the classic silent pass. It must be caught by the same length check.
+    function test_requireSanctionsOracleAnswers_failsLoudWhenTheOracleHasNoCode() public {
+        _expectGuardRevert(address(0xDEAD), "sanctions oracle did not answer");
+    }
+
+    // ── audit FIND-006: right answers are not enough, they must be affordable ────
+
+    /// The case the value checks alone cannot see, and the one FIND-006 is really about:
+    /// an oracle that gives the CORRECT answer for both subjects and cannot afford to give
+    /// it on the transfer path. The mirror short-circuits `KNOWN_FLAGGED` off its local list
+    /// and forwards `KNOWN_CLEAN` to an upstream that burns the whole `FORWARDING_GAS`
+    /// allowance before answering `false` — structurally perfect, correct on both counts,
+    /// and over budget.
+    ///
+    /// Before this check the configuration was admitted: the guard read it with the entire
+    /// deploy transaction behind it, so the mirror always reached its allowance and the
+    /// answer came back. What a real transfer offers is 63/64 of whatever it has left.
+    function test_requireSanctionsOracleAnswers_rejectsAnUpstreamThatBurnsTheAllowance() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        oracle.setForwardingOracle(address(new GasGriefingOracle()));
+
+        // The answers themselves are right — this is not the value check firing.
+        assertTrue(oracle.isSanctioned(KNOWN_FLAGGED), "flagged subject should still flag");
+        assertFalse(oracle.isSanctioned(KNOWN_CLEAN), "clean subject should still be clean");
+
+        // And it ANSWERED — the distinction the two revert messages exist to keep. Reading
+        // this as "did not answer" would send an operator looking for an unreachable oracle.
+        _expectGuardRevert(address(oracle), "but spent");
+        _expectGuardRevert(address(oracle), "no margin left on the transfer path");
+
+        // `KNOWN_FLAGGED` never reaches the griefer (local list short-circuits at
+        // `SanctionsOracleMirror:79`), so it is the clean subject that names itself here.
+        _expectGuardRevert(address(oracle), vm.toString(KNOWN_CLEAN));
+    }
+
+    /// The other half of the cap, and the reason it is 40_000 rather than something tighter:
+    /// the shape production actually deploys — a seeded mirror forwarding to a live vendor
+    /// oracle — must still pass, with margin. If a future change to either contract pushes a
+    /// healthy screen near the budget, this fails before the guard starts refusing real
+    /// oracles on deploy day.
+    function test_requireSanctionsOracleAnswers_admitsAHealthyForwardingMirror() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        oracle.setForwardingOracle(address(new MockSanctionsList(address(this))));
+
+        vm.chainId(PROD_L2);
+        harness.requireSanctionsOracleAnswers(address(oracle), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+
+        // Pin the headroom, not just the pass. A bare call above would keep passing at
+        // 19_999 gas, one refactor away from a deploy that cannot screen anyone. `vm.cool`
+        // because the guard meets these slots cold on a real deploy and this test does not.
+        vm.cool(address(oracle));
+        uint256 startGas = gasleft();
+        oracle.isSanctioned(KNOWN_CLEAN);
+        uint256 gasUsed = startGas - gasleft();
+        assertLt(
+            gasUsed,
+            DeployGuards.SCREENING_GAS_BUDGET / 2,
+            "a healthy forwarding screen has lost its margin under SCREENING_GAS_BUDGET"
+        );
+    }
+
+    /// Dev chains cannot supply a live SDN designation, so the guard is a no-op there —
+    /// even for an oracle that would be rejected outright on production.
+    function test_requireSanctionsOracleAnswers_isANoOpOnADevChain() public {
+        SanctionsOracleMirror unseeded = new SanctionsOracleMirror(address(this), address(this), address(0));
+
+        vm.chainId(ANVIL);
+        harness.requireSanctionsOracleAnswers(address(unseeded), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+        harness.requireSanctionsOracleAnswers(address(0xDEAD), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+
+        // ...and the very same oracle is refused once the chain is production.
+        _expectGuardRevert(address(unseeded), "does NOT flag known-sanctioned");
+    }
+
+    // ── requireValidIsin (audit FIND-012) ─────────────────────────────────────
+
+    /// The guard must agree with the algorithm the check digits were ISSUED under, so it is
+    /// pinned against ISINs assigned by real numbering agencies rather than against itself.
+    /// AU0000XVGZA3 is the load-bearing one: five letters in the body, each expanding to TWO
+    /// digits, which is the half of ISO 6166 an all-numeric fixture would never exercise.
+    function test_requireValidIsin_acceptsIndependentlyIssuedIsins() public view {
+        harness.requireValidIsin(APPLE);            // Apple Inc, CUSIP 037833100
+        harness.requireValidIsin("US5949181045");   // Microsoft Corp, CUSIP 594918104
+        harness.requireValidIsin("GB0002634946");   // BAE Systems plc
+        harness.requireValidIsin("DE0005557508");   // Deutsche Telekom AG
+        harness.requireValidIsin("AU0000XVGZA3");   // ISO 6166 reference vector
+    }
+
+    /// The whole point of the guard: a single transposed or mistyped character. The body is
+    /// byte-identical to Apple's and only the check digit moves.
+    function test_requireValidIsin_rejectsABadCheckDigit() public view {
+        _expectBadIsin("US0378331006", "has a bad check digit");
+    }
+
+    function test_requireValidIsin_rejectsTheWrongLength() public view {
+        _expectBadIsin("US037833100", "ISIN must be 12 characters");
+        _expectBadIsin("US03783310055", "ISIN must be 12 characters");
+    }
+
+    /// The country prefix is two A-Z letters — lowercase is not merely a formatting nit,
+    /// `tokenByIsin` keys on the raw string, so "us..." would claim a DIFFERENT slot from
+    /// the "US..." the same bond is registered under everywhere else.
+    function test_requireValidIsin_rejectsAMalformedPrefix() public view {
+        _expectBadIsin("us0378331005", "ISIN prefix must be two A-Z letters");
+        _expectBadIsin("U50378331005", "ISIN prefix must be two A-Z letters");
+    }
+
+    /// The check digit is decimal by definition; a letter there would otherwise be compared
+    /// against a nonsense numeric value.
+    function test_requireValidIsin_rejectsANonNumericCheckDigit() public view {
+        _expectBadIsin("US037833100A", "ISIN check digit must be numeric");
+    }
+
+    // ── requireIsinVacant (audit FIND-012) ────────────────────────────────────
+
+    /// Deliberately run against the REAL {TokenFactory}: the guard reaches it through a
+    /// hand-encoded `tokenByIsin(string)` selector, so this is what proves that signature
+    /// still exists and still returns an address. A mock alone would keep passing after a
+    /// rename on the factory.
+    function test_requireIsinVacant_acceptsAnUnclaimedIsinOnTheRealFactory() public {
+        TokenFactory factory = new TokenFactory(
+            address(new GyldBondToken()), address(new MockSanctionsList(address(this))), address(this)
+        );
+        assertEq(factory.tokenByIsin(APPLE), address(0), "fixture factory should be empty");
+        harness.requireIsinVacant(address(factory), APPLE);
+    }
+
+    /// The case the guard exists for. `deployToken` claims an ISIN one-way, so reaching
+    /// `IsinAlreadyDeployed` on chain BURNS the identifier on that factory; this fails
+    /// while the mistake is still free.
+    function test_requireIsinVacant_rejectsAnAlreadyDeployedIsin() public {
+        MockIsinRegistry factory = new MockIsinRegistry();
+        factory.setToken(APPLE, address(0xB0AD));
+        _expectIsinRevert(
+            abi.encodeCall(GuardsHarness.requireIsinVacant, (address(factory), APPLE)), "is already deployed at"
+        );
+    }
+
+    /// Fail-loud, not fail-open — the same property as the sanctions probe. An address with
+    /// no code staticcalls "successfully" with zero-length returndata, and an unrelated
+    /// contract with no such function reverts outright. Neither may be read as "vacant",
+    /// which is how a typo'd factory address would silently disarm the guard entirely.
+    function test_requireIsinVacant_failsLoudWhenTheTargetCannotAnswer() public view {
+        _expectIsinRevert(
+            abi.encodeCall(GuardsHarness.requireIsinVacant, (address(0xDEAD), APPLE)),
+            "factory did not answer tokenByIsin"
+        );
+        // A real contract that simply has no `tokenByIsin` — the harness itself will do.
+        _expectIsinRevert(
+            abi.encodeCall(GuardsHarness.requireIsinVacant, (address(harness), APPLE)),
+            "factory did not answer tokenByIsin"
+        );
+    }
+
+    /// {_expectGuardRevert}'s shape for the ISIN guards: same substring match on the REASON,
+    /// over an arbitrary encoded call because these two guards take different arguments.
+    function _expectIsinRevert(bytes memory call_, string memory needle) internal view {
+        (bool ok, bytes memory ret) = address(harness).staticcall(call_);
+        assertFalse(ok, string.concat("expected the guard to revert with: ", needle));
+        string memory reason = _revertReason(ret);
+        assertTrue(
+            _contains(reason, needle),
+            string.concat("wrong revert reason\n   expected substring: ", needle, "\n   actual: ", reason)
+        );
+    }
+
+    function _expectBadIsin(string memory isin, string memory needle) internal view {
+        _expectIsinRevert(abi.encodeCall(GuardsHarness.requireValidIsin, (isin)), needle);
+    }
+
+    /// The real production oracle, seeded the way the keeper seeds it.
+    function _seededMirror() internal returns (SanctionsOracleMirror oracle) {
+        oracle = new SanctionsOracleMirror(address(this), address(this), address(0));
+        address[] memory sdn = new address[](1);
+        sdn[0] = KNOWN_FLAGGED;
+        oracle.addToSanctionsList(sdn);
+    }
+
+    /// Matches the REASON, not merely the fact of a revert — same contract as
+    /// {ScriptRevertAsserts._expectRunRevert}, which cannot be reused directly because the
+    /// guard is not a `run()`. Substring, because the messages interpolate addresses.
+    function _expectGuardRevert(address oracle, string memory needle) internal {
+        vm.chainId(PROD_L2);
+        (bool ok, bytes memory ret) = address(harness).staticcall(
+            abi.encodeWithSelector(
+                GuardsHarness.requireSanctionsOracleAnswers.selector,
+                oracle,
+                KNOWN_FLAGGED,
+                KNOWN_CLEAN,
+                "SANCTIONS_LIST"
+            )
+        );
+        assertFalse(ok, string.concat("expected the guard to revert with: ", needle));
+        string memory reason = _revertReason(ret);
+        assertTrue(
+            _contains(reason, needle),
+            string.concat("wrong revert reason\n   expected substring: ", needle, "\n   actual: ", reason)
+        );
+    }
+
     function _isDev(uint256 chainId) internal returns (bool) {
         vm.chainId(chainId);
         return harness.isDevChain();
+    }
+}
+
+/// An oracle wired to `true`: structurally perfect, and it would freeze the token.
+contract AlwaysSanctionedOracle is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) {
+        return true;
+    }
+}
+
+/// An oracle that cannot answer at all. Must fail the deploy loudly rather than read
+/// as "does not flag".
+contract RevertingOracle is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) {
+        revert("oracle unavailable");
+    }
+}
+
+/// Answers with 4 bytes instead of 32 — a successful call whose payload `abi.decode`
+/// must never be pointed at.
+contract ShortAnswerOracle {
+    fallback() external {
+        assembly {
+            mstore(0, 1)
+            return(0, 4)
+        }
+    }
+}
+
+/// The one thing {DeployGuards.requireIsinVacant} reads off a factory, with a setter so a
+/// test can stage an ALREADY-CLAIMED ISIN. Populating the real {TokenFactory} would mean
+/// driving a full `deployToken` (NAV feed, forwarder, roles) to assert one mapping read;
+/// test_requireIsinVacant_acceptsAnUnclaimedIsinOnTheRealFactory is what keeps this
+/// signature honest against the real contract.
+contract MockIsinRegistry {
+    mapping(string => address) private _tokenByIsin;
+
+    function setToken(string memory isin, address token) external {
+        _tokenByIsin[isin] = token;
+    }
+
+    function tokenByIsin(string memory isin) external view returns (address) {
+        return _tokenByIsin[isin];
     }
 }
 
@@ -153,6 +482,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     address constant SUBSCRIBER = address(0x5BC1);
     address constant REDEEMER = address(0xEDEE);
     address constant WHITELIST_ADMIN = address(0x117E);
+    address constant ISSUANCE_PAUSER = address(0xBA5E);
     address constant NAV_OWNER = address(0x0AC1);
     address constant TREASURER = address(0x77EA);
     address constant QUOTE_SIGNER = address(0x519E);
@@ -163,6 +493,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     MockSanctionsList sanctions;
     /// The real production oracle (GYL-1051) — what a production run must be given.
     SanctionsOracleMirror prodOracle;
+    /// Stands in for an address on the live OFAC/SDN feed: {prodOracle} flags it, and it is
+    /// what `SANCTIONS_PROBE_FLAGGED` names so the deploy's behavioural screen can pass.
+    address constant SDN_SUBJECT = address(0x5D4);
     MockUSDC usdc;
     uint256 snap;
 
@@ -172,6 +505,17 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.warp(1_750_000_000);
         sanctions = new MockSanctionsList(address(this));
         prodOracle = new SanctionsOracleMirror(GOVERNANCE, OPS, address(0));
+
+        // Audit FIND-006: seeded, because the production fixture must model an oracle that
+        // actually screens. It was previously constructed and left empty, which answers
+        // `false` for every address — the unseeded-mirror case D-33 exists to refuse, and
+        // the behavioural guard in DeployDevNet now rejects it outright. A fixture that
+        // cannot pass the deploy's own compliance check is not a production happy path.
+        address[] memory sdn = new address[](1);
+        sdn[0] = SDN_SUBJECT;
+        vm.prank(OPS); // SANCTIONS_UPDATER_ROLE on prodOracle
+        prodOracle.addToSanctionsList(sdn);
+
         usdc = new MockUSDC();
     }
 
@@ -188,7 +532,11 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_devNet_unsetSanctionsListOnProdL2);
         _run(this.reject_devNet_sanctionsListWithoutCode);
         _run(this.reject_devNet_sanctionsListIsADevMock);
+        _run(this.reject_devNet_unseededSanctionsOracleOnProd);
+        _run(this.reject_devNet_sanctionsOracleWithNoGasMarginOnProd);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
+        _run(this.reject_devNet_issuancePauserEqualsSubscriber);
+        _run(this.reject_devNet_unsetIssuancePauserOnProd);
         _run(this.accept_devNet_productionHappyPath);
         _run(this.accept_devNet_anvilDevPathStillWorks);
         _run(this.accept_devNet_everySeriesTokenAdminIsTheTimelock);
@@ -210,6 +558,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         // ── DeployNAVFeed ─────────────────────────────────────────────────────
         _run(this.reject_navFeed_forwarderOwnerIsAnEoa);
         _run(this.reject_navFeed_unsetForwarderOwnerOnProd);
+        _run(this.reject_navFeed_unsetGuardianOnProd);
+        _run(this.reject_navFeed_guardianIsTheOperator);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -294,6 +644,48 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         );
     }
 
+    /// Audit FIND-006. Catches the failure every structural guard above is blind to: an
+    /// oracle that is a real contract, is not the dev mock, implements the interface, and
+    /// screens NOBODY. A freshly deployed SanctionsOracleMirror answers `false` for every
+    /// address, so it satisfies `requireProdContract` and `requireProdNotMock` alike and
+    /// would ship a series with compliance silently switched off.
+    ///
+    /// This is also the test that proves the behavioural guard is WIRED IN. It lived in
+    /// DeployGuards with full unit coverage and no caller for its whole existence, which is
+    /// a control that exists on paper only — exactly what a reviewer greps for.
+    function reject_devNet_unseededSanctionsOracleOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        _setAddr("SANCTIONS_LIST", address(new SanctionsOracleMirror(GOVERNANCE, OPS, address(0))));
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "does NOT flag known-sanctioned"
+        );
+    }
+
+    /// The other half: an oracle that answers correctly but cannot afford to. The deploy
+    /// reads it with the whole transaction behind it; a transfer forwards 63/64 of what is
+    /// left, so an oracle with no margin passes admission and fails on a holder's transfer.
+    function reject_devNet_sanctionsOracleWithNoGasMarginOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+
+        SanctionsOracleMirror spent = new SanctionsOracleMirror(GOVERNANCE, OPS, address(0));
+        address[] memory sdn = new address[](1);
+        sdn[0] = SDN_SUBJECT;
+        vm.prank(OPS);
+        spent.addToSanctionsList(sdn);
+        GasGriefingOracle upstream = new GasGriefingOracle();
+        vm.prank(GOVERNANCE);
+        spent.setForwardingOracle(address(upstream));
+
+        _setAddr("SANCTIONS_LIST", address(spent));
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "no margin left on the transfer path"
+        );
+    }
+
     /// Catches: collapsing the deliberate mint/burn two-key quorum into one address.
     function reject_devNet_subscriberEqualsRedeemer() external {
         vm.chainId(PROD_L2);
@@ -303,6 +695,27 @@ contract DeployScriptsTest is ScriptRevertAsserts {
             address(new DeployDevNet()),
             "SUBSCRIBER_ADDRESS and REDEEMER_ADDRESS must be different addresses on production"
         );
+    }
+
+    /// Catches: pointing the mint-path brake at the very key it exists to stop. The pause
+    /// added for audit FIND-001 is only a control while a second party holds it.
+    function reject_devNet_issuancePauserEqualsSubscriber() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        _setAddr("ISSUANCE_PAUSER", SUBSCRIBER);
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "SUBSCRIBER_ADDRESS and ISSUANCE_PAUSER must be different addresses on production"
+        );
+    }
+
+    /// Catches the FIND-001 regression directly: ISSUANCE_PAUSER unset on production must
+    /// abort rather than deploy a "pausable" manager whose pauser role has no holder.
+    function reject_devNet_unsetIssuancePauserOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        vm.setEnv("ISSUANCE_PAUSER", "");
+        _expectRunRevert(address(new DeployDevNet()), "env var ISSUANCE_PAUSER is required on chainId 8453");
     }
 
     /// Every bond series this run deploys must leave DEFAULT_ADMIN_ROLE with the timelock
@@ -346,6 +759,14 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         assertFalse(im.hasRole(im.SUBSCRIBER_ROLE(), DEFAULT_SENDER), "deployer kept SUBSCRIBER_ROLE");
         assertFalse(im.hasRole(im.REDEEMER_ROLE(), DEFAULT_SENDER), "deployer kept REDEEMER_ROLE");
         assertFalse(im.hasRole(im.REGISTRAR_ROLE(), DEFAULT_SENDER), "deployer kept REGISTRAR_ROLE");
+
+        // audit FIND-001: the mint-path brake must actually be held by the ops key, and not
+        // by the deployer. Shipped once with no holder at all, which made pauseIssuance()
+        // uncallable by anyone.
+        assertTrue(
+            im.hasRole(im.ISSUANCE_PAUSER_ROLE(), ISSUANCE_PAUSER), "ops key is not the issuance pauser"
+        );
+        assertFalse(im.hasRole(im.ISSUANCE_PAUSER_ROLE(), DEFAULT_SENDER), "deployer kept ISSUANCE_PAUSER_ROLE");
 
         // A timelock that gates nothing is the heart of the incident.
         assertEq(tl.getMinDelay(), 48 hours, "production timelock delay must be 48h");
@@ -580,6 +1001,30 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _expectRunRevert(address(new DeployNAVFeed()), "env var FORWARDER_OWNER is required on chainId 8453");
     }
 
+    /// Catches: NAV_GUARDIAN unset on production and silently defaulting. The feed's
+    /// emergency correction path is a 2-of-2, and a defaulted guardian is the D-7 defect
+    /// (audit FIND-003) — one key holding both halves of the quorum.
+    function reject_navFeed_unsetGuardianOnProd() external {
+        vm.chainId(PROD_L2);
+        _navFeedEnv();
+        _setAddr("FORWARDER_OWNER", address(_timelock(48 hours, GOVERNANCE)));
+        vm.setEnv("NAV_GUARDIAN", "");
+        _expectRunRevert(address(new DeployNAVFeed()), "env var NAV_GUARDIAN is required on chainId 8453");
+    }
+
+    /// Catches: the guardian and the feed owner set to the SAME address on production,
+    /// which collapses the 2-of-2 into a 1-of-1. `KaleidoscopeNAVFeed`'s constructor
+    /// refuses it on-chain too; this fails earlier, naming the variable to fix.
+    function reject_navFeed_guardianIsTheOperator() external {
+        vm.chainId(PROD_L2);
+        _navFeedEnv();
+        _setAddr("FORWARDER_OWNER", address(_timelock(48 hours, GOVERNANCE)));
+        _setAddr("NAV_GUARDIAN", NAV_OWNER); // == OPERATOR_ADDRESS
+        _expectRunRevert(
+            address(new DeployNAVFeed()), "OPERATOR_ADDRESS and NAV_GUARDIAN must be different addresses"
+        );
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  Fixtures
     // ══════════════════════════════════════════════════════════════════════════
@@ -605,8 +1050,12 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _setAddr("SUBSCRIBER_ADDRESS", SUBSCRIBER);
         _setAddr("REDEEMER_ADDRESS", REDEEMER);
         _setAddr("WHITELIST_ADMIN", WHITELIST_ADMIN);
+        _setAddr("ISSUANCE_PAUSER", ISSUANCE_PAUSER);
         _setAddr("NAV_FEED_OWNER", NAV_OWNER);
         _setAddr("SANCTIONS_LIST", address(prodOracle));
+        // The live SDN designation the deploy screens against (audit FIND-006). On a real
+        // run the operator reads this from the current OFAC feed at deploy time.
+        _setAddr("SANCTIONS_PROBE_FLAGGED", SDN_SUBJECT);
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "172800");
     }
 
@@ -646,6 +1095,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     function _navFeedEnv() internal {
         _clearEnv();
         _setAddr("OPERATOR_ADDRESS", NAV_OWNER);
+        // Distinct from OPERATOR_ADDRESS by construction: the feed's emergency path is a
+        // 2-of-2 and its constructor rejects a guardian equal to the owner (FIND-003).
+        _setAddr("NAV_GUARDIAN", OPS);
         vm.setEnv("FEED_DESCRIPTION", "TBA / USD NAV");
     }
 
@@ -672,14 +1124,16 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// from the project root, and an empty value makes `vm.envAddress` / `vm.envUint`
     /// revert — exactly how an unset variable behaves.
     function _clearEnv() internal {
-        string[24] memory keys = [
+        string[27] memory keys = [
             "GOVERNANCE_MULTISIG",
             "OPS_MULTISIG",
             "SUBSCRIBER_ADDRESS",
             "REDEEMER_ADDRESS",
             "WHITELIST_ADMIN",
+            "ISSUANCE_PAUSER",
             "NAV_FEED_OWNER",
             "SANCTIONS_LIST",
+            "SANCTIONS_PROBE_FLAGGED",
             "TIMELOCK_DELAY_SECONDS",
             "MULTISIG_ADDRESS",
             "EVM_FACTORY_ADDRESS",
@@ -696,7 +1150,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
             "SERIES_TOKENS",
             "ALLOWED_TAKERS",
             "OPERATOR_ADDRESS",
-            "FORWARDER_OWNER"
+            "FORWARDER_OWNER",
+            "NAV_GUARDIAN"
         ];
         for (uint256 i = 0; i < keys.length; i++) {
             vm.setEnv(keys[i], "");

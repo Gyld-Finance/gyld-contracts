@@ -3,6 +3,7 @@ pragma solidity =0.8.28;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
@@ -32,14 +33,48 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 ///   WHITELIST_ADMIN_ROLE — adds / removes APs from the whitelist
 ///   SUBSCRIBER_ROLE      — calls subscribe() (mint path); separate MPC wallet from redeemer
 ///   REDEEMER_ROLE        — calls redeem()    (burn path); separate MPC wallet from subscriber
+///   ISSUANCE_PAUSER_ROLE — halts the mint path; redeem stays open so APs are not trapped
 ///   DEFAULT_ADMIN_ROLE   — also authorizes UUPS upgrades (should be a TimelockController)
-contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
+///
+/// Maturity (audit FIND-009): a series' maturityTimestamp used to be read by nothing, so a
+/// matured bond minted exactly like a live one and closing it depended on an operator
+/// remembering to act. subscribe() now refuses a matured series. It gates the mint path only —
+/// redeem() stays open, and the token's own transfers stay open, so holders of a matured
+/// series can still exit.
+///
+/// Issuance limit (audit FIND-001): subscribe() used to bound only "registered,
+/// whitelisted, non-zero", so one compromised online SUBSCRIBER_ROLE key could mint
+/// without limit — diluting every holder, since NAV is computed against total supply.
+/// Each series now has a daily mint cap (DEFAULT_DAILY_CAP unless the timelock sets
+/// another). Dual control above a threshold is a Fordefi approval policy rather than an
+/// on-chain check — an accepted residual, not a claim that on-chain dual control is unusual.
+contract IssuanceManager is
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     // ── Roles ─────────────────────────────────────────────────────────────────
 
     bytes32 public constant WHITELIST_ADMIN_ROLE = keccak256("WHITELIST_ADMIN_ROLE");
     bytes32 public constant SUBSCRIBER_ROLE      = keccak256("SUBSCRIBER_ROLE");
     bytes32 public constant REDEEMER_ROLE        = keccak256("REDEEMER_ROLE");
     bytes32 public constant REGISTRAR_ROLE       = keccak256("REGISTRAR_ROLE");
+    bytes32 public constant ISSUANCE_PAUSER_ROLE = keccak256("ISSUANCE_PAUSER_ROLE");
+
+    /// Daily mint cap applied to a series with no explicit cap set.
+    ///
+    /// Sized against operational AP subscription volume, not against a loss budget: the
+    /// series trade at ~$1.00 NAV, so this is ~$1m of primary issuance per series per day
+    /// (~$2m across a window straddle — see CAP_WINDOW). It is a ceiling that stops an
+    /// unbounded mint, not a tight per-desk limit; the timelock lowers it per series with
+    /// setDailyCap where a tighter bound is wanted.
+    uint256 public constant DEFAULT_DAILY_CAP = 1_000_000e18;
+
+    /// Cap window. Fixed and resetting, not sliding — hence the 2x straddle in §known-issues.
+    /// A decaying-capacity limiter avoids the instantaneous case if a 1x bound is ever needed.
+    uint256 public constant CAP_WINDOW = 1 days;
 
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
@@ -47,6 +82,15 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     struct IssuanceManagerStorage {
         mapping(address => bool) whitelisted;
         mapping(address => bool) registeredTokens;
+        // APPEND-ONLY (ERC-7201): new fields go here, never insert/reorder above.
+        mapping(address => uint256) dailyCapOf; // 0 = use DEFAULT_DAILY_CAP
+        mapping(address => Usage) usageOf;
+    }
+
+    /// Mint usage for the current window. One slot: uint64 timestamp + uint192 amount.
+    struct Usage {
+        uint64 windowStart;
+        uint192 minted;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.IssuanceManager")) - 1)) & ~bytes32(uint256(0xff))
@@ -67,6 +111,10 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     error NotWhitelisted(address account);
     error NotValidTokenContract(address token);
     error CannotRenounceAdminRole();
+    error CannotRemoveLastAdmin(); // audit FIND-007
+    error DailyCapExceeded(address token, uint256 requested, uint256 cap);
+    error InvalidCap(uint256 cap);
+    error SeriesMatured(address token, uint256 maturityTimestamp, uint256 nowTs); // audit FIND-009
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -76,6 +124,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     event AddressRemovedFromWhitelist(address indexed account);
     event TokenRegistered(address indexed token);
     event TokenDeregistered(address indexed token);
+    event DailyCapUpdated(address indexed token, uint256 cap);
 
     // ── Constructor / Initializer ─────────────────────────────────────────────
 
@@ -91,6 +140,7 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         if (defaultAdmin == address(0) || subscriber == address(0) || redeemer == address(0)) revert ZeroAddress();
         __AccessControl_init();
         __ReentrancyGuard_init();
+        __Pausable_init();
         __UUPSUpgradeable_init();
         _grantRole(DEFAULT_ADMIN_ROLE,  defaultAdmin);
         _grantRole(SUBSCRIBER_ROLE,     subscriber);
@@ -119,17 +169,44 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     /// @dev    Caller must hold SUBSCRIBER_ROLE. The Chainalysis oracle is NOT checked here —
     ///         IssuanceManager pre-screens APs off-chain before calling. Only registered
     ///         tokens and whitelisted recipients are accepted.
+    ///
+    ///         Primary issuance closes at the series' maturity (audit FIND-009). That is a
+    ///         mint-path gate only: `redeem` below and the token's own transfers stay open
+    ///         afterwards, so holders of a matured series are never trapped in it.
     /// @param token     A registered GyldBondToken proxy address.
     /// @param recipient Whitelisted AP wallet that receives the bond tokens.
     /// @param amount    Token amount in 18-decimal units. Must be greater than zero.
     function subscribe(address token, address recipient, uint256 amount)
         external
         nonReentrant
+        whenNotPaused
         onlyRole(SUBSCRIBER_ROLE)
     {
         if (!_getStorage().registeredTokens[token]) revert UnregisteredToken(token);
         if (!_getStorage().whitelisted[recipient])   revert NotWhitelisted(recipient);
         if (amount == 0)                             revert ZeroAmount();
+
+        // Maturity (audit FIND-009). Read from the token, which is the single source of
+        // truth for the series; 0 is the documented open-ended sentinel and skips the gate.
+        // `>=` closes issuance at the timestamp itself, matching TokenFactory.deployToken,
+        // which requires a maturity strictly greater than the deploying block.
+        uint256 maturity = IGyldBondToken(token).maturityTimestamp();
+        if (maturity != 0 && block.timestamp >= maturity) {
+            revert SeriesMatured(token, maturity, block.timestamp);
+        }
+
+        // Daily cap (audit FIND-001). Roll the window if it has elapsed — or if this
+        // series has never minted, so the window anchors here rather than at epoch 0.
+        Usage storage u = _getStorage().usageOf[token];
+        if (u.windowStart == 0 || block.timestamp >= u.windowStart + CAP_WINDOW) {
+            u.windowStart = uint64(block.timestamp);
+            u.minted = 0;
+        }
+        uint256 cap = dailyCap(token);
+        uint256 used = u.minted + amount;
+        if (used > cap) revert DailyCapExceeded(token, amount, cap);
+        u.minted = uint192(used);
+
         // nonReentrant: defense-in-depth; mint/burn are role-gated with no untrusted callbacks
         IGyldBondToken(token).mint(recipient, amount);
         emit Subscribed(token, recipient, amount);
@@ -151,18 +228,20 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     ///
     ///         Tokens held by this contract during the window are inert — the contract
     ///         has no withdraw(), transfer(), or rescue() function, so they cannot be
-    ///         extracted without REDEEMER_ROLE calling redeem().  A rogue REDEEMER_ROLE
-    ///         key could burn tokens for a wrong beneficiary address, but cannot redirect
-    ///         the off-chain USDC payment — that settlement is handled by a separate
-    ///         backend service keyed to the beneficiary recorded in the Redeemed event.
-    ///         The beneficiary must also be whitelisted, limiting the blast radius of a
-    ///         compromised key to addresses already KYC-approved.
+    ///         extracted without REDEEMER_ROLE calling redeem().
+    ///
+    ///         `beneficiary` is a call argument, so `Redeemed` records the caller's own
+    ///         choice — an audit trail, not a control (audit FIND-015). A compromised
+    ///         REDEEMER_ROLE key can name any whitelisted address. Attribution to the real
+    ///         depositor is an OFF-CHAIN control; the whitelist is the only on-chain one,
+    ///         capping the blast radius at KYC-approved addresses.
     ///
     ///         Atomicity is not required because value does not move on-chain at redemption
     ///         time — USDC is sent off-chain after this call succeeds.
     ///
     /// @param token       A registered GyldBondToken proxy address.
-    /// @param beneficiary Whitelisted AP who sent the tokens (recorded in event for audit trail).
+    /// @param beneficiary Whitelisted AP the backend asserts sent the tokens — NOT verified
+    ///                    on-chain (FIND-015). Recorded in the event as an audit trail.
     /// @param amount      Token amount to burn. Must not exceed this contract's token balance.
     function redeem(address token, address beneficiary, uint256 amount)
         external
@@ -226,6 +305,13 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         // (success=false): we require success AND a full 32-byte return value.
         (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSignature("MINTER_ROLE()"));
         if (!ok || data.length != 32) revert NotValidTokenContract(token);
+
+        // Probe maturityTimestamp() for the same reason, added with the maturity gate
+        // (audit FIND-009): subscribe() now depends on it, so a token without it would
+        // register cleanly and then revert every subscribe with an opaque unknown-selector
+        // error. Fail here, where the registrar can still do something about it.
+        (ok, data) = token.staticcall(abi.encodeWithSignature("maturityTimestamp()"));
+        if (!ok || data.length != 32) revert NotValidTokenContract(token);
         _getStorage().registeredTokens[token] = true;
         emit TokenRegistered(token);
     }
@@ -240,6 +326,43 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
         emit TokenDeregistered(token);
     }
 
+    // ── Issuance limit + pause (audit FIND-001) ───────────────────────────────
+
+    /// @notice Set a series' daily mint cap. Zero restores DEFAULT_DAILY_CAP.
+    /// @dev    DEFAULT_ADMIN_ROLE (the timelock) only — a cap the online SUBSCRIBER key
+    ///         could raise would not be a cap.
+    ///
+    ///         Bounded by uint192 because `Usage.minted` is a uint192 and subscribe casts
+    ///         to it explicitly, which Solidity does not check. A cap above this range
+    ///         would let the running total truncate and silently reset the counter.
+    function setDailyCap(address token, uint256 cap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (cap > type(uint192).max) revert InvalidCap(cap);
+        _getStorage().dailyCapOf[token] = cap;
+        emit DailyCapUpdated(token, cap);
+    }
+
+    /// @notice The daily mint cap in force for `token`.
+    function dailyCap(address token) public view returns (uint256) {
+        uint256 cap = _getStorage().dailyCapOf[token];
+        return cap == 0 ? DEFAULT_DAILY_CAP : cap;
+    }
+
+    /// @notice Amount minted in the current window, and when that window started.
+    function mintedToday(address token) external view returns (uint256 minted, uint256 windowStart) {
+        Usage storage u = _getStorage().usageOf[token];
+        return (u.minted, u.windowStart);
+    }
+
+    /// @notice Halt the mint path. Redeem stays open so APs are not trapped mid-incident.
+    function pauseIssuance() external onlyRole(ISSUANCE_PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Resume issuance. Timelock only — asymmetric, like the swap (D-14).
+    function unpauseIssuance() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
     // ── Role management overrides ─────────────────────────────────────────────
 
     /// DEFAULT_ADMIN_ROLE cannot be renounced — losing it permanently bricks UUPS
@@ -248,6 +371,27 @@ contract IssuanceManager is Initializable, AccessControlUpgradeable, ReentrancyG
     function renounceRole(bytes32 role, address callerConfirmation) public override {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
         super.renounceRole(role, callerConfirmation);
+    }
+
+    /// @dev Audit FIND-007. `renounceRole` above refuses DEFAULT_ADMIN_ROLE, but the role
+    ///      admins itself, so the sole holder could self-revoke into the same bricked state.
+    ///      Guarding `_revokeRole` covers both paths. Removing a NON-last admin is untouched
+    ///      — that is the deploy handover (grant successor, then self-revoke).
+    ///      `<= 1` not `== 1`: a proxy upgraded to this code never wrote the slot, so it reads
+    ///      0 while holding one admin; blocking there is the safe direction.
+    uint256 public defaultAdminCount;
+
+    function _grantRole(bytes32 r, address a) internal override returns (bool granted) {
+        granted = super._grantRole(r, a);
+        if (granted && r == DEFAULT_ADMIN_ROLE) defaultAdminCount++;
+    }
+
+    function _revokeRole(bytes32 r, address a) internal override returns (bool revoked) {
+        revoked = super._revokeRole(r, a);
+        if (revoked && r == DEFAULT_ADMIN_ROLE) {
+            if (defaultAdminCount <= 1) revert CannotRemoveLastAdmin();
+            defaultAdminCount--;
+        }
     }
 
     // ── UUPS ──────────────────────────────────────────────────────────────────
