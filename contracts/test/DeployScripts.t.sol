@@ -20,6 +20,10 @@ import {IssuanceManager} from "../IssuanceManager.sol";
 import {TokenFactory} from "../TokenFactory.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
+// Audit FIND-006. Imported rather than re-declared: a second copy of a griefer would have
+// to relearn the `RETURN_RESERVE` lesson recorded on the original, and a griefer that
+// quietly stops griefing makes its test vacuous instead of failing it.
+import {GasGriefingOracle} from "./SanctionsOracleMirror.t.sol";
 import {MockUSDC} from "./MockUSDC.sol";
 
 /// @dev External wrapper around the library.
@@ -193,6 +197,62 @@ contract DeployGuardsTest is ScriptRevertAsserts {
     /// the classic silent pass. It must be caught by the same length check.
     function test_requireSanctionsOracleAnswers_failsLoudWhenTheOracleHasNoCode() public {
         _expectGuardRevert(address(0xDEAD), "sanctions oracle did not answer");
+    }
+
+    // ── audit FIND-006: right answers are not enough, they must be affordable ────
+
+    /// The case the value checks alone cannot see, and the one FIND-006 is really about:
+    /// an oracle that gives the CORRECT answer for both subjects and cannot afford to give
+    /// it on the transfer path. The mirror short-circuits `KNOWN_FLAGGED` off its local list
+    /// and forwards `KNOWN_CLEAN` to an upstream that burns the whole `FORWARDING_GAS`
+    /// allowance before answering `false` — structurally perfect, correct on both counts,
+    /// and over budget.
+    ///
+    /// Before this check the configuration was admitted: the guard read it with the entire
+    /// deploy transaction behind it, so the mirror always reached its allowance and the
+    /// answer came back. What a real transfer offers is 63/64 of whatever it has left.
+    function test_requireSanctionsOracleAnswers_rejectsAnUpstreamThatBurnsTheAllowance() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        oracle.setForwardingOracle(address(new GasGriefingOracle()));
+
+        // The answers themselves are right — this is not the value check firing.
+        assertTrue(oracle.isSanctioned(KNOWN_FLAGGED), "flagged subject should still flag");
+        assertFalse(oracle.isSanctioned(KNOWN_CLEAN), "clean subject should still be clean");
+
+        // And it ANSWERED — the distinction the two revert messages exist to keep. Reading
+        // this as "did not answer" would send an operator looking for an unreachable oracle.
+        _expectGuardRevert(address(oracle), "but spent");
+        _expectGuardRevert(address(oracle), "no margin left on the transfer path");
+
+        // `KNOWN_FLAGGED` never reaches the griefer (local list short-circuits at
+        // `SanctionsOracleMirror:79`), so it is the clean subject that names itself here.
+        _expectGuardRevert(address(oracle), vm.toString(KNOWN_CLEAN));
+    }
+
+    /// The other half of the cap, and the reason it is 40_000 rather than something tighter:
+    /// the shape production actually deploys — a seeded mirror forwarding to a live vendor
+    /// oracle — must still pass, with margin. If a future change to either contract pushes a
+    /// healthy screen near the budget, this fails before the guard starts refusing real
+    /// oracles on deploy day.
+    function test_requireSanctionsOracleAnswers_admitsAHealthyForwardingMirror() public {
+        SanctionsOracleMirror oracle = _seededMirror();
+        oracle.setForwardingOracle(address(new MockSanctionsList(address(this))));
+
+        vm.chainId(PROD_L2);
+        harness.requireSanctionsOracleAnswers(address(oracle), KNOWN_FLAGGED, KNOWN_CLEAN, "SANCTIONS_LIST");
+
+        // Pin the headroom, not just the pass. A bare call above would keep passing at
+        // 19_999 gas, one refactor away from a deploy that cannot screen anyone. `vm.cool`
+        // because the guard meets these slots cold on a real deploy and this test does not.
+        vm.cool(address(oracle));
+        uint256 startGas = gasleft();
+        oracle.isSanctioned(KNOWN_CLEAN);
+        uint256 gasUsed = startGas - gasleft();
+        assertLt(
+            gasUsed,
+            DeployGuards.SCREENING_GAS_BUDGET / 2,
+            "a healthy forwarding screen has lost its margin under SCREENING_GAS_BUDGET"
+        );
     }
 
     /// Dev chains cannot supply a live SDN designation, so the guard is a no-op there —
@@ -433,6 +493,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     MockSanctionsList sanctions;
     /// The real production oracle (GYL-1051) — what a production run must be given.
     SanctionsOracleMirror prodOracle;
+    /// Stands in for an address on the live OFAC/SDN feed: {prodOracle} flags it, and it is
+    /// what `SANCTIONS_PROBE_FLAGGED` names so the deploy's behavioural screen can pass.
+    address constant SDN_SUBJECT = address(0x5D4);
     MockUSDC usdc;
     uint256 snap;
 
@@ -442,6 +505,17 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.warp(1_750_000_000);
         sanctions = new MockSanctionsList(address(this));
         prodOracle = new SanctionsOracleMirror(GOVERNANCE, OPS, address(0));
+
+        // Audit FIND-006: seeded, because the production fixture must model an oracle that
+        // actually screens. It was previously constructed and left empty, which answers
+        // `false` for every address — the unseeded-mirror case D-33 exists to refuse, and
+        // the behavioural guard in DeployDevNet now rejects it outright. A fixture that
+        // cannot pass the deploy's own compliance check is not a production happy path.
+        address[] memory sdn = new address[](1);
+        sdn[0] = SDN_SUBJECT;
+        vm.prank(OPS); // SANCTIONS_UPDATER_ROLE on prodOracle
+        prodOracle.addToSanctionsList(sdn);
+
         usdc = new MockUSDC();
     }
 
@@ -458,6 +532,8 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_devNet_unsetSanctionsListOnProdL2);
         _run(this.reject_devNet_sanctionsListWithoutCode);
         _run(this.reject_devNet_sanctionsListIsADevMock);
+        _run(this.reject_devNet_unseededSanctionsOracleOnProd);
+        _run(this.reject_devNet_sanctionsOracleWithNoGasMarginOnProd);
         _run(this.reject_devNet_subscriberEqualsRedeemer);
         _run(this.reject_devNet_issuancePauserEqualsSubscriber);
         _run(this.reject_devNet_unsetIssuancePauserOnProd);
@@ -565,6 +641,48 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _expectRunRevert(
             address(new DeployDevNet()),
             "is a DEV MOCK whose sanctions list is writable - it must never be used on production chainId 8453"
+        );
+    }
+
+    /// Audit FIND-006. Catches the failure every structural guard above is blind to: an
+    /// oracle that is a real contract, is not the dev mock, implements the interface, and
+    /// screens NOBODY. A freshly deployed SanctionsOracleMirror answers `false` for every
+    /// address, so it satisfies `requireProdContract` and `requireProdNotMock` alike and
+    /// would ship a series with compliance silently switched off.
+    ///
+    /// This is also the test that proves the behavioural guard is WIRED IN. It lived in
+    /// DeployGuards with full unit coverage and no caller for its whole existence, which is
+    /// a control that exists on paper only — exactly what a reviewer greps for.
+    function reject_devNet_unseededSanctionsOracleOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+        _setAddr("SANCTIONS_LIST", address(new SanctionsOracleMirror(GOVERNANCE, OPS, address(0))));
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "does NOT flag known-sanctioned"
+        );
+    }
+
+    /// The other half: an oracle that answers correctly but cannot afford to. The deploy
+    /// reads it with the whole transaction behind it; a transfer forwards 63/64 of what is
+    /// left, so an oracle with no margin passes admission and fails on a holder's transfer.
+    function reject_devNet_sanctionsOracleWithNoGasMarginOnProd() external {
+        vm.chainId(PROD_L2);
+        _devNetProdEnv();
+
+        SanctionsOracleMirror spent = new SanctionsOracleMirror(GOVERNANCE, OPS, address(0));
+        address[] memory sdn = new address[](1);
+        sdn[0] = SDN_SUBJECT;
+        vm.prank(OPS);
+        spent.addToSanctionsList(sdn);
+        GasGriefingOracle upstream = new GasGriefingOracle();
+        vm.prank(GOVERNANCE);
+        spent.setForwardingOracle(address(upstream));
+
+        _setAddr("SANCTIONS_LIST", address(spent));
+        _expectRunRevert(
+            address(new DeployDevNet()),
+            "no margin left on the transfer path"
         );
     }
 
@@ -935,6 +1053,9 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _setAddr("ISSUANCE_PAUSER", ISSUANCE_PAUSER);
         _setAddr("NAV_FEED_OWNER", NAV_OWNER);
         _setAddr("SANCTIONS_LIST", address(prodOracle));
+        // The live SDN designation the deploy screens against (audit FIND-006). On a real
+        // run the operator reads this from the current OFAC feed at deploy time.
+        _setAddr("SANCTIONS_PROBE_FLAGGED", SDN_SUBJECT);
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "172800");
     }
 
@@ -1003,7 +1124,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
     /// from the project root, and an empty value makes `vm.envAddress` / `vm.envUint`
     /// revert — exactly how an unset variable behaves.
     function _clearEnv() internal {
-        string[26] memory keys = [
+        string[27] memory keys = [
             "GOVERNANCE_MULTISIG",
             "OPS_MULTISIG",
             "SUBSCRIBER_ADDRESS",
@@ -1012,6 +1133,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
             "ISSUANCE_PAUSER",
             "NAV_FEED_OWNER",
             "SANCTIONS_LIST",
+            "SANCTIONS_PROBE_FLAGGED",
             "TIMELOCK_DELAY_SECONDS",
             "MULTISIG_ADDRESS",
             "EVM_FACTORY_ADDRESS",

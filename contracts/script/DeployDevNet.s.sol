@@ -26,6 +26,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   * every privileged env var below is REQUIRED and must not be the deployer EOA;
 ///   * TIMELOCK_DELAY_SECONDS is REQUIRED and must be >= 48h;
 ///   * SANCTIONS_LIST is REQUIRED and must be a contract (no mock is ever deployed);
+///   * SANCTIONS_PROBE_FLAGGED is REQUIRED — a live SDN designation the oracle must
+///     actually flag, which is what separates a working gate from an unseeded one;
 ///   * SUBSCRIBER_ADDRESS and REDEEMER_ADDRESS must differ (mint/burn quorum split);
 ///   * Anvil account[1] is NOT whitelisted (its private key is public);
 ///   * the final role topology is asserted in-band, inside the broadcast, so a
@@ -55,6 +57,10 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                            feed's emergency correction path (audit FIND-003).
 ///                           In prod: KMS signer
 ///   SANCTIONS_LIST       →  SanctionsOracleMirror (prod) / MockSanctionsList (dev)
+///   SANCTIONS_PROBE_FLAGGED → an address on the CURRENT OFAC/SDN feed. Read fresh at
+///                           deploy time, never hardcoded: a stored designation goes
+///                           stale on delisting and would then block the deploy
+///                           (audit FIND-006, D-33). Prod only — unused on dev chains.
 ///
 /// A TimelockController is deployed and wired as:
 ///   - DEFAULT_ADMIN_ROLE on each GyldBondToken
@@ -84,6 +90,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   export ISSUANCE_PAUSER=<ops_hot_key_address>
 ///   export NAV_FEED_OWNER=<kms_signer_address>
 ///   export SANCTIONS_LIST=<sanctions_oracle_mirror>
+///   export SANCTIONS_PROBE_FLAGGED=<address_on_todays_sdn_list>
 ///   export TIMELOCK_DELAY_SECONDS=172800
 ///   forge script contracts/script/DeployDevNet.s.sol \
 ///     --rpc-url $EVM_RPC_URL --broadcast --private-key $PRIVKEY_SIGNING_KEY
@@ -108,6 +115,10 @@ contract DeployDevNet is Script {
         address issuancePauser;
         address navFeedOwner;
         address sanctionsList; // address(0) on a dev chain ⇒ deploy a MockSanctionsList
+        /// An address on the CURRENT OFAC/SDN feed, read at run time — the subject the
+        /// behavioural screen requires a `true` for. Audit FIND-006. Production only; the
+        /// guard is a no-op on dev chains, which cannot supply a live designation.
+        address sanctionsProbeFlagged;
         uint256 delay;
     }
 
@@ -218,6 +229,26 @@ contract DeployDevNet is Script {
             // otherwise sail through as SANCTIONS_LIST. Refuse this repo's mock by bytecode.
             DeployGuards.requireProdNotMock(
                 c.sanctionsList, type(MockSanctionsList).runtimeCode, "SANCTIONS_LIST"
+            );
+
+            // Audit FIND-006. Everything above is a STRUCTURAL check — it establishes that
+            // SANCTIONS_LIST is a contract, is not this repo's mock, and answers on the
+            // terms the transfer path decodes on. None of it can tell a working compliance
+            // gate from one that screens nobody: a freshly deployed, unseeded
+            // SanctionsOracleMirror satisfies every line above and answers `false` for
+            // every address. The behavioural screen below is the one that can, because a
+            // deploy script is the layer that can be handed a live SDN designation at run
+            // time — a fixture stored on-chain would go stale the moment OFAC delisted it.
+            //
+            // Also bounds the gas each answer costs, so an oracle with no margin left is
+            // refused here rather than on a holder's transfer. See SCREENING_GAS_BUDGET.
+            c.sanctionsProbeFlagged =
+                DeployGuards.envAddressProdRequired("SANCTIONS_PROBE_FLAGGED", address(0));
+            DeployGuards.requireSanctionsOracleAnswers(
+                c.sanctionsList,
+                c.sanctionsProbeFlagged,
+                c.deployer, // known-clean: the broadcaster is on no sanctions list
+                "SANCTIONS_LIST"
             );
         }
     }

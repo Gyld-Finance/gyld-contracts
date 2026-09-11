@@ -50,6 +50,44 @@ library DeployGuards {
     /// Minimum TimelockController delay on any production chain.
     uint256 internal constant MIN_PROD_TIMELOCK_DELAY = 48 hours;
 
+    /// @notice Gas one `isSanctioned` read may consume in {requireSanctionsOracleAnswers}
+    ///         before the oracle is refused. Audit FIND-006.
+    /// @dev    The budget is MEASURED, not imposed — {_screens} calls with a far larger
+    ///         ceiling and then checks what was actually spent. That distinction is the
+    ///         whole design, and the first attempt got it wrong: capping the guard's own
+    ///         staticcall at `SanctionsOracleMirror.FORWARDING_GAS` (40_000) starves the
+    ///         mirror of the gas it needs to hand its upstream the full allowance, so the
+    ///         guard would refuse a vendor oracle that costs 30k and works perfectly at
+    ///         runtime. A cap cannot both give the upstream its real allowance and sit
+    ///         below "mirror overhead + that allowance". Observing sidesteps the conflict.
+    ///
+    ///         Why any budget, when an upstream that OOGs behind a mirror already fails
+    ///         this guard on the answer itself: a deploy script runs with the whole
+    ///         transaction behind it, so the mirror always reaches its full allowance
+    ///         here. A transfer does not. EIP-150 forwards 63/64 of what remains, so a
+    ///         transfer far enough along to hold under ~41k hands the third-party hop
+    ///         LESS than the deploy probe did. An upstream sitting just inside the
+    ///         allowance is admitted and then fails in production — exactly the gap
+    ///         FIND-006 names. What separates the two is margin, and margin is a number
+    ///         you can only get by measuring.
+    ///
+    ///         20_000 sits between two measured populations, cold-slot (`vm.cool`) on the
+    ///         shapes this repo actually deploys:
+    ///           - healthy: local-list-only mirror 5,420; mirror forwarding to a leaf
+    ///             oracle 8,573; mirror chained through a second mirror 8,188
+    ///           - spent:   mirror whose upstream burns its allowance 41,185
+    ///         2.3x above the worst healthy read and under half the spent one. Pinned
+    ///         from both sides in `DeployScripts.t.sol` so neither edge drifts silently.
+    uint256 internal constant SCREENING_GAS_BUDGET = 20_000;
+
+    /// @notice Hard ceiling on a single screening staticcall, so an oracle that never
+    ///         returns cannot consume the deploy transaction. Audit FIND-006.
+    /// @dev    4x {SCREENING_GAS_BUDGET}: high enough that an over-budget oracle still
+    ///         RETURNS and can be reported with the figure it actually spent, low enough
+    ///         to bound the damage. A ceiling at the budget itself would collapse "too
+    ///         expensive" into "did not answer" and lose the diagnosis.
+    uint256 internal constant SCREENING_GAS_CEILING = SCREENING_GAS_BUDGET * 4;
+
     /// Canonical deterministic CREATE2 proxy (Arachnid / `forge script` default).
     /// Present on Anvil and on every major chain at the same address.
     address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
@@ -354,10 +392,17 @@ library DeployGuards {
     ///         — answers `false` for everything, satisfies every structural check, satisfies
     ///         {requireProdContract} and {requireProdNotMock}, and screens nobody.
     ///
+    ///         Audit FIND-006 adds the third term: both reads are measured against
+    ///         {SCREENING_GAS_BUDGET}, so this asserts the oracle answers correctly AND
+    ///         affordably. Without it the guard read every oracle with the whole deploy
+    ///         transaction behind it, which is not the budget the transfer path offers —
+    ///         see the constant for the EIP-150 reasoning.
+    ///
     ///         Point-in-time by nature. The mirror's list is rewritten by the keeper every
     ///         few hours, so this proves the oracle was answering correctly at deploy; the
     ///         continuous equivalent is the keeper re-running the same two `eth_call`s each
-    ///         cycle against the installed oracle.
+    ///         cycle against the installed oracle — with the same gas cap, or the drift
+    ///         this guard now catches at deploy goes unnoticed after it.
     /// @param  knownFlagged an address on the CURRENT OFAC/SDN feed — read it at run time,
     ///         never hardcode it.
     /// @param  knownClean   an address that must not be flagged; the deployer EOA will do.
@@ -396,13 +441,50 @@ library DeployGuards {
         }
     }
 
-    /// Read one screening answer on the same terms `GyldBondToken._requireAccess` decodes on.
-    /// Reverts rather than returning false if the oracle cannot answer at all, so an
-    /// unreachable oracle fails the deploy loudly instead of reading as "does not flag".
+    /// Read one screening answer on the same terms `GyldBondToken._requireAccess` decodes on,
+    /// inside {SCREENING_GAS_BUDGET} (audit FIND-006). Reverts rather than returning false if
+    /// the oracle cannot answer at all, so an unreachable oracle fails the deploy loudly
+    /// instead of reading as "does not flag".
+    ///
+    /// The two failures are kept apart on purpose, because they are different fixes: an
+    /// oracle that cannot answer is unreachable or broken, while one that answers over
+    /// budget is live and correct and simply too expensive to screen with. Both carry the
+    /// gas actually spent, so the operator does not have to guess which they are looking at.
     function _screens(address oracle, address who) private view returns (bool) {
-        (bool ok, bytes memory data) =
-            oracle.staticcall(abi.encodeWithSignature("isSanctioned(address)", who));
-        require(ok && data.length == 32, "DeployGuards: sanctions oracle did not answer");
+        uint256 startGas = gasleft();
+        (bool ok, bytes memory data) = oracle.staticcall{gas: SCREENING_GAS_CEILING}(
+            abi.encodeWithSignature("isSanctioned(address)", who)
+        );
+        uint256 gasUsed = startGas - gasleft();
+
+        // Not `require(cond, string.concat(...))`: the argument would be built on every
+        // successful screen too. This guard runs inside a broadcast.
+        if (!ok || data.length != 32) {
+            revert(
+                string.concat(
+                    "DeployGuards: sanctions oracle did not answer for ",
+                    vm.toString(who),
+                    " (spent ",
+                    vm.toString(gasUsed),
+                    " gas)"
+                )
+            );
+        }
+        // Audit FIND-006. Checked AFTER the answer, so "cannot answer" and "answers too
+        // expensively" cannot be reported as each other.
+        if (gasUsed > SCREENING_GAS_BUDGET) {
+            revert(
+                string.concat(
+                    "DeployGuards: sanctions oracle answered for ",
+                    vm.toString(who),
+                    " but spent ",
+                    vm.toString(gasUsed),
+                    " gas, over the ",
+                    vm.toString(SCREENING_GAS_BUDGET),
+                    " budget - it has no margin left on the transfer path"
+                )
+            );
+        }
         return abi.decode(data, (uint256)) == 1;
     }
 
