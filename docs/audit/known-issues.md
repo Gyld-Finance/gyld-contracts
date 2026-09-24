@@ -186,10 +186,12 @@ the cap, not to chase sub-second accuracy.
 
 ## Informational
 
-### `missing-inheritance` ×6 — **Accepted (test doubles only)**
+### `missing-inheritance` ×10 — **Accepted (test doubles only)**
 
 `MockSanctionsList`, `SelectiveRevertingOracle`, `MalformedReturnOracle`,
-`GasGriefingOracle`, `MockFutureDatedOracle`, `ReentrantToken`.
+`GasGriefingOracle`, `MockFutureDatedOracle`, `ReentrantToken`, and the four
+added with the FIND-003 / FIND-019 work: `ConstantMetadataWrapper`,
+`UnprobedPathWrapper`, `CallerBackReferenceOracle`, `SelectiveRouter`.
 
 **Zero production contracts appear in this detector**, which is the point: audit
 §4.8 moved every cross-contract interface into `contracts/interfaces/` and made
@@ -200,6 +202,20 @@ six results are a *consequence* of the fix, not a gap in it.
 They are all deliberately non-conforming: the doubles exist to return malformed
 data, revert selectively, or grief on gas. Making them `is ISanctionsList` would
 force them to be well-behaved and destroy what they test.
+
+The four later ones are the same class. `ConstantMetadataWrapper` and
+`UnprobedPathWrapper` pin `decimals` / `version` — and, in the second, a canned
+`latestRoundData` — that a conforming upstream would derive, which is the whole
+point of wrapping. `CallerBackReferenceOracle` and `SelectiveRouter` answer by
+calling back into `msg.sender`, so they only behave like an oracle when reached
+through the contract under probe; `SelectiveRouter` additionally answers honestly
+for a chosen address and routes the rest, the shape that defeats a one-question
+probe. Declaring the interface on any of them would compile, but would assert a
+conformance the test exists to violate.
+
+These four arrived with FIND-003 / FIND-019 and were never baselined, so the
+Slither job has been red on this branch since 2026-09-11, independently of any
+later commit. Triaged and baselined here; no production contract is involved.
 
 ### `low-level-calls` ×10 — **Accepted**
 

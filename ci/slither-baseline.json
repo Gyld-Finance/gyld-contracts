@@ -124,7 +124,22 @@
     {
       "check": "missing-inheritance",
       "file": "contracts/test/NAVFeedForwarder.t.sol",
+      "element": "ConstantMetadataWrapper"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/NAVFeedForwarder.t.sol",
       "element": "MockFutureDatedOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/NAVFeedForwarder.t.sol",
+      "element": "UnprobedPathWrapper"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "CallerBackReferenceOracle"
     },
     {
       "check": "missing-inheritance",
@@ -140,6 +155,11 @@
       "check": "missing-inheritance",
       "file": "contracts/test/SanctionsOracleMirror.t.sol",
       "element": "SelectiveRevertingOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "SelectiveRouter"
     },
     {
       "check": "naming-convention",
