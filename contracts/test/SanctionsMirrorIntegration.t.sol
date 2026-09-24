@@ -130,16 +130,31 @@ contract SanctionsMirrorIntegrationTest is Test {
     }
 
     /// Mint and burn are deliberately NOT screened (`_update` skips a zero counterparty), so
-    /// issuance and redemption survive a bricked oracle. That is a designed exemption rather
-    /// than an accident, and it is what keeps a compliance outage from also trapping the
-    /// custodian's own position — worth pinning here, where the oracle is genuinely broken,
-    /// and not only in the unit test that asserts it against an unset list.
+    /// issuance and the custodian's own supply management survive a bricked oracle — worth
+    /// pinning here, where the oracle is genuinely broken, not only against an unset list.
+    ///
+    /// Since FIND-027 the burn is a self-burn, as the redemption path always was. Note what
+    /// this does NOT claim: the AP's transfer IN is screened, so a bricked oracle still
+    /// stalls redemption at that step. The exemption only keeps units already held here
+    /// from being stranded.
     function test_mintAndBurn_surviveABrickedUpstream() public {
         SelectiveRevertingOracle bad = new SelectiveRevertingOracle();
         vm.prank(complianceSafe);
         mirror.setForwardingOracle(address(bad));
 
-        token.mint(alice, 1e18);
+        token.mint(address(this), 1e18);
+        token.burn(address(this), 1e18);
+        assertEq(token.balanceOf(address(this)), 0);
+        assertEq(token.balanceOf(alice), 1_000e18);
+    }
+
+    /// The counterpart: `burn` rejects a third-party `from` whatever the oracle is doing.
+    function test_burn_cannotReachAHolder_evenWithABrickedUpstream() public {
+        SelectiveRevertingOracle bad = new SelectiveRevertingOracle();
+        vm.prank(complianceSafe);
+        mirror.setForwardingOracle(address(bad));
+
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, alice));
         token.burn(alice, 1e18);
         assertEq(token.balanceOf(alice), 1_000e18);
     }

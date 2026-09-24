@@ -8,7 +8,7 @@ pragma solidity =0.8.28;
 /// @dev    Deliberately minimal — everything else `IssuanceManager` needs from a token
 ///         it reaches through `IERC20`. `mint` is `MINTER_ROLE`-gated and `burn` is
 ///         `BURNER_ROLE`-gated; both skip sanctions screening by design (APs are
-///         pre-screened off-chain).
+///         pre-screened off-chain, and `burn` only reaches the caller's own balance).
 interface IGyldBondToken {
     /// @notice Mint `amount` tokens to `to`. `MINTER_ROLE` on the token.
     /// @dev    ALSO `whenNotPaused` on the token (audit FIND-005). That pause is independent
@@ -25,6 +25,8 @@ interface IGyldBondToken {
     /// @dev    ALSO `whenNotPaused` on the token (audit FIND-005) — see {mint}. `redeem`
     ///         carries no pause of its own, so on that path the token's is the only one in
     ///         play and `EnforcedPause()` is unambiguous by elimination.
+    ///         `from` MUST be the caller, else `CannotBurnFromOtherAccount` (audit FIND-027).
+    ///         `redeem` complies: the AP transfers in first, so it burns its own balance.
     function burn(address from, uint256 amount) external;
 
     /// @notice Unix maturity of the series, or 0 for an open-ended series.

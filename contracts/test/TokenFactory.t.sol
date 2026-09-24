@@ -1266,10 +1266,20 @@ contract GyldBondTokenUnitTest is Test {
     }
 
     function test_burn_zeroAmount_reverts() public {
-        _mint(alice, 100e18);
+        // Self-burn — the `from` check runs before the amount guard (FIND-027).
+        _mint(burner, 100e18);
         vm.prank(burner);
         vm.expectRevert(GyldBondToken.ZeroAmount.selector);
-        token.burn(alice, 0);
+        token.burn(burner, 0);
+    }
+
+    /// audit FIND-027 — BURNER_ROLE cannot destroy a balance it does not hold.
+    function test_burn_fromAnotherAccount_reverts() public {
+        _mint(alice, 100e18);
+        vm.prank(burner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, alice));
+        token.burn(alice, 100e18);
+        assertEq(token.balanceOf(alice), 100e18);
     }
 
     function test_burn_zeroAddress_reverts() public {

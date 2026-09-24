@@ -388,26 +388,50 @@ contract GyldBondTokenTest is Test {
         assertEq(token.balanceOf(ap), 1_000e18, "tokens were burned despite no BURNER_ROLE");
     }
 
-    /// Property B: BURNER_ROLE can burn from any address without that address's allowance.
-    /// This is intentional: forced redemption is a compliance requirement for regulated bonds.
-    function test_burn_burnerRole_fromArbitraryAddress_noAllowanceNeeded() public {
+    /// Property B: BURNER_ROLE is NOT a clawback — `burn` requires `from == msg.sender`
+    /// (audit FIND-027). This asserted the opposite until the Information Memorandum
+    /// settled it: forced redemption is a capability the contract must NOT have.
+    function test_burn_burnerRole_cannotReachAnotherHoldersBalance() public {
         // Mint tokens to ap.
         vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
 
-        // ap has NOT approved directBurner — zero allowance.
         address directBurner = address(0xB1);
 
         // Cache role bytes before pranking — prank is consumed by the first external call,
         // so calling token.BURNER_ROLE() inside vm.prank would consume the prank on the getter.
         bytes32 burnerRole = token.BURNER_ROLE();
         vm.prank(admin); token.grantRole(burnerRole, directBurner);
-        assertEq(token.allowance(ap, directBurner), 0, "allowance should be zero");
 
-        // BURNER_ROLE burns from ap — no allowance check, no approval needed.
+        // The role alone does not reach ap's balance.
         vm.prank(directBurner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
         token.burn(ap, 500e18);
 
-        assertEq(token.balanceOf(ap), 500e18, "burn amount wrong");
+        // Nor the role PLUS a full allowance — `burn` never consults allowances.
+        vm.prank(ap); token.approve(directBurner, type(uint256).max);
+        vm.prank(directBurner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 500e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "a holder's balance was destroyed by BURNER_ROLE");
+    }
+
+    /// The other half: a BURNER_ROLE holder CAN destroy what it owns — the redemption path.
+    function test_burn_burnerRole_burnsItsOwnBalance() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        address directBurner = address(0xB1);
+        bytes32 burnerRole = token.BURNER_ROLE();
+        vm.prank(admin); token.grantRole(burnerRole, directBurner);
+
+        vm.prank(ap); token.transfer(directBurner, 500e18);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.prank(directBurner); token.burn(directBurner, 500e18);
+
+        assertEq(token.balanceOf(directBurner), 0,                  "burner kept units it destroyed");
+        assertEq(token.balanceOf(ap),           500e18,             "ap balance wrong");
+        assertEq(token.totalSupply(),           supplyBefore - 500e18, "supply not reduced");
     }
 
     /// Revoking BURNER_ROLE immediately removes the ability to burn.
@@ -418,9 +442,12 @@ contract GyldBondTokenTest is Test {
         bytes32 burnerRole = token.BURNER_ROLE();
         vm.prank(admin); token.grantRole(burnerRole, directBurner);
 
+        // Position the units on the burner — it can only destroy its own balance.
+        vm.prank(ap); token.transfer(directBurner, 200e18);
+
         // Burn works with the role.
-        vm.prank(directBurner); token.burn(ap, 100e18);
-        assertEq(token.balanceOf(ap), 900e18);
+        vm.prank(directBurner); token.burn(directBurner, 100e18);
+        assertEq(token.balanceOf(directBurner), 100e18);
 
         // Role is revoked.
         vm.prank(admin); token.revokeRole(burnerRole, directBurner);
@@ -428,7 +455,79 @@ contract GyldBondTokenTest is Test {
         // Burn now reverts.
         vm.prank(directBurner);
         vm.expectRevert();
-        token.burn(ap, 100e18);
+        token.burn(directBurner, 100e18);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // audit FIND-027 — supply destruction cannot reach a balance it does not own
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// TEST-78. `burn` moved a balance unscreened; the fix removes the capability rather
+    /// than screening it, so no unscreened third-party destruction is left to screen.
+    function test_burn_fromAnotherAccount_reverts_FIND027() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        // The production burner — the only address holding the role today.
+        vm.prank(address(mgr));
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "IssuanceManager reached a holder's balance");
+    }
+
+    /// The escalation the finding is really about: admin can grant itself BURNER_ROLE and
+    /// still cannot touch a holder. Only a proxy upgrade could change that.
+    function test_burn_adminSelfGrantingBurnerRole_stillCannotClawBack() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        bytes32 burnerRole = token.BURNER_ROLE();
+        vm.prank(admin); token.grantRole(burnerRole, admin);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1_000e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "admin clawed back a holder's balance");
+    }
+
+    /// A sanctioned holder is frozen, not expropriated — `_update` blocks its transfers and
+    /// `burn` cannot destroy it. Any future seizure power needs its own role, not this one.
+    function test_burn_sanctionedHolder_balanceCannotBeDestroyed() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = ap;
+        mockSanctions.addToSanctionsList(addrs);
+
+        vm.prank(address(mgr));
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1_000e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "sanctioned balance was destroyed, not frozen");
+    }
+
+    /// No screening crept in by the back door: a self-burn succeeds while the caller is
+    /// listed. D-38 liveness — IssuanceManager's own position must never be stranded.
+    function test_burn_selfBurn_succeedsWhileCallerIsSanctioned() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+        vm.prank(ap); token.transfer(address(mgr), 400e18);
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = address(mgr);
+        mockSanctions.addToSanctionsList(addrs);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.prank(address(mgr)); token.burn(address(mgr), 400e18);
+
+        assertEq(token.balanceOf(address(mgr)), 0, "self-burn blocked by the caller's own listing");
+        assertEq(token.totalSupply(), supplyBefore - 400e18, "supply not reduced");
+    }
+
+    /// The zero-address guard still fires first, so `burn(0, x)` keeps its existing error.
+    function test_burn_zeroAddress_stillReportsZeroAddress() public {
+        vm.prank(address(mgr));
+        vm.expectRevert(GyldBondToken.ZeroAddress.selector);
+        token.burn(address(0), 1e18);
     }
 
     // ── initialize sanctions oracle probe (M-04) ──────────────────────────────

@@ -159,6 +159,11 @@ assertions that abort the deployment on a mismatch. See
   (`IssuanceManager` pre-screens APs off-chain) but still respect `whenNotPaused` — a
   paused token blocks `subscribe` and `redeem`, raising `EnforcedPause()` on the token
   (FIND-005; see `IGyldBondToken` and the runbook).
+- **No clawback.** `burn` destroys only the caller's own balance — `from` must equal
+  `msg.sender` — so no holder of `BURNER_ROLE`, now or later, can remove another
+  address's tokens, sanctioned or not. This is an Information Memorandum requirement,
+  and it is why the burn path needs no sanctions screening (FIND-027; D-39 in
+  `docs/ARCHITECTURE.md` §17.1).
 - **Pause:** `PAUSER_ROLE` halts mint, burn, transfer, transferFrom, approve and
   permit. Note that a pause also freezes DeFi liquidations.
 - **AP whitelist:** only whitelisted addresses may receive primary issuance or be a

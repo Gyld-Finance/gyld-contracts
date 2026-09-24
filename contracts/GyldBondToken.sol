@@ -40,12 +40,14 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 ///   - The check is fail-closed: if the oracle call reverts, or the oracle address is
 ///     unset, the transfer reverts. There is no path on which screening is skipped.
 ///   - Mint and burn skip the sanctions check — IssuanceManager pre-screens APs off-chain.
+///     Burn only reaches the caller's own balance, so nothing unscreened is ever taken
+///     from a third party (audit FIND-027).
 ///   - No internal blocklist — sanctioning decisions are made by Chainalysis, not the platform.
 ///
 /// Roles:
 ///   DEFAULT_ADMIN_ROLE — grants / revokes all other roles; should be a TimelockController
 ///   MINTER_ROLE        — IssuanceManager only
-///   BURNER_ROLE        — IssuanceManager only
+///   BURNER_ROLE        — IssuanceManager only; may burn ONLY from its own balance
 ///   PAUSER_ROLE        — ops multisig (separate signer set from governance)
 ///   DOCUMENT_ROLE      — ops multisig, for ERC-1643 document set/remove (operational, not a
 ///                        governance event — decisions recorded on GLD-264)
@@ -97,6 +99,7 @@ contract GyldBondToken is
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
     error CannotRemoveLastAdmin(); // audit FIND-007
+    error CannotBurnFromOtherAccount(address from); // audit FIND-027
     error NotValidSanctionsList(address addr);
     error SanctionsListNotSet();
     error EmptyDocumentName();
@@ -189,6 +192,8 @@ contract GyldBondToken is
     /// Sanctions check at the _update layer — the single funnel for ALL balance
     /// changes in OZ v5 (transfer, mint, burn). Mint (from == 0) and burn (to == 0)
     /// are intentionally skipped; IssuanceManager pre-screens APs off-chain.
+    /// Safe by construction, not by deployment (FIND-027): `burn` requires
+    /// `from == msg.sender`, so the unscreened side is always the caller's own.
     function _update(address from, address to, uint256 value) internal override {
         if (from != address(0) && to != address(0)) {
             _requireAccess(from);
@@ -236,8 +241,12 @@ contract GyldBondToken is
     }
 
     /// Burn `amount` tokens from `from`.
+    /// @dev `from` MUST be the caller (audit FIND-027) — no clawback of a Holder's units,
+    ///      per the Information Memorandum; a sanctioned balance is frozen, never destroyed.
+    ///      Redemption is unaffected: `IssuanceManager.redeem` burns its own balance. D-39.
     function burn(address from, uint256 amount) external onlyRole(BURNER_ROLE) whenNotPaused {
         if (from == address(0)) revert ZeroAddress();
+        if (from != _msgSender()) revert CannotBurnFromOtherAccount(from);
         if (amount == 0) revert ZeroAmount();
         _burn(from, amount);
     }
