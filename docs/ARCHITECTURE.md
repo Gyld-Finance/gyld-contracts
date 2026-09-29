@@ -1023,9 +1023,9 @@ across deregistrations** (invariant I-24).
 > **A paused bond token blocks deregistration too, while a residual exists.** The
 > sweep is a token `transfer`, which a paused bond token blocks (see *Treasury
 > withdrawal* below), so the retirement of a matured series reverts `EnforcedPause`
-> — via the timelock, 48 h after the proposal. Unpause the token (its timelock)
-> first, or put the unpause ahead of `deregisterSeries` in the same batched proposal.
-> Check `token.paused()` before proposing.
+> — via the timelock, 48 h after the proposal. Have the token unpaused
+> (`PAUSER_ROLE`) when the proposal executes, and check `token.paused()` before
+> proposing.
 
 #### Treasury withdrawal
 
