@@ -3,7 +3,8 @@
 This file is the **only** authoritative list of Gyld contracts on public chains.
 Every row below was verified directly against the chain with `cast code` /
 `cast call` on **2026-08-04** (Sepolia head ~11,416,602; BSC testnet head
-~123,091,110). If an address is not in this file, do not send
+~123,091,110) — **except the Hoodi section, which is transcribed from deploy config
+and marked as such**. If an address is not in this file, do not send
 funds to it, approve it, or wire it into a config.
 
 Deployer EOA for everything below: `0xcEae7F1093762C75fdbC2B95FAcE3dE954b9FEAd`.
@@ -96,6 +97,35 @@ script is not in the tree — the source is preserved by the tag
 | SanctionsOracleMirror | `0x3ed17C11D29384d3E7e4BEC8fFA58D63C21Cf584` | 46050ea | DEFAULT_ADMIN_ROLE and SANCTIONS_UPDATER_ROLE both = deployer EOA (role-gated, unlike the Sepolia mock) | Unknown — BscScan needs `ETHERSCAN_API_KEY`; no Blockscout instance | live (test) |
 | GyldBondToken implementation (ERC-8056) | `0x27faeeAAE973c374B5C477e0187C73f10A47E608` | 46050ea | — | Unknown (same) | live (test) |
 | GBSCD "Gyld BSC Demo Bond" (ERC1967 proxy) | `0x7D7B5bE30bfe7A1941c60247b4D5A28ab266305a` | 46050ea | DEFAULT_ADMIN_ROLE = deployer EOA | Unknown (same) | **do-not-reuse** — experimental ERC-8056 demo proxy |
+
+---
+
+## Ethereum Hoodi (chainId 560048) — Kaleidoscope UAT
+
+> **From deploy config, not verified on-chain.** Unlike every section above, nothing
+> here was checked with `cast`. Each row is transcribed from the Kaleidoscope repo's
+> UAT deploy config (`scripts/deploy/deploy-uat.sh`, `docker-compose.uat.yml`) as of
+> 2026-09-29 (GLD-682). Verify against the chain before relying on any of it.
+
+Most UAT contract addresses are **not in any repository**: the deploy reads them from
+AWS Secrets Manager (`kaleidoscope/uat/<name>`), so they cannot be recorded here from
+source. Recording them — verified on-chain, with role holders — is still open.
+
+| Item | Address / value | Privileged roles | Source | Status |
+|---|---|---|---|---|
+| TokenFactory | secret `evm-factory-address` | — | `deploy-uat.sh:261` | unknown from repo |
+| IssuanceManager (proxy) | secret `evm-issuance-manager` | `SUBSCRIBER_ROLE` = Fordefi "Subscriber" vault (`FORDEFI_SUBSCRIBER_EVM_ADDRESS`, secret); `REDEEMER_ROLE` = Fordefi "Redeemer" vault (`FORDEFI_REDEEMER_EVM_ADDRESS`, secret) | `deploy-uat.sh:262`; `docker-compose.uat.yml:426,430` | unknown from repo |
+| GyldAtomicSwap (proxy) | secret `evm-atomic-swap-address` | `QUOTE_SIGNER_ROLE` **and** `ALLOWLIST_ADMIN_ROLE` = `0xea40393bd4d52fc703e59c69a8aa604e4c77883a` (KMS `alias/kaleidoscope-dev-platform-signer`, **the same key DEV uses** — owner decision GLD-287); `DEFAULT_ADMIN_ROLE` = "the timelock" (address not in repo) | `deploy-uat.sh:263,273-290` | the same file also says, as of 2026-08-20, that this secret had not been created and the swap feature was inactive (`deploy-uat.sh:574-575`) — the two notes conflict |
+| GyldAtomicSwap `withdrawalWallet` (intended) | `0xAEE38E74412E1dee48E9192a4EE54a7bC5364E3B` (Fordefi "UAT Swap Distribution") | — | `deploy-uat.sh:582` | documented as interim and **not yet set on-chain** |
+| Sanctions oracle | secret `chainalysis-sanctions-contract` | — | `deploy-uat.sh:328` | unknown from repo |
+| USDC | `0xF897992D06149AaD05e84053614aF53d8F8BeC92` | — | `deploy-uat.sh:327` | the one UAT transacts with; a second Hoodi USDC (`0x557c63b7…`) exists in older Kaleidoscope docs and is **not** the one in use |
+| First `TokenRegistered` block | `3318492` | — | `deploy-uat.sh:296` | lower bound for the factory's first series |
+
+**Hoodi takes the production path in the deploy scripts.** `DeployGuards.isDevChain`
+allowlists only Anvil and Sepolia, so every production guard applies on 560048 —
+including, since GLD-682, `requireDistinct(QUOTE_SIGNER, ALLOWLIST_ADMIN)` in
+`DeployAtomicSettlement`. The UAT topology above (one key holding both) could not be
+redeployed with the current script; a UAT redeploy needs two distinct keys.
 
 ---
 
