@@ -46,6 +46,10 @@ library DeployGuards {
     uint256 internal constant ANVIL_CHAIN_ID = 31337;
     /// The single supported public testnet (docs/ARCHITECTURE.md).
     uint256 internal constant SEPOLIA_CHAIN_ID = 11155111;
+    /// Public testnets that are NOT dev chains (the production guards still apply) but
+    /// on which key-sharing owner decisions are tolerated — see {isTestnet}.
+    uint256 internal constant HOODI_CHAIN_ID = 560048;
+    uint256 internal constant BSC_TESTNET_CHAIN_ID = 97;
 
     /// Minimum TimelockController delay on any production chain.
     uint256 internal constant MIN_PROD_TIMELOCK_DELAY = 48 hours;
@@ -84,6 +88,14 @@ library DeployGuards {
     ///         do not exist yet — is treated as production and gets the strict path.
     function isDevChain() internal view returns (bool) {
         return block.chainid == ANVIL_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID;
+    }
+
+    /// @notice True for the dev chains plus the public testnets Hoodi (Kaleidoscope UAT)
+    ///         and BSC testnet. Narrower exemption than {isDevChain}: it only waives
+    ///         guards that protect mainnet funds from an owner-accepted testnet topology.
+    /// @dev    ALLOWLIST too — an unlisted chain is treated as a production mainnet.
+    function isTestnet() internal view returns (bool) {
+        return isDevChain() || block.chainid == HOODI_CHAIN_ID || block.chainid == BSC_TESTNET_CHAIN_ID;
     }
 
     /// @notice Reverts unless the current chain is a development chain.

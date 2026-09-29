@@ -32,6 +32,10 @@ contract GuardsHarness {
         return DeployGuards.isDevChain();
     }
 
+    function isTestnet() external view returns (bool) {
+        return DeployGuards.isTestnet();
+    }
+
     function saltFor(string memory name) external view returns (bytes32) {
         return DeployGuards.saltFor(name);
     }
@@ -111,6 +115,27 @@ contract DeployGuardsTest is Test {
     function _isDev(uint256 chainId) internal returns (bool) {
         vm.chainId(chainId);
         return harness.isDevChain();
+    }
+
+    /// GLD-682: the testnet exemption (used for the GLD-287 shared swap key) is an
+    /// allowlist of exactly the dev chains plus Hoodi and BSC testnet. Every mainnet,
+    /// every other testnet and every unknown chain stays strict.
+    function test_isTestnet_isAnAllowlist() public {
+        uint256[4] memory testnets = [uint256(31337), 11155111, 560048, 97];
+        for (uint256 i = 0; i < testnets.length; i++) {
+            vm.chainId(testnets[i]);
+            assertTrue(harness.isTestnet(), string.concat("chainId ", vm.toString(testnets[i]), " is a testnet"));
+        }
+        uint256[8] memory mainnets = [uint256(1), 8453, 42161, 10, 137, 56, 84532, 999_999_999];
+        for (uint256 i = 0; i < mainnets.length; i++) {
+            vm.chainId(mainnets[i]);
+            assertFalse(
+                harness.isTestnet(), string.concat("chainId ", vm.toString(mainnets[i]), " must be treated as mainnet")
+            );
+        }
+        // Hoodi is exempt from this one guard only, not promoted to a dev chain.
+        vm.chainId(560048);
+        assertFalse(harness.isDevChain(), "Hoodi keeps the production path for every other guard");
     }
 }
 
@@ -206,6 +231,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_atomic_cosmeticZeroDelayTimelock);
         _run(this.reject_atomic_deployerIsSoleProposer);
         _run(this.reject_atomic_quoteSignerEqualsAllowlistAdmin);
+        _run(this.accept_atomic_sharedQuoteSignerAndAllowlistAdminOnHoodi);
         _run(this.accept_atomic_productionHappyPath);
 
         // ── DeployNAVFeed ─────────────────────────────────────────────────────
@@ -539,7 +565,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 
     /// Catches (GLD-682, audit L-6): one key holding both QUOTE_SIGNER_ROLE and
     /// ALLOWLIST_ADMIN_ROLE can allowlist an attacker taker and sign band-edge quotes
-    /// for it. Tolerated on dev chains (GLD-287), refused on production.
+    /// for it. Tolerated on testnets incl. Hoodi (GLD-287), refused on mainnet.
     function reject_atomic_quoteSignerEqualsAllowlistAdmin() external {
         vm.chainId(PROD_L2);
         _atomicProdEnv();
@@ -548,6 +574,22 @@ contract DeployScriptsTest is ScriptRevertAsserts {
             address(new DeployAtomicSettlement()),
             "QUOTE_SIGNER and ALLOWLIST_ADMIN must be different addresses on production"
         );
+    }
+
+    /// The GLD-287 UAT topology — one KMS key as both QUOTE_SIGNER and ALLOWLIST_ADMIN —
+    /// still deploys on Hoodi, with every other production guard applied.
+    function accept_atomic_sharedQuoteSignerAndAllowlistAdminOnHoodi() external {
+        vm.chainId(560048);
+        _atomicProdEnv();
+        _setAddr("ALLOWLIST_ADMIN", QUOTE_SIGNER);
+
+        DeployAtomicSettlement script = new DeployAtomicSettlement();
+        script.run();
+
+        address swap = address(script.swap());
+        assertTrue(_hasRole(swap, keccak256("QUOTE_SIGNER_ROLE"), QUOTE_SIGNER), "quote signer role");
+        assertTrue(_hasRole(swap, keccak256("ALLOWLIST_ADMIN_ROLE"), QUOTE_SIGNER), "same key holds allowlist admin");
+        assertTrue(_hasRole(swap, bytes32(0), script.timelockAddress()), "timelock is still swap admin");
     }
 
     function accept_atomic_productionHappyPath() external {

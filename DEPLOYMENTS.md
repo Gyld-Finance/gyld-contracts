@@ -122,10 +122,10 @@ source. Recording them — verified on-chain, with role holders — is still ope
 | First `TokenRegistered` block | `3318492` | — | `deploy-uat.sh:296` | lower bound for the factory's first series |
 
 **Hoodi takes the production path in the deploy scripts.** `DeployGuards.isDevChain`
-allowlists only Anvil and Sepolia, so every production guard applies on 560048 —
-including, since GLD-682, `requireDistinct(QUOTE_SIGNER, ALLOWLIST_ADMIN)` in
-`DeployAtomicSettlement`. The UAT topology above (one key holding both) could not be
-redeployed with the current script; a UAT redeploy needs two distinct keys.
+allowlists only Anvil and Sepolia, so the production guards apply on 560048. The one
+exception is `requireDistinct(QUOTE_SIGNER, ALLOWLIST_ADMIN)` (GLD-682), which is
+mainnet-only (`DeployGuards.isTestnet` exempts Hoodi and BSC testnet), so the shared-key
+UAT topology above (GLD-287) still redeploys.
 
 ---
 
