@@ -109,7 +109,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   export OPS_MULTISIG=<gnosis_safe_address>
 ///   export TREASURER_ADDRESS=<ops_mpc_address>
 ///   export QUOTE_SIGNER=<kms_signer_address>
-///   export ALLOWLIST_ADMIN=<kms_swap_admin_address>
+///   export ALLOWLIST_ADMIN=<kms_swap_admin_address>   # must differ from QUOTE_SIGNER:
+///                                                    # Hoodi takes the production path
 ///   export WITHDRAWAL_WALLET=<treasury_safe>
 ///   export EVM_FACTORY_ADDRESS=<factory>
 ///   export SERIES_TOKENS=<token0>,<token1>
@@ -216,6 +217,9 @@ contract DeployAtomicSettlement is Script {
         DeployGuards.requireNotDeployer(c.quoteSigner, c.deployer, "QUOTE_SIGNER");
         DeployGuards.requireNotDeployer(c.allowlistAdmin, c.deployer, "ALLOWLIST_ADMIN");
         DeployGuards.requireNotDeployer(c.withdrawal, c.deployer, "WITHDRAWAL_WALLET");
+        // One key with both roles can allowlist an attacker taker and sign band-edge
+        // quotes for it (GLD-682). Shared on dev chains by owner decision (GLD-287).
+        DeployGuards.requireDistinct(c.quoteSigner, c.allowlistAdmin, "QUOTE_SIGNER", "ALLOWLIST_ADMIN");
 
         c.maxBps = uint16(_envOrUint("MAX_QUOTE_DEVIATION_BPS", 200));
         c.maxNavAge = uint32(_envOrUint("MAX_NAV_AGE_SECS", 86400));

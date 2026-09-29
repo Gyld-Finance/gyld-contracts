@@ -205,6 +205,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _run(this.reject_atomic_treasurerIsTheDeployer);
         _run(this.reject_atomic_cosmeticZeroDelayTimelock);
         _run(this.reject_atomic_deployerIsSoleProposer);
+        _run(this.reject_atomic_quoteSignerEqualsAllowlistAdmin);
         _run(this.accept_atomic_productionHappyPath);
 
         // ── DeployNAVFeed ─────────────────────────────────────────────────────
@@ -533,6 +534,19 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _setAddr("TIMELOCK_ADDRESS", address(_timelock(48 hours, DEFAULT_SENDER)));
         _expectRunRevert(
             address(new DeployAtomicSettlement()), "holds PROPOSER_ROLE on the timelock - the handover is cosmetic"
+        );
+    }
+
+    /// Catches (GLD-682, audit L-6): one key holding both QUOTE_SIGNER_ROLE and
+    /// ALLOWLIST_ADMIN_ROLE can allowlist an attacker taker and sign band-edge quotes
+    /// for it. Tolerated on dev chains (GLD-287), refused on production.
+    function reject_atomic_quoteSignerEqualsAllowlistAdmin() external {
+        vm.chainId(PROD_L2);
+        _atomicProdEnv();
+        _setAddr("ALLOWLIST_ADMIN", QUOTE_SIGNER);
+        _expectRunRevert(
+            address(new DeployAtomicSettlement()),
+            "QUOTE_SIGNER and ALLOWLIST_ADMIN must be different addresses on production"
         );
     }
 
