@@ -669,6 +669,34 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.stopPrank();
     }
 
+    /// Regression for GLD-661 H-1 (tracked as GLD-682): the audit's exploit, replayed
+    /// end to end. A compromised owner key appoints a second address it controls as
+    /// emergency updater, and that address then pushes any price. Both steps must fail,
+    /// and the stored answer must stay where the guarded path left it.
+    function test_GLD682_ownerKeyCannotBypassCircuitBreakers() public {
+        address attacker2 = makeAddr("attackerEOA2");
+        vm.warp(1_800_000_000);
+        vm.prank(owner);
+        feed.updateAnswer(100e8);
+
+        // Even with the interval satisfied, the owner key alone is held to the band.
+        vm.warp(1_800_003_600);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, 150e8, 100e8));
+        feed.updateAnswer(150e8);
+
+        vm.prank(owner);
+        (bool appointed,) = address(feed).call(abi.encodeWithSignature("setEmergencyUpdater(address)", attacker2));
+        assertFalse(appointed, "owner key must not be able to appoint an emergency updater");
+
+        vm.prank(attacker2);
+        (bool pushed,) = address(feed).call(abi.encodeWithSignature("emergencyUpdateAnswer(int256)", int256(1_000_000e8)));
+        assertFalse(pushed, "no second key may push a price past the breakers");
+
+        (, int256 answer,,,) = feed.latestRoundData();
+        assertEq(answer, 100e8, "the stored answer is unchanged");
+    }
+
     /// Every price push emits exactly one event, and it is always `AnswerUpdated` —
     /// there is no second, privileged price event for monitoring to have to watch.
     function test_updateAnswer_emitsOnlyAnswerUpdated() public {
