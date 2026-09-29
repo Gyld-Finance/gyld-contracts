@@ -1011,20 +1011,20 @@ decimals, pushes `token` onto `seriesList` if new, and sets
 `registeredSeries` / `navForwarderOf`. Re-registering an active series just
 updates its forwarder — which is also the escape hatch if a forwarder is bricked.
 
-`deregisterSeries(token)` reverts `SeriesNotEmpty` while the contract still holds
-any balance of the series: silently orphaning inventory that can no longer be
-priced or served is unsafe. It swap-and-pops `seriesList` and deletes both
+`deregisterSeries(token)` sweeps any balance of the series the contract still
+holds to the admin-fixed `withdrawalWallet` in the same call (emitting `Withdrawn`),
+so inventory that can no longer be priced or served is never orphaned, and a 1-wei
+donation cannot block a retirement (GLD-682; it used to revert `SeriesNotEmpty`,
+which anyone could trigger with dust). Like `withdraw`, a residual reverts
+`ZeroAddress` while `withdrawalWallet` is unset. It swap-and-pops `seriesList` and deletes both
 mappings. The list is **not** externally observable, and **order is not stable
 across deregistrations** (invariant I-24).
 
-> **A paused bond token blocks deregistration too.** The only way to reach
-> `balanceOf(swap) == 0` is `withdraw`, and `withdraw` is precisely what a paused
-> bond token blocks (see *Treasury withdrawal* below). So a token pause silently
-> gates this second, unrelated admin operation: the retirement of a matured series
-> fails with a bare `SeriesNotEmpty(token)` that names the balance, not the pause
-> that is actually preventing you from clearing it — and via the timelock, 48 h
-> after the proposal. The runbook's unpause → withdraw → re-pause sequence is
-> therefore a **precondition for deregistration**, not just an evacuation remedy.
+> **A paused bond token blocks deregistration too, while a residual exists.** The
+> sweep is a token `transfer`, which a paused bond token blocks (see *Treasury
+> withdrawal* below), so the retirement of a matured series reverts `EnforcedPause`
+> — via the timelock, 48 h after the proposal. Unpause the token (its timelock)
+> first, or put the unpause ahead of `deregisterSeries` in the same batched proposal.
 > Check `token.paused()` before proposing.
 
 #### Treasury withdrawal
@@ -1058,8 +1058,7 @@ Three deliberate properties:
   the token's `_update` (which carries only the sanctions check; the pause gate never
   reaches it). Easy to misattribute from a bare `cast` error. USDC has no pause and
   evacuates normally with both switches pulled. This also gates `deregisterSeries`,
-  which needs `balanceOf(swap) == 0` and so cannot succeed until the token is
-  unpaused long enough to withdraw — see *Series registration* above.
+  whose residual sweep is the same transfer — see *Series registration* above.
 
   This is a **design requirement, not a gap**. A pause that inventory can be moved
   through is not a pause; the token's pause is the stronger statement and is meant

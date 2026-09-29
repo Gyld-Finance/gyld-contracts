@@ -262,7 +262,6 @@ contract GyldAtomicSwap is
     ///      "unset — fall back to DEFAULT_MAX_QUOTE_TTL", not zero seconds.
     error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
-    error SeriesNotEmpty(address token);
     // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
     // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
@@ -630,22 +629,21 @@ contract GyldAtomicSwap is
     }
 
     /// @notice Deregister a matured bond series.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Reverts SeriesNotEmpty while this
-    ///         contract still holds inventory of the series — silently orphaning
-    ///         inventory that can no longer be priced or served is unsafe. Wind the
-    ///         series down first (withdraw the remaining balance).
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Any balance of the series still held
+    ///         here is swept to the admin-fixed withdrawalWallet in the same call (and
+    ///         emits Withdrawn), so inventory that can no longer be priced or served is
+    ///         never orphaned, and a 1-wei donation cannot block retirement (GLD-682).
+    ///         Like withdraw(), a residual reverts ZeroAddress while withdrawalWallet is
+    ///         unset.
     ///
-    ///         A PAUSED bond token blocks this call. Clearing the balance requires
-    ///         withdraw(), which a paused token blocks (see withdraw below), so the
-    ///         revert you get is SeriesNotEmpty — naming the balance, not the pause
-    ///         that is stopping you from clearing it. Check token.paused() before
-    ///         opening the timelock proposal; see the runbook's "Evacuating a paused
-    ///         bond token".
+    ///         A PAUSED bond token blocks this call while a residual exists: the sweep
+    ///         is a token transfer, so it reverts EnforcedPause. Check token.paused()
+    ///         before opening the timelock proposal; see the runbook's "Evacuating a
+    ///         paused bond token".
     /// @param token Registered bond series to remove.
-    function deregisterSeries(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function deregisterSeries(address token) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();
         if (!$.registeredSeries[token]) revert UnregisteredSeries(token);
-        if (IERC20(token).balanceOf(address(this)) != 0) revert SeriesNotEmpty(token);
         uint256 n = $.seriesList.length;
         for (uint256 i = 0; i < n;) {
             if ($.seriesList[i] == token) {
@@ -660,6 +658,13 @@ contract GyldAtomicSwap is
         delete $.registeredSeries[token];
         delete $.navForwarderOf[token];
         emit SeriesDeregistered(token);
+
+        uint256 residual = IERC20(token).balanceOf(address(this));
+        if (residual == 0) return;
+        address to = $.withdrawalWallet;
+        if (to == address(0)) revert ZeroAddress();
+        IERC20(token).safeTransfer(to, residual);
+        emit Withdrawn(token, to, residual);
     }
 
     // ── Admin: band params, allowlist, withdrawal wallet ──────────────────────

@@ -883,10 +883,66 @@ contract GyldAtomicSwapTest is Test {
         swap.registerSeries(address(0xD00D), address(navFeed));
     }
 
-    function test_deregisterSeries_nonEmpty_reverts() public {
+    /// GLD-682 (audit L-5): a non-empty series no longer blocks deregistration — the
+    /// residual is swept to the admin-fixed withdrawalWallet in the same call, so it is
+    /// never orphaned and never goes anywhere withdraw() could not have sent it.
+    function test_deregisterSeries_nonEmpty_sweepsResidualToWithdrawalWallet() public {
         // The swap still holds 1_000e18 of the series from setUp.
+        vm.expectEmit(address(swap));
+        emit GyldAtomicSwap.Withdrawn(address(token), wallet, 1_000e18);
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.SeriesNotEmpty.selector, address(token)));
+        swap.deregisterSeries(address(token));
+
+        assertEq(token.balanceOf(address(swap)), 0, "swap holds none of the retired series");
+        assertEq(token.balanceOf(wallet), 1_000e18, "residual lands in the withdrawalWallet");
+        assertFalse(swap.registeredSeries(address(token)));
+    }
+
+    /// The audit's grief: withdraw everything, then anyone donates 1 wei before the
+    /// timelocked deregistration executes. It must still succeed.
+    function test_deregisterSeries_dustDonation_cannotGrief() public {
+        vm.prank(treasurer);
+        swap.withdraw(address(token), 1_000e18);
+        vm.prank(taker);
+        token.transfer(address(swap), 1);
+
+        vm.prank(admin);
+        swap.deregisterSeries(address(token));
+
+        assertFalse(swap.registeredSeries(address(token)), "dust must not block retirement");
+        assertEq(token.balanceOf(wallet), 1_000e18 + 1, "the dust is swept with the rest");
+    }
+
+    /// Fail-closed like withdraw(): a residual with no withdrawalWallet set reverts
+    /// rather than being stranded or sent to address(0).
+    function test_deregisterSeries_residualWithoutWithdrawalWallet_reverts() public {
+        GyldAtomicSwap fresh = GyldAtomicSwap(
+            address(
+                new ERC1967Proxy(
+                    address(new GyldAtomicSwap()),
+                    abi.encodeCall(
+                        GyldAtomicSwap.initialize,
+                        (admin, pauser, signer, treasurer, address(usdc), MAX_BPS, MAX_NAV_AGE)
+                    )
+                )
+            )
+        );
+        vm.prank(admin);
+        fresh.registerSeries(address(token), address(navFeed));
+        token.mint(address(fresh), 1);
+
+        vm.prank(admin);
+        vm.expectRevert(GyldAtomicSwap.ZeroAddress.selector);
+        fresh.deregisterSeries(address(token));
+    }
+
+    /// A paused bond token still wins: the sweep is a token transfer, so it reverts
+    /// with EnforcedPause — now naming the actual obstacle.
+    function test_deregisterSeries_residualOfPausedToken_reverts() public {
+        vm.prank(pauser);
+        token.pause();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
         swap.deregisterSeries(address(token));
     }
 
