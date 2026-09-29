@@ -660,11 +660,12 @@ contract GyldAtomicSwap is
         emit SeriesDeregistered(token);
 
         uint256 residual = IERC20(token).balanceOf(address(this));
-        if (residual == 0) return;
-        address to = $.withdrawalWallet;
-        if (to == address(0)) revert ZeroAddress();
-        IERC20(token).safeTransfer(to, residual);
-        emit Withdrawn(token, to, residual);
+        if (residual > 0) {
+            address to = $.withdrawalWallet;
+            if (to == address(0)) revert ZeroAddress();
+            IERC20(token).safeTransfer(to, residual);
+            emit Withdrawn(token, to, residual);
+        }
     }
 
     // ── Admin: band params, allowlist, withdrawal wallet ──────────────────────
