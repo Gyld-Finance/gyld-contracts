@@ -1372,24 +1372,28 @@ contract GyldBondTokenUnitTest is Test {
 
     function test_setSanctionsList_byAdmin_succeeds() public {
         address newOracle = address(new MockSanctionsList(address(this)));
+        MockSanctionsList(newOracle).setSanctioned(address(0x5D17), true); // an SDN address it must flag
         vm.expectEmit(true, false, false, false);
         emit SanctionsListUpdated(newOracle);
         vm.prank(admin);
-        token.setSanctionsList(newOracle);
+        token.setSanctionsList(newOracle, address(0x5D17));
         assertEq(address(token.sanctionsList()), newOracle);
     }
 
     function test_setSanctionsList_byNonAdmin_reverts() public {
         address newOracle = address(new MockSanctionsList(address(this)));
+        MockSanctionsList(newOracle).setSanctioned(address(0x5D17), true); // valid: only the role can revert
         vm.prank(outsider);
-        vm.expectRevert();
-        token.setSanctionsList(newOracle);
+        vm.expectRevert(
+            abi.encodeWithSignature("AccessControlUnauthorizedAccount(address,bytes32)", outsider, bytes32(0))
+        );
+        token.setSanctionsList(newOracle, address(0x5D17));
     }
 
     function test_setSanctionsList_zeroAddress_reverts() public {
         vm.prank(admin);
         vm.expectRevert(GyldBondToken.ZeroAddress.selector);
-        token.setSanctionsList(address(0));
+        token.setSanctionsList(address(0), address(0x5D17));
     }
 
     // ── Pause edge cases ──────────────────────────────────────────────────────

@@ -220,7 +220,7 @@ later commit. Triaged and baselined here; no production contract is involved.
 ### `low-level-calls` ×10 — **Accepted**
 
 `staticcall` probes in `GyldAtomicSwap.initialize` / `registerSeries`,
-`GyldBondToken._requireValidSanctionsOracle`, `IssuanceManager.registerToken`,
+`GyldBondToken._probeSanctions`, `IssuanceManager.registerToken`,
 `NAVFeedForwarder` ×3, `SanctionsOracleMirror` ×2, `TokenFactory.constructor`.
 
 The count fell by one at audit FIND-008: `GyldBondToken.initialize` and
@@ -228,7 +228,10 @@ The count fell by one at audit FIND-008: `GyldBondToken.initialize` and
 were reported separately. Both now delegate to one `_requireValidSanctionsOracle`, so
 `initialize` and `setSanctionsList` cannot drift apart on admission terms. Two results
 collapse into one, and the shared helper is the reason the fix is a single site rather
-than four.
+than four. When FIND-008 was reopened the `staticcall` moved one level down, into
+`_probeSanctions(oracle, account)`, so the same site can ask about `address(0)` at
+admission and about a proposer-supplied SDN address on rotation. Still one result: the
+detector reports the function that holds the call, and only one does.
 
 `registerToken` carries **two** probes since audit FIND-009 — `MINTER_ROLE()` and
 `maturityTimestamp()`, the second added because `subscribe` now depends on it — but

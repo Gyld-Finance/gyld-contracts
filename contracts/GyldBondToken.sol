@@ -101,6 +101,8 @@ contract GyldBondToken is
     error CannotRemoveLastAdmin(); // audit FIND-007
     error CannotBurnFromOtherAccount(address from); // audit FIND-027
     error NotValidSanctionsList(address addr);
+    /// audit FIND-008 — the candidate oracle did not flag the SDN-listed address supplied.
+    error SanctionsOracleMissesFlagged(address oracle, address knownFlagged);
     error SanctionsListNotSet();
     error EmptyDocumentName();
     error EmptyDocumentUri();
@@ -253,26 +255,26 @@ contract GyldBondToken is
 
     // ── Compliance management ─────────────────────────────────────────────────
 
-    /// @notice Replace the sanctions oracle with a new implementation.
-    /// @dev    Fail-closed by design: zero-address is explicitly rejected. Disabling the
-    ///         oracle entirely is not permitted — a token with no oracle is a greater
-    ///         compliance risk than a frozen token. Should the slot ever reach zero anyway,
-    ///         `_requireAccess` reverts `SanctionsListNotSet` rather than skipping the
-    ///         check, so this rejection is a first line of defence and not the only one.
-    ///
-    ///         Emergency path if the current oracle is compromised: deploy a new oracle
-    ///         contract (e.g. SanctionsOracleMirror) and call this function with the new
-    ///         address. The oracle is replaced, not removed.
-    ///
-    ///         The candidate is probed before storing — rejects EOAs, wrong contracts, stubs
-    ///         that don't implement ISanctionsList, and (audit FIND-008) any oracle whose
-    ///         reply is not a canonical `false`. That is an INTERFACE check: it asserts the
-    ///         oracle answers on the same terms the transfer path decodes on, not that its
-    ///         list is correct. Behavioural verification is a deploy-time and monitoring
-    ///         concern — see `_requireValidSanctionsOracle` and D-33.
-    function setSanctionsList(address newSanctionsList) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newSanctionsList == address(0)) revert ZeroAddress();
+    /// @notice Replace the sanctions oracle. `knownFlagged` must be an address on the
+    ///         CURRENT SDN list; the candidate must flag it and must clear the caller.
+    /// @dev    Audit FIND-008. The `address(0)` probe proves the oracle answers; only a
+    ///         genuinely flagged address proves it screens — an oracle wired to `false`
+    ///         answers `address(0)` exactly as a healthy one does. Clearing the caller (the
+    ///         timelock) refuses one that flags everyone but `address(0)`. The contract
+    ///         cannot verify `knownFlagged` is really listed: this guards against error, and
+    ///         reviewers check the address during the timelock window. Nothing is stored to
+    ///         go stale; if it is delisted inside that window, execution reverts and the
+    ///         current oracle stays in place. D-33.
+    function setSanctionsList(address newSanctionsList, address knownFlagged)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (newSanctionsList == address(0) || knownFlagged == address(0)) revert ZeroAddress();
         _requireValidSanctionsOracle(newSanctionsList);
+        if (_probeSanctions(newSanctionsList, _msgSender()) != 0) revert NotValidSanctionsList(newSanctionsList);
+        if (_probeSanctions(newSanctionsList, knownFlagged) != 1) {
+            revert SanctionsOracleMissesFlagged(newSanctionsList, knownFlagged);
+        }
         _getStorage().sanctionsList = ISanctionsList(newSanctionsList);
         emit SanctionsListUpdated(newSanctionsList);
     }
@@ -415,10 +417,9 @@ contract GyldBondToken is
     /// This is an INTERFACE check and nothing more (audit FIND-008, D-33): it proves the
     /// candidate is a contract that implements `isSanctioned(address)` and answers on the
     /// same terms the transfer path decodes on. It does not, and is not intended to, prove
-    /// the oracle's list is correct or seeded — that is asserted at deploy time by
-    /// `DeployGuards.requireSanctionsOracleAnswers` and continuously by off-chain
-    /// reconciliation against the SDN feed, both of which can use real designations as
-    /// fixtures where a contract-stored one would go stale.
+    /// the oracle's list is correct or seeded. For a rotation, `setSanctionsList` asserts
+    /// that with a proposer-supplied SDN address; for the initial oracle it is asserted at
+    /// deploy time by `DeployGuards.requireSanctionsOracleAnswers`.
     ///
     /// Two legs are load-bearing beyond the original length check. `code.length` rejects an
     /// EOA and, less obviously, the 32-byte-returning precompiles at `0x02`/`0x03`, which the
@@ -431,11 +432,16 @@ contract GyldBondToken is
     /// address, so the only way to answer `true` there is to answer `true` for everyone.
     function _requireValidSanctionsOracle(address candidate) private view {
         if (candidate.code.length == 0) revert NotValidSanctionsList(candidate);
-        (bool ok, bytes memory data) =
-            candidate.staticcall(abi.encodeCall(ISanctionsList.isSanctioned, (address(0))));
-        if (!ok || data.length != 32 || abi.decode(data, (uint256)) != 0) {
-            revert NotValidSanctionsList(candidate);
-        }
+        if (_probeSanctions(candidate, address(0)) != 0) revert NotValidSanctionsList(candidate);
+    }
+
+    /// @dev The raw answer word for `account`, or `NotValidSanctionsList` if the oracle does
+    ///      not answer with exactly one word. Callers compare it to 0 or 1, which also
+    ///      rejects any non-canonical bool — the terms `_requireAccess` decodes on.
+    function _probeSanctions(address oracle, address account) private view returns (uint256) {
+        (bool ok, bytes memory data) = oracle.staticcall(abi.encodeCall(ISanctionsList.isSanctioned, (account)));
+        if (!ok || data.length != 32) revert NotValidSanctionsList(oracle);
+        return abi.decode(data, (uint256));
     }
 
     /// Remove `name` from the docNames array (swap-and-pop). The array's ordering is purely

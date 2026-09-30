@@ -8,6 +8,7 @@ import {IERC1643} from "../interfaces/IERC1643.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 // ── V2 stub for upgrade test ──────────────────────────────────────────────────
 
@@ -560,24 +561,28 @@ contract GyldBondTokenTest is Test {
 
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
+    /// Stand-in for an address on the CURRENT SDN list, supplied by the proposer.
+    address constant SDN_FLAGGED = address(0x5D17);
+
     function test_setSanctionsList_validOracle_succeeds() public {
         MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        newOracle.setSanctioned(SDN_FLAGGED, true);
         vm.prank(admin);
-        token.setSanctionsList(address(newOracle));
+        token.setSanctionsList(address(newOracle), SDN_FLAGGED);
         assertEq(address(token.sanctionsList()), address(newOracle));
     }
 
     function test_setSanctionsList_zeroAddress_reverts() public {
         vm.prank(admin);
         vm.expectRevert(GyldBondToken.ZeroAddress.selector);
-        token.setSanctionsList(address(0));
+        token.setSanctionsList(address(0), SDN_FLAGGED);
     }
 
     function test_setSanctionsList_eoa_reverts() public {
         address eoa = address(0xBEEF);
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, eoa));
-        token.setSanctionsList(eoa);
+        token.setSanctionsList(eoa, SDN_FLAGGED);
     }
 
     function test_setSanctionsList_wrongContract_reverts() public {
@@ -585,14 +590,21 @@ contract GyldBondTokenTest is Test {
         address wrongContract = address(new MockWrongContract());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, wrongContract));
-        token.setSanctionsList(wrongContract);
+        token.setSanctionsList(wrongContract, SDN_FLAGGED);
     }
 
+    /// The oracle is VALID here, so the role check is the only thing that can revert — a
+    /// bad oracle would satisfy a bare expectRevert() and hide a missing onlyRole.
     function test_setSanctionsList_onlyAdmin_reverts() public {
         MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        newOracle.setSanctioned(SDN_FLAGGED, true);
         vm.prank(address(0xDEAD));
-        vm.expectRevert();
-        token.setSanctionsList(address(newOracle));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(0xDEAD), bytes32(0)
+            )
+        );
+        token.setSanctionsList(address(newOracle), SDN_FLAGGED);
     }
 
     // ── Sanctions-oracle admission: interface check (audit FIND-008) ─────────
@@ -603,15 +615,15 @@ contract GyldBondTokenTest is Test {
     // data on any word above 1. A length-only probe admitted such an oracle and then
     // reverted EVERY transfer of the series.
     //
-    // It is an INTERFACE check by design, not a compliance control (D-33): it proves the
-    // oracle answers, not that its list is right. The last two tests pin that accepted
-    // limit so it cannot later be mistaken for coverage.
+    // The `address(0)` probe proves the oracle ANSWERS. Since FIND-008 was reopened, a
+    // rotation also proves it SCREENS: the candidate must flag a proposer-supplied SDN
+    // address, which is what refuses the two oracles that used to be accepted limits.
 
     function test_setSanctionsList_nonCanonicalBool_reverts() public {
         address bad = address(new NonCanonicalSanctionsList());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
-        token.setSanctionsList(bad);
+        token.setSanctionsList(bad, SDN_FLAGGED);
     }
 
     function test_initialize_nonCanonicalBool_sanctionsList_reverts() public {
@@ -634,7 +646,7 @@ contract GyldBondTokenTest is Test {
         address bad = address(new AlwaysTrueSanctionsList());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
-        token.setSanctionsList(bad);
+        token.setSanctionsList(bad, SDN_FLAGGED);
     }
 
     /// An oracle that reverts the read is refused, not stored.
@@ -642,7 +654,7 @@ contract GyldBondTokenTest is Test {
         address bad = address(new RevertingSanctionsList());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
-        token.setSanctionsList(bad);
+        token.setSanctionsList(bad, SDN_FLAGGED);
         assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
     }
 
@@ -651,37 +663,76 @@ contract GyldBondTokenTest is Test {
         address bad = address(new ShortReturnSanctionsList());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
-        token.setSanctionsList(bad);
+        token.setSanctionsList(bad, SDN_FLAGGED);
     }
 
-    /// ACCEPTED LIMIT (D-33), not a bug. An oracle wired to `false` is well-formed, so it is
-    /// admitted and screening is silently off. Nothing on this contract can tell it from a
-    /// healthy oracle: admission asks about `address(0)`, whose correct answer is also
-    /// `false`. Catching it needs a genuinely flagged address, which is why that assertion
-    /// lives in DeployGuards and in keeper-side reconciliation, not here.
-    function test_setSanctionsList_alwaysFalseOracle_isAdmitted_acceptedLimit() public {
-        AlwaysFalseSanctionsList blind = new AlwaysFalseSanctionsList();
-        vm.prank(admin); token.setSanctionsList(address(blind));
-
-        // The real list flags 0xB0B; the blind oracle does not, and the transfer settles.
-        mockSanctions.setSanctioned(address(0xB0B), true);
-        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
-        vm.prank(ap); token.transfer(address(0xB0B), 1e18);
-        assertEq(token.balanceOf(address(0xB0B)), 1e18, "screening is silently off");
+    /// The case Halborn reopened FIND-008 on. An oracle wired to `false` answers `address(0)`
+    /// exactly as a healthy one does, so the interface probe admits it and screening is
+    /// silently off. It cannot flag the supplied SDN address, so the rotation is refused and
+    /// the working oracle stays.
+    function test_setSanctionsList_alwaysFalseOracle_isRejected() public {
+        address blind = address(new AlwaysFalseSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldBondToken.SanctionsOracleMissesFlagged.selector, blind, SDN_FLAGGED)
+        );
+        token.setSanctionsList(blind, SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
     }
 
-    /// The same limit in its second shape: admission screens `address(0)` only, so an oracle
-    /// answering canonically for that one address and garbage for every other is admitted and
-    /// still reverts every transfer. Screening a second fixed address would not close it —
-    /// the oracle chooses its answer per address.
-    function test_setSanctionsList_canonicalOnlyForZero_acceptedLimit() public {
+    /// The second former accepted limit: canonical for `address(0)`, garbage (a word of 2)
+    /// for everyone else, which would revert every transfer. Its garbage answer for the
+    /// caller is not a canonical `false`, so the clean-caller probe refuses it first.
+    function test_setSanctionsList_canonicalOnlyForZero_isRejected() public {
         address dirty = address(new DirtyForNonZeroSanctionsList());
-        vm.prank(admin); token.setSanctionsList(dirty);
-        vm.prank(issuer); mgr.subscribe(address(token), ap, 100e18);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, dirty));
+        token.setSanctionsList(dirty, SDN_FLAGGED);
+    }
 
-        vm.prank(ap);
-        vm.expectRevert(); // ABI bool validator, no reason data
-        token.transfer(address(0xB0B), 1e18);
+    /// A healthy, correctly built oracle that simply is not seeded with the supplied address
+    /// — an unseeded mirror, or an address delisted inside the 48 h timelock window. Refused
+    /// loudly; the current oracle stays in place, and the proposal is re-made.
+    function test_setSanctionsList_unseededOracle_isRejected() public {
+        MockSanctionsList unseeded = new MockSanctionsList(address(this));
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldBondToken.SanctionsOracleMissesFlagged.selector, address(unseeded), SDN_FLAGGED
+            )
+        );
+        token.setSanctionsList(address(unseeded), SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
+    }
+
+    /// A zero `knownFlagged` would fail the flagged probe anyway; naming it is clearer.
+    function test_setSanctionsList_zeroKnownFlagged_reverts() public {
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        vm.prank(admin);
+        vm.expectRevert(GyldBondToken.ZeroAddress.selector);
+        token.setSanctionsList(address(newOracle), address(0));
+    }
+
+    /// "Wired to true" in the shape the `address(0)` probe misses: it clears only zero and
+    /// flags everyone else, so every transfer would revert. It flags the caller — the
+    /// timelock — so the clean-caller probe refuses it.
+    function test_setSanctionsList_flagsAllButZeroOracle_isRejected() public {
+        address bad = address(new FlagsAllButZeroSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+    }
+
+    /// ACCEPTED LIMIT, pinned so it is not mistaken for coverage. An oracle that flags only
+    /// the one address it is probed with passes: any fixed probe can be gamed by an oracle
+    /// that chooses its answer per address. The threat here is governance error behind a
+    /// 48 h timelock, not an adversarial oracle — and whoever holds DEFAULT_ADMIN_ROLE can
+    /// upgrade this token outright, which is strictly worse. D-33.
+    function test_setSanctionsList_singleAddressOracle_isAdmitted_acceptedLimit() public {
+        address narrow = address(new FlagsOnlySanctionsList(SDN_FLAGGED));
+        vm.prank(admin);
+        token.setSanctionsList(narrow, SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), narrow);
     }
 
     // ── Fail-closed on an unset sanctions list (audit §4.1) ───────────────────
@@ -1105,8 +1156,20 @@ contract NonCanonicalSanctionsList {
     }
 }
 
-/// @dev Canonical for `address(0)` — the only address admission screens — and dirty for
-///      every other. Passes both probes, reverts every real transfer.
+/// @dev Flags every address except `address(0)` — "wired to true", past the zero probe.
+contract FlagsAllButZeroSanctionsList is ISanctionsList {
+    function isSanctioned(address addr) external pure override returns (bool) { return addr != address(0); }
+}
+
+/// @dev Flags exactly one address and nothing else — the per-address oracle D-33 names.
+contract FlagsOnlySanctionsList is ISanctionsList {
+    address public immutable only;
+    constructor(address only_) { only = only_; }
+    function isSanctioned(address addr) external view override returns (bool) { return addr == only; }
+}
+
+/// @dev Canonical for `address(0)` and a non-canonical word (2) for every other address.
+///      Passes the `address(0)` probe; refused on rotation by the flagged-address probe.
 contract DirtyForNonZeroSanctionsList {
     fallback() external {
         assembly {
@@ -1119,7 +1182,8 @@ contract DirtyForNonZeroSanctionsList {
 }
 
 
-/// @dev Answers `false` for everything — the silent case. Well-formed, so admitted (D-33).
+/// @dev Answers `false` for everything — the silent case. Passes the `address(0)` probe;
+///      refused on rotation because it cannot flag the supplied SDN address (FIND-008).
 contract AlwaysFalseSanctionsList is ISanctionsList {
     function isSanctioned(address) external pure override returns (bool) { return false; }
 }

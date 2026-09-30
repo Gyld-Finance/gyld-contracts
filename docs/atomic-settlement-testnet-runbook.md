@@ -94,8 +94,9 @@ would drift out of step with them.
 > all. Supply `knownFlagged` fresh each run — never hardcode it, since designations are
 > revoked. This is the check that refuses a freshly deployed, **unseeded**
 > `SanctionsOracleMirror`, which answers `false` for everything and passes every structural
-> check while screening nobody. The token's own admission probe cannot catch that: it asks
-> about `address(0)`, whose correct answer is also `false`.
+> check while screening nobody. The token's `initialize` probe cannot catch that: it asks
+> about `address(0)`, whose correct answer is also `false`. (A later rotation through
+> `setSanctionsList` does refuse it — FIND-008.)
 > See the TODO(compliance) below and readiness gap 5.
 
 - **TODO(compliance):** decide the sanctions oracle for the fresh testnet stack —
@@ -782,8 +783,14 @@ cast send $ORACLE "setForwardingOracle(address)" $ZERO --private-key $COMPLIANCE
 
 (a) does not clear an upstream flag — `isSanctioned` is true if *either* source says so.
 
-**No fast path if the mirror itself is faulty.** Only fix is `setSanctionsList` on every
-affected token, behind the 48 h timelock; a token upgrade is the same timelock. Accepted:
+**No fast path if the mirror itself is faulty.** Only fix is `setSanctionsList(newOracle,
+knownFlagged)` on every affected token, behind the 48 h timelock (FIND-008). Choosing
+`knownFlagged`: take a **long-standing** designation, since a delisting inside the window
+makes `execute` revert and costs a fresh 48 h (`knownFlagged` is fixed in the calldata);
+it must be flagged by the **replacement's own** data source — for a mirror with no
+forwarding oracle, seed it first, and on Sepolia seed it by hand; and run
+`cast call $NEW "isSanctioned(address)(bool)" $KNOWN_FLAGGED` before scheduling and again
+before executing. The new oracle must also clear the timelock itself; a token upgrade is the same timelock. Accepted:
 a carve-out for the swap would give the compliance gate an address that walks through it.
 Revisiting it is a security-model change, not a doc fix. USDC is unaffected.
 

@@ -239,11 +239,49 @@ contract SanctionsMirrorIntegrationTest is Test {
 
         // The mirror-side lever is gone with it; only the token admin can repoint.
         MockSanctionsList replacement = new MockSanctionsList(address(this));
+        replacement.setSanctioned(address(0x5D17), true); // FIND-008: it must flag an SDN address
         vm.prank(tokenAdmin);
-        token.setSanctionsList(address(replacement));
+        token.setSanctionsList(address(replacement), address(0x5D17));
 
         vm.prank(alice);
         token.transfer(bob, 1e18);
         assertEq(token.balanceOf(bob), 1e18);
+    }
+
+    // ── FIND-008 reopen: rotation against the REAL mirror ────────────────────
+    //
+    // Every other rotation test uses a mock. These drive `setSanctionsList` against the
+    // oracle production deploys, so the flagged-address probe is proven on the real
+    // contract's answers rather than on a stub written to satisfy it.
+
+    /// The accident FIND-008 was reopened on, in its real form: a freshly deployed
+    /// mirror with an empty list and no forwarding oracle answers `false` for everyone.
+    /// It passes the `address(0)` probe; the flagged-address probe refuses it.
+    function test_rotation_refusesAnUnseededRealMirror() public {
+        SanctionsOracleMirror fresh = new SanctionsOracleMirror(complianceSafe, keeper, address(0));
+        vm.prank(tokenAdmin);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldBondToken.SanctionsOracleMissesFlagged.selector, address(fresh), sdnHolder)
+        );
+        token.setSanctionsList(address(fresh), sdnHolder);
+        assertEq(address(token.sanctionsList()), address(mirror), "the working mirror must stay installed");
+    }
+
+    /// The happy path on the real contract: seed the replacement the way the keeper
+    /// does, rotate with that SDN address, and screening is live on the new oracle.
+    function test_rotation_admitsASeededRealMirror_andScreeningIsLive() public {
+        SanctionsOracleMirror replacement = new SanctionsOracleMirror(complianceSafe, keeper, address(0));
+        address[] memory sdn = new address[](1);
+        sdn[0] = sdnHolder;
+        vm.prank(keeper);
+        replacement.addToSanctionsList(sdn);
+
+        vm.prank(tokenAdmin);
+        token.setSanctionsList(address(replacement), sdnHolder);
+        assertEq(address(token.sanctionsList()), address(replacement));
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.AccountSanctioned.selector, sdnHolder));
+        token.transfer(sdnHolder, 1e18);
     }
 }

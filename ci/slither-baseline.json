@@ -74,7 +74,7 @@
     {
       "check": "low-level-calls",
       "file": "contracts/GyldBondToken.sol",
-      "element": "_requireValidSanctionsOracle"
+      "element": "_probeSanctions"
     },
     {
       "check": "low-level-calls",

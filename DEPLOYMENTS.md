@@ -142,7 +142,9 @@ script is not in the tree — the source is preserved by the tag
    `0x40C57923924B5c5c5455c48D93317139ADDaC8fb` has **no code on Sepolia**; Chainalysis
    does not publish an oracle there.
 
-   **If Sepolia demos resume, rewire rather than redeploy:** `setSanctionsList()` is
+   **If Sepolia demos resume, rewire rather than redeploy:** these proxies run the
+   implementation from before the FIND-008 reopen, so their `setSanctionsList(address)`
+   takes one argument and checks no behaviour. `setSanctionsList()` is
    `DEFAULT_ADMIN_ROLE`-gated and live on all four proxies, and the timelock
    `0xf803…ef72` holds that role — so all four can be pointed at a freshly deployed
    gated mock in a handful of transactions, no upgrade needed. Note that timelock has

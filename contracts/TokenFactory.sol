@@ -128,7 +128,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     ///                        TimelockController (or an address that hands over to one).
     constructor(address bondTokenLogic_, address sanctionsList_, address owner_) Ownable(owner_) {
         if (bondTokenLogic_ == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
-        // Same admission terms as GyldBondToken._probeSanctionsOracle, leg for leg, including
+        // Same admission terms as GyldBondToken._requireValidSanctionsOracle, leg for leg, including
         // the code-length and canonical-bool checks (audit FIND-008): a word above 1 passes a
         // length-only probe and then reverts the ABI validator on every transfer of every token
         // deployed here. This is a hand-rolled copy because no token exists yet to call, and
