@@ -40,12 +40,14 @@ import {IGyldBondToken} from "./interfaces/IGyldBondToken.sol";
 ///   - The check is fail-closed: if the oracle call reverts, or the oracle address is
 ///     unset, the transfer reverts. There is no path on which screening is skipped.
 ///   - Mint and burn skip the sanctions check — IssuanceManager pre-screens APs off-chain.
+///     Burn only reaches the caller's own balance, so nothing unscreened is ever taken
+///     from a third party (audit FIND-027).
 ///   - No internal blocklist — sanctioning decisions are made by Chainalysis, not the platform.
 ///
 /// Roles:
 ///   DEFAULT_ADMIN_ROLE — grants / revokes all other roles; should be a TimelockController
 ///   MINTER_ROLE        — IssuanceManager only
-///   BURNER_ROLE        — IssuanceManager only
+///   BURNER_ROLE        — IssuanceManager only; may burn ONLY from its own balance
 ///   PAUSER_ROLE        — ops multisig (separate signer set from governance)
 ///   DOCUMENT_ROLE      — ops multisig, for ERC-1643 document set/remove (operational, not a
 ///                        governance event — decisions recorded on GLD-264)
@@ -66,13 +68,14 @@ contract GyldBondToken is
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 public constant DOCUMENT_ROLE = keccak256("DOCUMENT_ROLE");
 
+
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
 
     /// @custom:storage-location erc7201:gyld.GyldBondToken
     struct GyldBondTokenStorage {
         ISanctionsList sanctionsList;
         string isin;
-        uint256 maturityTimestamp;
+        uint256 maturityTimestamp; // read by IssuanceManager.subscribe, never here (D-30)
         // ── IERC-1643 document management ────────────────────────────────────
         // Appended fields — ERC-7201 layout-safe for the UUPS upgrade of live proxies.
         mapping(bytes32 => Document) documents;
@@ -95,7 +98,11 @@ contract GyldBondToken is
     error ZeroAmount();
     error AccountSanctioned(address account);
     error CannotRenounceAdminRole();
+    error CannotRemoveLastAdmin(); // audit FIND-007
+    error CannotBurnFromOtherAccount(address from); // audit FIND-027
     error NotValidSanctionsList(address addr);
+    /// audit FIND-008 — the candidate oracle did not flag the SDN-listed address supplied.
+    error SanctionsOracleMissesFlagged(address oracle, address knownFlagged);
     error SanctionsListNotSet();
     error EmptyDocumentName();
     error EmptyDocumentUri();
@@ -118,7 +125,9 @@ contract GyldBondToken is
     /// @param name_              Token name (e.g. "Gyld US Treasury Bond 2026-06")
     /// @param symbol_            Ticker (e.g. "GYLD-UST-2606")
     /// @param isin_              ISO 6166 ISIN, e.g. "US912797KR72"
-    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended.
+    /// @param maturityTimestamp_ Unix maturity timestamp; 0 if open-ended. Not enforced by any
+    ///                           function on THIS contract — the gate lives one layer up, in
+    ///                           IssuanceManager.subscribe(). See maturityTimestamp().
     /// @param defaultAdmin       Should be a TimelockController in production.
     /// @param pauser             Ops multisig — separate from governance.
     /// @param sanctionsList_     Chainalysis on-chain sanctions oracle (read-only).
@@ -137,10 +146,7 @@ contract GyldBondToken is
         __Pausable_init();
         __UUPSUpgradeable_init();
         if (defaultAdmin == address(0) || pauser == address(0) || sanctionsList_ == address(0)) revert ZeroAddress();
-        (bool ok, bytes memory data) = sanctionsList_.staticcall(
-            abi.encodeWithSignature("isSanctioned(address)", address(0))
-        );
-        if (!ok || data.length != 32) revert NotValidSanctionsList(sanctionsList_);
+        _requireValidSanctionsOracle(sanctionsList_);
         GyldBondTokenStorage storage $ = _getStorage();
         $.isin = isin_;
         $.maturityTimestamp = maturityTimestamp_;
@@ -153,8 +159,21 @@ contract GyldBondToken is
     // ── Getters ───────────────────────────────────────────────────────────────
 
     function isin() external view returns (string memory) { return _getStorage().isin; }
+
+    /// @notice Maturity date of this series. Enforced on primary issuance only (audit FIND-009).
+    /// @dev    NOT enforced by this contract. mint(), transfer() and transferFrom() behave
+    ///         identically before and after this date — deliberately, so holders of a matured
+    ///         series can still exit it, and so correcting a maturity entered wrong never
+    ///         requires upgrading a live bond proxy.
+    ///
+    ///         The gate is one layer up: `IssuanceManager.subscribe()` reads this value and
+    ///         refuses a matured series, and IssuanceManager is the sole MINTER_ROLE holder, so
+    ///         that closes the whole primary-issuance path. An integrator must read this as
+    ///         "no new units are issued after this date", NOT as "the token stops moving" (D-30).
+    /// @return Unix maturity timestamp, or 0 for an open-ended series with no fixed maturity.
     function maturityTimestamp() external view returns (uint256) { return _getStorage().maturityTimestamp; }
     function sanctionsList() external view returns (ISanctionsList) { return _getStorage().sanctionsList; }
+
 
     // ── ERC20 transfer overrides ──────────────────────────────────────────────
 
@@ -175,6 +194,8 @@ contract GyldBondToken is
     /// Sanctions check at the _update layer — the single funnel for ALL balance
     /// changes in OZ v5 (transfer, mint, burn). Mint (from == 0) and burn (to == 0)
     /// are intentionally skipped; IssuanceManager pre-screens APs off-chain.
+    /// Safe by construction, not by deployment (FIND-027): `burn` requires
+    /// `from == msg.sender`, so the unscreened side is always the caller's own.
     function _update(address from, address to, uint256 value) internal override {
         if (from != address(0) && to != address(0)) {
             _requireAccess(from);
@@ -209,6 +230,9 @@ contract GyldBondToken is
     // whenNotPaused IS enforced — a paused contract stops all token movement including
     // primary issuance. This ensures a compromised SUBSCRIBER_ROLE or REDEEMER_ROLE key
     // cannot mint or burn after the ops multisig has triggered an emergency pause.
+    // Enforced HERE and only here (FIND-005): `IssuanceManager.subscribe`/`redeem` have no
+    // pause check of their own for the token, so a paused token surfaces as `EnforcedPause()`
+    // raised on this contract and bubbled up unchanged. See IGyldBondToken and the runbook.
     // Sanctions oracle is NOT checked here. IssuanceManager pre-screens APs off-chain.
 
     /// Mint `amount` tokens to `to`.
@@ -219,33 +243,38 @@ contract GyldBondToken is
     }
 
     /// Burn `amount` tokens from `from`.
+    /// @dev `from` MUST be the caller (audit FIND-027) — no clawback of a Holder's units,
+    ///      per the Information Memorandum; a sanctioned balance is frozen, never destroyed.
+    ///      Redemption is unaffected: `IssuanceManager.redeem` burns its own balance. D-39.
     function burn(address from, uint256 amount) external onlyRole(BURNER_ROLE) whenNotPaused {
         if (from == address(0)) revert ZeroAddress();
+        if (from != _msgSender()) revert CannotBurnFromOtherAccount(from);
         if (amount == 0) revert ZeroAmount();
         _burn(from, amount);
     }
 
     // ── Compliance management ─────────────────────────────────────────────────
 
-    /// @notice Replace the sanctions oracle with a new implementation.
-    /// @dev    Fail-closed by design: zero-address is explicitly rejected. Disabling the
-    ///         oracle entirely is not permitted — a token with no oracle is a greater
-    ///         compliance risk than a frozen token. Should the slot ever reach zero anyway,
-    ///         `_requireAccess` reverts `SanctionsListNotSet` rather than skipping the
-    ///         check, so this rejection is a first line of defence and not the only one.
-    ///
-    ///         Emergency path if the current oracle is compromised: deploy a new oracle
-    ///         contract (e.g. SanctionsOracleMirror) and call this function with the new
-    ///         address. The oracle is replaced, not removed.
-    ///
-    ///         The candidate address is probed via staticcall before storing — rejects EOAs,
-    ///         wrong contracts, and stubs that don't implement ISanctionsList.
-    function setSanctionsList(address newSanctionsList) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newSanctionsList == address(0)) revert ZeroAddress();
-        (bool ok, bytes memory data) = newSanctionsList.staticcall(
-            abi.encodeWithSignature("isSanctioned(address)", address(0))
-        );
-        if (!ok || data.length != 32) revert NotValidSanctionsList(newSanctionsList);
+    /// @notice Replace the sanctions oracle. `knownFlagged` must be an address on the
+    ///         CURRENT SDN list; the candidate must flag it and must clear the caller.
+    /// @dev    Audit FIND-008. The `address(0)` probe proves the oracle answers; only a
+    ///         genuinely flagged address proves it screens — an oracle wired to `false`
+    ///         answers `address(0)` exactly as a healthy one does. Clearing the caller (the
+    ///         timelock) refuses one that flags everyone but `address(0)`. The contract
+    ///         cannot verify `knownFlagged` is really listed: this guards against error, and
+    ///         reviewers check the address during the timelock window. Nothing is stored to
+    ///         go stale; if it is delisted inside that window, execution reverts and the
+    ///         current oracle stays in place. D-33.
+    function setSanctionsList(address newSanctionsList, address knownFlagged)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (newSanctionsList == address(0) || knownFlagged == address(0)) revert ZeroAddress();
+        _requireValidSanctionsOracle(newSanctionsList);
+        if (_probeSanctions(newSanctionsList, _msgSender()) != 0) revert NotValidSanctionsList(newSanctionsList);
+        if (_probeSanctions(newSanctionsList, knownFlagged) != 1) {
+            revert SanctionsOracleMissesFlagged(newSanctionsList, knownFlagged);
+        }
         _getStorage().sanctionsList = ISanctionsList(newSanctionsList);
         emit SanctionsListUpdated(newSanctionsList);
     }
@@ -340,6 +369,27 @@ contract GyldBondToken is
         super.renounceRole(role, callerConfirmation);
     }
 
+    /// @dev Audit FIND-007. `renounceRole` above refuses DEFAULT_ADMIN_ROLE, but the role
+    ///      admins itself, so the sole holder could self-revoke into the same bricked state.
+    ///      Guarding `_revokeRole` covers both paths. Removing a NON-last admin is untouched
+    ///      — that is the deploy handover (grant successor, then self-revoke).
+    ///      `<= 1` not `== 1`: a proxy upgraded to this code never wrote the slot, so it reads
+    ///      0 while holding one admin; blocking there is the safe direction.
+    uint256 public defaultAdminCount;
+
+    function _grantRole(bytes32 r, address a) internal override returns (bool granted) {
+        granted = super._grantRole(r, a);
+        if (granted && r == DEFAULT_ADMIN_ROLE) defaultAdminCount++;
+    }
+
+    function _revokeRole(bytes32 r, address a) internal override returns (bool revoked) {
+        revoked = super._revokeRole(r, a);
+        if (revoked && r == DEFAULT_ADMIN_ROLE) {
+            if (defaultAdminCount <= 1) revert CannotRemoveLastAdmin();
+            defaultAdminCount--;
+        }
+    }
+
     // ── UUPS upgrade authorization ────────────────────────────────────────────
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
@@ -358,6 +408,40 @@ contract GyldBondToken is
         ISanctionsList sl = _getStorage().sanctionsList;
         if (address(sl) == address(0)) revert SanctionsListNotSet();
         if (sl.isSanctioned(account)) revert AccountSanctioned(account);
+    }
+
+    /// The single sanctions-oracle admission check, shared by `initialize` and
+    /// `setSanctionsList` so the two cannot drift. `TokenFactory`'s constructor holds the
+    /// only other copy, pinned by `test_constructorProbe_agreesWithBondTokenProbe`.
+    ///
+    /// This is an INTERFACE check and nothing more (audit FIND-008, D-33): it proves the
+    /// candidate is a contract that implements `isSanctioned(address)` and answers on the
+    /// same terms the transfer path decodes on. It does not, and is not intended to, prove
+    /// the oracle's list is correct or seeded. For a rotation, `setSanctionsList` asserts
+    /// that with a proposer-supplied SDN address; for the initial oracle it is asserted at
+    /// deploy time by `DeployGuards.requireSanctionsOracleAnswers`.
+    ///
+    /// Two legs are load-bearing beyond the original length check. `code.length` rejects an
+    /// EOA and, less obviously, the 32-byte-returning precompiles at `0x02`/`0x03`, which the
+    /// hot path's high-level call refuses on its own extcodesize test. And `!= 0` rather than
+    /// a bare length test: `_requireAccess` is a HIGH-LEVEL call, so solc runs the ABI bool
+    /// validator and reverts — with no reason data — on any word above 1, meaning a
+    /// length-only probe admitted such an oracle and then reverted EVERY transfer of the
+    /// series. The same comparison rejects a word of exactly 1, an oracle flagging
+    /// `address(0)`, which flags everything; `SanctionsOracleMirror` cannot even hold that
+    /// address, so the only way to answer `true` there is to answer `true` for everyone.
+    function _requireValidSanctionsOracle(address candidate) private view {
+        if (candidate.code.length == 0) revert NotValidSanctionsList(candidate);
+        if (_probeSanctions(candidate, address(0)) != 0) revert NotValidSanctionsList(candidate);
+    }
+
+    /// @dev The raw answer word for `account`, or `NotValidSanctionsList` if the oracle does
+    ///      not answer with exactly one word. Callers compare it to 0 or 1, which also
+    ///      rejects any non-canonical bool — the terms `_requireAccess` decodes on.
+    function _probeSanctions(address oracle, address account) private view returns (uint256) {
+        (bool ok, bytes memory data) = oracle.staticcall(abi.encodeCall(ISanctionsList.isSanctioned, (account)));
+        if (!ok || data.length != 32) revert NotValidSanctionsList(oracle);
+        return abi.decode(data, (uint256));
     }
 
     /// Remove `name` from the docNames array (swap-and-pop). The array's ordering is purely

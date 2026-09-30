@@ -195,7 +195,31 @@ contract GyldAtomicSwap is
     ///         does not retro-narrow a value an earlier initializer already wrote.
     uint64 public constant MAX_QUOTE_TTL_CEILING = 10 minutes;
 
+    /// @notice Fallback per-series notional cap per NAV round, USDC 6dp (audit FIND-021).
+    /// @dev    Every guard in executeSwap is per-fill; this is the only one that relates
+    ///         fills to each other. A fallback rather than a seed, for the reason on
+    ///         DEFAULT_MAX_QUOTE_TTL. Read only via `_effectiveMaxNavRoundNotional`.
+    ///
+    ///         $1M is the CONSERVATIVE floor a series gets when nobody has configured it,
+    ///         not the operating value: each series is set to its own cap at deploy
+    ///         (policy today is $10M) via setMaxNavRoundNotionalFor. Sizing this knob is
+    ///         two-sided — too low reverts legitimate flow, and because the setter is
+    ///         behind the 48 h timelock there is no same-day remedy, so a series' own cap
+    ///         must carry headroom over its busiest expected day, not its typical one.
+    uint256 public constant DEFAULT_MAX_NAV_ROUND_NOTIONAL = 1_000_000e6;
+
+    /// @dev Structural upper bound on `maxNavRoundNotionalOf`. The permissive end of this
+    ///      knob is "settle unbounded notional against one NAV price" — the guard as a
+    ///      no-op — so it is bounded like the band, the age and the TTL are.
+    uint256 public constant MAX_NAV_ROUND_NOTIONAL_CEILING = 50_000_000e6;
+
     // ── ERC-7201 namespaced storage ───────────────────────────────────────────
+
+    /// @dev One slot: the NAV round a counter belongs to, and the notional spent on it.
+    struct NavRoundDraw {
+        uint64 round; // the feed's `updatedAt` these draws were validated against
+        uint192 drawn; // cumulative USDC (6dp) settled against `round`
+    }
 
     /// @custom:storage-location erc7201:gyld.GyldAtomicSwap
     struct GyldAtomicSwapStorage {
@@ -205,7 +229,7 @@ contract GyldAtomicSwap is
         address withdrawalWallet; // fixed treasury destination for withdraw()
         address usdc; // cash leg discriminator (6 decimals)
         mapping(uint256 => uint256) usedQuoteWords; // quoteId >> 8 → 256-bit usage word
-        address[] seriesList; // registered series, for clean deregister
+        address[] seriesList; // registered series; read via registeredSeriesList()
         mapping(address => bool) registeredSeries; // bond token → enabled
         mapping(address => address) navForwarderOf; // bond token → NAVFeedForwarder (stable addr)
         mapping(address => bool) allowed; // executeSwap taker allowlist
@@ -216,6 +240,24 @@ contract GyldAtomicSwap is
         // slot has never been written) will reject every quote. See the fallback rationale
         // on DEFAULT_MAX_QUOTE_TTL.
         uint64 maxQuoteTtl;
+        // Per-series NAV age override (audit FIND-022). ZERO MEANS UNSET, not zero
+        // seconds — always read via _effectiveMaxNavAge(), never directly. A proxy
+        // upgraded from a pre-FIND-022 implementation has never written this mapping,
+        // so a raw read returns 0 for every series; treating that as a literal age
+        // would revert StaleNav on every swap. Unset means "follow the global
+        // maxNavAgeSecs", which is exactly the pre-upgrade behaviour.
+        mapping(address => uint32) maxNavAgeSecsOf;
+        // Per-series notional cap per NAV round (audit FIND-021). ZERO MEANS UNSET, not
+        // "zero notional" — always read via _effectiveMaxNavRoundNotional(). A proxy
+        // upgraded across this addition reads 0 for every series; as a literal cap that
+        // would revert every swap, and as "unlimited" it would ship the guard disarmed.
+        // Unset therefore resolves to DEFAULT_MAX_NAV_ROUND_NOTIONAL.
+        mapping(address => uint256) maxNavRoundNotionalOf;
+        // Running notional per series, scoped to ONE NAV round. Keyed on the feed's
+        // `updatedAt` — the value the band already validated against — not `roundId`,
+        // which is not guaranteed monotone across a forwarder repoint. Only a STRICTLY
+        // NEWER round resets the counter — see _drawNavRoundNotional.
+        mapping(address => NavRoundDraw) navRoundDrawOf;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -236,6 +278,32 @@ contract GyldAtomicSwap is
         return ttl == 0 ? DEFAULT_MAX_QUOTE_TTL : ttl;
     }
 
+    /// @dev The max NAV age actually in force for one series (audit FIND-022). A series
+    ///      with no override follows the global `maxNavAgeSecs`, so a feed pushing daily
+    ///      and one pushing hourly are no longer forced onto a single threshold that is
+    ///      necessarily wrong for one of them. This is the ONLY permitted read path for
+    ///      `maxNavAgeSecsOf` — see the field's note for why a raw read bricks
+    ///      executeSwap on a proxy upgraded across the mapping's addition.
+    function _effectiveMaxNavAge(GyldAtomicSwapStorage storage $, address bondToken)
+        private
+        view
+        returns (uint32)
+    {
+        uint32 perSeries = $.maxNavAgeSecsOf[bondToken];
+        return perSeries == 0 ? $.maxNavAgeSecs : perSeries;
+    }
+
+    /// @dev The per-NAV-round notional cap in force for one series (audit FIND-021). The
+    ///      ONLY permitted read path for `maxNavRoundNotionalOf` — see the field's note.
+    function _effectiveMaxNavRoundNotional(GyldAtomicSwapStorage storage $, address bondToken)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 cap = $.maxNavRoundNotionalOf[bondToken];
+        return cap == 0 ? DEFAULT_MAX_NAV_ROUND_NOTIONAL : cap;
+    }
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error ZeroAddress();
@@ -248,6 +316,7 @@ contract GyldAtomicSwap is
     error NotTaker(address taker, address caller);
     error NotAllowed(address taker);
     error CannotRenounceAdminRole();
+    error CannotRemoveLastAdmin(); // audit FIND-007
     // NAV band / series registry (migrated from the former GyldSettlementVault).
     error UnregisteredSeries(address token);
     error NotOneBondLeg(address tokenIn, address tokenOut);
@@ -262,12 +331,33 @@ contract GyldAtomicSwap is
     ///      "unset — fall back to DEFAULT_MAX_QUOTE_TTL", not zero seconds.
     error InvalidQuoteTtl(uint64 ttl);
     error NotValidForwarder(address forwarder);
-    error SeriesNotEmpty(address token);
+    /// @dev FIND-002: the forwarder is well-formed but its upstream cannot serve a usable
+    ///      price — `latestRoundData()` reverts, returns too few bytes, or reports a
+    ///      non-positive answer or the `updatedAt == 0` never-written sentinel. Malformed
+    ///      returndata that is long enough but fails ABI validation reverts in the decoder
+    ///      with no reason data instead; it is refused either way, and `_checkQuoteBand`
+    ///      decodes identically, so nothing the probe admits can fail there on shape.
+    error NavFeedNotPriced(address forwarder);
+    /// @dev FIND-002: `updatedAt` ahead of the clock. Same invariant as F-6 at read time and
+    ///      NAVFeedForwarder's configuration-time probe — a future-dated feed is refused by
+    ///      `_checkQuoteBand` outright, so admitting one registers an untradeable series.
+    error NavFeedFutureDated(address forwarder, uint256 updatedAt);
     // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
     // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
     error InvalidTokenDecimals(address token, uint8 decimals);
     error QuoteExpiryTooFar(uint64 expiry, uint64 maxAllowed);
+    /// @dev FIND-021: this fill would push notional settled against ONE NAV round past
+    ///      the series' cap. The quoteId is NOT consumed — the revert unwinds it — but
+    ///      that is bookkeeping hygiene, NOT a retry path: rounds are >= 1 h apart
+    ///      (MIN_UPDATE_INTERVAL) and a quote lives at most MAX_QUOTE_TTL_CEILING, so a
+    ///      refused quote expires long before the budget resets. `remaining` is carried
+    ///      for the quote service to re-issue against, and note MIN_DRAW_BPS can leave a
+    ///      non-zero `remaining` that no draw of this quote is small enough to fit.
+    error NavRoundNotionalExceeded(address token, uint256 requested, uint256 remaining, uint256 cap);
+    /// @dev Above MAX_NAV_ROUND_NOTIONAL_CEILING. Zero is legal and means "unset — fall
+    ///      back to DEFAULT_MAX_NAV_ROUND_NOTIONAL", not zero notional.
+    error InvalidNavRoundNotional(uint256 notional);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -281,9 +371,18 @@ contract GyldAtomicSwap is
     );
     event QuoteEpochBumped(uint64 indexed newEpoch);
     event SeriesRegistered(address indexed token, address indexed navForwarder);
+    /// Additional to SeriesRegistered when an already registered series is repointed at a
+    /// DIFFERENT forwarder (audit FIND-026); silent on a first or idempotent registration.
+    event SeriesForwarderRotated(
+        address indexed token, address indexed previousForwarder, address indexed newForwarder
+    );
     event SeriesDeregistered(address indexed token);
     event MaxQuoteDeviationUpdated(uint16 newBps);
     event MaxNavAgeUpdated(uint32 newSecs);
+    /// newSecs == 0 means the override was CLEARED and the series follows the global value.
+    event MaxNavAgeForSeriesUpdated(address indexed token, uint32 newSecs);
+    /// newCap == 0 means the override was CLEARED and the series follows the default.
+    event MaxNavRoundNotionalForSeriesUpdated(address indexed token, uint256 newCap);
     event MaxQuoteTtlUpdated(uint64 newTtl);
     event WithdrawalWalletUpdated(address indexed previous, address indexed next);
     event AllowedSet(address indexed account, bool allowed);
@@ -399,6 +498,32 @@ contract GyldAtomicSwap is
         return _getStorage().navForwarderOf[token];
     }
 
+    /// @notice Every registered bond series, in registry order (audit FIND-017).
+    /// @dev    The set previously had no reader at all. `seriesList` is a field inside the
+    ///         ERC-7201 struct, so Solidity generates no getter for it, and while any
+    ///         OFFCHAIN caller can hand-compute the slot and eth_getStorageAt it, no
+    ///         CONTRACT can — SLOAD reads only its own storage. Replaying
+    ///         SeriesRegistered / SeriesDeregistered has the same limitation. So an
+    ///         integrator could not enumerate the set at all; `registeredSeries(token)`
+    ///         answers only for an address you already hold.
+    ///
+    ///         Returns the whole array rather than offering a count/index pair to page
+    ///         it: registration is DEFAULT_ADMIN_ROLE behind the timelock, so the set is
+    ///         operator-sized and the return is bounded in practice. A Solidity caller
+    ///         reads `.length` off the result.
+    ///
+    ///         ORDER IS ARBITRARY AND NOT STABLE. `deregisterSeries` removes by
+    ///         swap-and-pop, so retiring any series moves the last element into the hole
+    ///         it left. A caller that remembers a position rather than an address will
+    ///         silently read a DIFFERENT series after any deregistration, with no revert
+    ///         and no event to distinguish it. Key off the address, and re-read the set
+    ///         rather than a cached index. `registeredSeries(token)` stays the membership
+    ///         test; this is enumeration only.
+    /// @return The registered bond tokens.
+    function registeredSeriesList() external view returns (address[] memory) {
+        return _getStorage().seriesList;
+    }
+
     /// @notice Whether `account` is allowed to be the taker on executeSwap.
     function isAllowed(address account) external view returns (bool) {
         return _getStorage().allowed[account];
@@ -429,7 +554,8 @@ contract GyldAtomicSwap is
     ///         binding → allowlist → price sanity → requested-amount range → expiry →
     ///         expiry-within-TTL → epoch → EIP-712 signature against QUOTE_SIGNER_ROLE →
     ///         single-use quoteId consumption (state effect) → derived-amount sanity →
-    ///         NAV band + leg classification → optional permit → PULL tokenIn →
+    ///         NAV band + leg classification → per-NAV-round notional cap (FIND-021, the
+    ///         second and last state effect) → optional permit → PULL tokenIn →
     ///         inventory check + PUSH tokenOut. The quoteId is burned in full regardless
     ///         of how much of `maxAmountIn` is drawn — single-shot-capped sizing, not
     ///         multi-draw (see docs/ARCHITECTURE.md). The optional permit is applied
@@ -486,7 +612,12 @@ contract GyldAtomicSwap is
         // Classify buy vs redeem, read NAV, and enforce the quote is within the NAV
         // band and the feed is fresh (reverts NotOneBondLeg / InvalidNav / StaleNav /
         // QuotePriceOutOfBand). The signed quote is the price; the feed only bounds it.
-        _checkQuoteBand($, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
+        (address bondToken, uint256 usdcNotional, uint64 navRound) =
+            _checkQuoteBand($, m.tokenIn, requestedAmountIn, m.tokenOut, amountOut);
+
+        // FIND-021: the only guard here that relates fills to one another. Last check and
+        // last state write before any transfer, so CEI is unchanged.
+        _drawNavRoundNotional($, bondToken, usdcNotional, navRound);
 
         // Optional EIP-2612 permit; try/catch so a front-run permit() cannot brick the
         // swap — safeTransferFrom below still enforces the allowance.
@@ -552,14 +683,14 @@ contract GyldAtomicSwap is
         uint256 amountIn,
         address tokenOut,
         uint256 amountOut
-    ) private view {
+    ) private view returns (address bondToken, uint256 usdcAmount, uint64 navRound) {
         bool buy = $.registeredSeries[tokenOut] && tokenIn == $.usdc;
         bool redeem = $.registeredSeries[tokenIn] && tokenOut == $.usdc;
         if (buy == redeem) revert NotOneBondLeg(tokenIn, tokenOut);
 
-        address bondToken = buy ? tokenOut : tokenIn;
+        bondToken = buy ? tokenOut : tokenIn;
         uint256 tokenAmount = buy ? amountOut : amountIn;
-        uint256 usdcAmount = buy ? amountIn : amountOut;
+        usdcAmount = buy ? amountIn : amountOut;
 
         // navForwarderOf[bondToken] is guaranteed non-zero (set atomically in registerSeries).
         // roundId/startedAt/answeredInRound are deliberately discarded. Chainlink deprecated
@@ -571,7 +702,7 @@ contract GyldAtomicSwap is
         // F-6: a future-dated updatedAt would otherwise satisfy the age check forever
         // (updatedAt + maxNavAgeSecs stays ahead of block.timestamp) — treat as stale.
         if (updatedAt > block.timestamp) revert StaleNav(bondToken, updatedAt);
-        if (block.timestamp > updatedAt + $.maxNavAgeSecs) revert StaleNav(bondToken, updatedAt);
+        if (block.timestamp > updatedAt + _effectiveMaxNavAge($, bondToken)) revert StaleNav(bondToken, updatedAt);
 
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 navValue = (tokenAmount * uint256(nav)) / 1e20; // nav > 0 checked above
@@ -579,6 +710,36 @@ contract GyldAtomicSwap is
         if (usdcAmount > navValue + band || usdcAmount + band < navValue) {
             revert QuotePriceOutOfBand(usdcAmount, navValue);
         }
+
+        // Safe: `updatedAt <= block.timestamp` was enforced above.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        navRound = uint64(updatedAt);
+    }
+
+    /// @dev Charge one fill against its NAV round's budget (audit FIND-021). The counter
+    ///      resets whenever the round differs, so each NAV push opens a fresh budget.
+    function _drawNavRoundNotional(
+        GyldAtomicSwapStorage storage $,
+        address bondToken,
+        uint256 usdcAmount,
+        uint64 navRound
+    ) private {
+        uint256 cap = _effectiveMaxNavRoundNotional($, bondToken);
+        NavRoundDraw memory d = $.navRoundDrawOf[bondToken];
+        // Reset only on a STRICTLY NEWER round. A plain inequality would let a feed whose
+        // updatedAt moves backwards re-open an already-spent budget (A -> B -> A settles
+        // 2x the cap against A), so the counter stays pinned to the highest round seen.
+        bool newRound = navRound > d.round;
+        uint256 drawn = newRound ? 0 : d.drawn;
+        // Saturating: an admin may lower the cap mid-round below what is already drawn.
+        uint256 remaining = drawn >= cap ? 0 : cap - drawn;
+        if (usdcAmount > remaining) {
+            revert NavRoundNotionalExceeded(bondToken, usdcAmount, remaining, cap);
+        }
+        // Safe: drawn + usdcAmount <= cap <= MAX_NAV_ROUND_NOTIONAL_CEILING << 2**192.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        $.navRoundDrawOf[bondToken] =
+            NavRoundDraw(newRound ? navRound : d.round, uint192(drawn + usdcAmount));
     }
 
     // ── Quote invalidation ────────────────────────────────────────────────────
@@ -597,6 +758,13 @@ contract GyldAtomicSwap is
     ///         or incident response). Quotes signed for the old epoch revert with
     ///         QuoteEpochStale; the quote service must re-issue against the new epoch.
     function bumpQuoteEpoch() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _bumpQuoteEpoch();
+    }
+
+    /// @dev Audit FIND-014. The band, NAV age and TTL guards are read at execution, not
+    ///      signed into the quote, so every setter that moves one must kill quotes priced
+    ///      under the old value rather than judge them by the new one.
+    function _bumpQuoteEpoch() private {
         uint64 next = ++_getStorage().quoteEpoch;
         emit QuoteEpochBumped(next);
     }
@@ -604,12 +772,18 @@ contract GyldAtomicSwap is
     // ── Series registry ───────────────────────────────────────────────────────
 
     /// @notice Register a bond series so this contract can hold, value, and serve it.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Both probes are probe-before-store
-    ///         (house idiom): the forwarder is staticcall-probed for 8 decimals (the NAV
-    ///         scaling in _checkQuoteBand assumes 8dp) and the bond token for 18 decimals
-    ///         (F-1 — the /1e20 ladder assumes 18dp bond / 8dp NAV / 6dp USDC and
-    ///         mis-scales silently for anything else). Re-registering an active series
-    ///         just updates its forwarder.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Three probe-before-store checks (house
+    ///         idiom): forwarder `decimals() == 8` (the NAV scaling in _checkQuoteBand
+    ///         assumes 8dp), bond token `decimals() == 18` (F-1 — the /1e20 ladder assumes
+    ///         18dp bond / 8dp NAV / 6dp USDC and mis-scales silently otherwise), and a
+    ///         `latestRoundData()` that is readable, positive and not future-dated
+    ///         (FIND-002, D-32 — `updateAnswer()` must run first; that was a runbook step,
+    ///         now enforced on-chain).
+    ///         Re-registering an active series just updates its forwarder, under the same
+    ///         three probes, so a bad rotation leaves it pointed at the working one.
+    ///         A rotation is DELIBERATELY not gated on a zero balance (audit FIND-026): that is
+    ///         the grief-able precondition FIND-024 removed, and it would guard the wrong leg.
+    ///         It DOES need `bumpQuoteEpoch()` in the same timelock batch (FIND-014).
     /// @param token        GyldBondToken proxy address (18 decimals).
     /// @param navForwarder NAVFeedForwarder paired with the series (stable address).
     function registerSeries(address token, address navForwarder) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -622,30 +796,84 @@ contract GyldAtomicSwap is
         if (!tokenOk || tokenData.length != 32) revert InvalidTokenDecimals(token, 0);
         uint8 tokenDecimals = abi.decode(tokenData, (uint8));
         if (tokenDecimals != 18) revert InvalidTokenDecimals(token, tokenDecimals);
+        // Liveness, not shape (FIND-002): decimals() is `pure` on KaleidoscopeNAVFeed and
+        // delegated by the forwarder, so the probe above passes on a feed that has never
+        // been pushed — and every executeSwap on such a series reverts NoPriceSet at trade
+        // time. The three rejections below are exactly _checkQuoteBand's own structural
+        // ones (InvalidNav, F-6), so nothing admitted here can be refused there for a
+        // reason registration could have seen. Deliberately NOT an age check: staleness is
+        // per-read against maxNavAgeSecs and heals on the next push (D-32).
+        (bool navOk, bytes memory navData) =
+            navForwarder.staticcall(abi.encodeWithSignature("latestRoundData()"));
+        if (!navOk || navData.length < 160) revert NavFeedNotPriced(navForwarder);
+        // Decoded on the SAME terms as the hot path, deliberately: a looser decode here
+        // would admit a payload _checkQuoteBand then rejects — the divergence this finding
+        // is about. Malformed-but-long returndata therefore fails closed in the decoder.
+        (, int256 probeNav,, uint256 probeUpdatedAt,) =
+            abi.decode(navData, (uint80, int256, uint256, uint256, uint80));
+        // `updatedAt == 0` is the never-written sentinel (KaleidoscopeNAVFeed's NoPriceSet
+        // condition); carried with a positive answer it fails every age check forever.
+        if (probeNav <= 0 || probeUpdatedAt == 0) revert NavFeedNotPriced(navForwarder);
+        // Future-dated is refused OUTRIGHT by _checkQuoteBand (F-6), so a series admitted
+        // with one could never trade. Same invariant NAVFeedForwarder probes on its own
+        // upstream — this is the third place a bad upstream can enter, via a rotation.
+        if (probeUpdatedAt > block.timestamp) revert NavFeedFutureDated(navForwarder, probeUpdatedAt);
         GyldAtomicSwapStorage storage $ = _getStorage();
+        address previousForwarder = $.navForwarderOf[token];
         if (!$.registeredSeries[token]) $.seriesList.push(token);
         $.registeredSeries[token] = true;
         $.navForwarderOf[token] = navForwarder;
+        // SeriesRegistered fires on both paths so existing log indexing is unbroken.
+        // `previousForwarder != 0` IS "already registered" — the two are written together.
         emit SeriesRegistered(token, navForwarder);
+        if (previousForwarder != address(0) && previousForwarder != navForwarder) {
+            emit SeriesForwarderRotated(token, previousForwarder, navForwarder);
+        }
     }
 
-    /// @notice Deregister a matured bond series.
-    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Reverts SeriesNotEmpty while this
-    ///         contract still holds inventory of the series — silently orphaning
-    ///         inventory that can no longer be priced or served is unsafe. Wind the
-    ///         series down first (withdraw the remaining balance).
+    /// @notice Deregister a matured bond series, sweeping any residual inventory out.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Any remaining balance is swept to the
+    ///         fixed `withdrawalWallet` in the same call, then the series is retired.
     ///
-    ///         A PAUSED bond token blocks this call. Clearing the balance requires
-    ///         withdraw(), which a paused token blocks (see withdraw below), so the
-    ///         revert you get is SeriesNotEmpty — naming the balance, not the pause
-    ///         that is stopping you from clearing it. Check token.paused() before
-    ///         opening the timelock proposal; see the runbook's "Evacuating a paused
-    ///         bond token".
+    ///         Replaces a `SeriesNotEmpty` precondition (audit FIND-024). Requiring a zero
+    ///         balance at execution time was racy: clearing it is a separate `withdraw`,
+    ///         this call waits on the 48 h timelock, and `GyldBondToken` screens only
+    ///         sanctions (no transfer allowlist), so any holder could re-seed one wei and
+    ///         cost the operator both again. A dust threshold fails the same way at
+    ///         threshold + 1; making the two steps atomic is what closes it.
+    ///
+    ///         Reverts ZeroAddress on a residual balance with no destination set
+    ///         (fail-closed, like `withdraw`). A zero balance needs none, so a PAUSED bond
+    ///         token — which blocks the sweep with its own `EnforcedPause` — cannot block
+    ///         an empty retirement; hence the zero-code remedy for the griefing above:
+    ///         withdraw, pause the token, then execute (runbook, "Retiring a matured
+    ///         series").
+    ///
+    ///         Note this gives DEFAULT_ADMIN_ROLE a token path that skips TREASURER_ROLE.
+    ///         Per call the destination is the fixed `withdrawalWallet` — but the admin
+    ///         also sets that, so `setWithdrawalWallet` + `deregisterSeries` drains a
+    ///         registered series anywhere, where before it took a UUPS upgrade. Same
+    ///         actor behind the same timelock either way, so no new trust assumption;
+    ///         what is lost is the upgrade ceremony and its storage-layout review gate.
+    ///         Bounded to registered (18dp) series and loud: SeriesDeregistered plus
+    ///         Withdrawn, with the registry entry destroyed.
+    ///
+    ///         CEI: registry writes precede the transfer, covered by `nonReentrant`
+    ///         (shared with executeSwap and withdraw, I-17).
+    ///
+    ///         Removal is swap-and-pop, so this REORDERS the enumeration exposed by
+    ///         `registeredSeriesList`: the last series takes the retired one's index.
+    ///         That reordering is observable to integrators (audit FIND-017) — see
+    ///         `registeredSeriesList` for why a position must never be cached across it.
     /// @param token Registered bond series to remove.
-    function deregisterSeries(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function deregisterSeries(address token) external nonReentrant onlyRole(DEFAULT_ADMIN_ROLE) {
         GyldAtomicSwapStorage storage $ = _getStorage();
         if (!$.registeredSeries[token]) revert UnregisteredSeries(token);
-        if (IERC20(token).balanceOf(address(this)) != 0) revert SeriesNotEmpty(token);
+
+        uint256 residual = IERC20(token).balanceOf(address(this));
+        address to = $.withdrawalWallet;
+        if (residual != 0 && to == address(0)) revert ZeroAddress();
+
         uint256 n = $.seriesList.length;
         for (uint256 i = 0; i < n;) {
             if ($.seriesList[i] == token) {
@@ -659,7 +887,20 @@ contract GyldAtomicSwap is
         }
         delete $.registeredSeries[token];
         delete $.navForwarderOf[token];
+        // Clear the per-series age override too (FIND-022). Leaving it would silently
+        // re-apply a matured series' threshold if the same token were ever re-registered.
+        delete $.maxNavAgeSecsOf[token];
+        // Same for the FIND-021 cap and its counter: a re-registered token must not
+        // inherit a retired series' budget, nor its already-spent notional.
+        delete $.maxNavRoundNotionalOf[token];
+        delete $.navRoundDrawOf[token];
         emit SeriesDeregistered(token);
+
+        // Interaction last (CEI). Withdrawn keeps the sweep in the log stream ops index.
+        if (residual != 0) {
+            IERC20(token).safeTransfer(to, residual);
+            emit Withdrawn(token, to, residual);
+        }
     }
 
     // ── Admin: band params, allowlist, withdrawal wallet ──────────────────────
@@ -674,11 +915,13 @@ contract GyldAtomicSwap is
     ///         anything from zero to 2× NAV, i.e. no band at all. Since this band and the
     ///         quote TTL are the containment on a compromised quote-signer key, an admin
     ///         must not be able to widen it into a no-op. See the constant for why 10%.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newBps Band width in basis points, e.g. 200 = 2%. 0 <= newBps <= 1000.
     function setMaxQuoteDeviationBps(uint16 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newBps > MAX_QUOTE_DEVIATION_BPS_CEILING) revert InvalidDeviationBps(newBps);
         _getStorage().maxQuoteDeviationBps = newBps;
         emit MaxQuoteDeviationUpdated(newBps);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Set the max NAV feed age (seconds) before executeSwap fails closed.
@@ -692,11 +935,84 @@ contract GyldAtomicSwap is
     ///         guard, here "accept an arbitrarily old price". (For this setter and the
     ///         deviation band the restrictive end is a safe soft-pause; maxQuoteTtl
     ///         differs — its zero is the UNSET sentinel, not a pause.)
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newSecs Max feed age in seconds (e.g. 86400 = 1 day). 0 < newSecs <= 72 h.
     function setMaxNavAgeSecs(uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newSecs == 0 || newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
         _getStorage().maxNavAgeSecs = newSecs;
         emit MaxNavAgeUpdated(newSecs);
+        _bumpQuoteEpoch();
+    }
+
+    /// @notice Hold ONE series to its own max NAV age instead of the global value.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE (audit FIND-022). The global
+    ///         `maxNavAgeSecs` is a single value applied to every registered series, so
+    ///         a feed pushing hourly and one pushing daily are held to one threshold
+    ///         that is necessarily wrong for one of them: sized for the daily feed, the
+    ///         hourly one may be most of a day dead and still settle.
+    ///
+    ///         The SAME 72 h ceiling as the global setter applies (D-16). An override is
+    ///         a per-series tightening or loosening WITHIN that bound, never an escape
+    ///         from it — otherwise a single series could be widened into the no-op the
+    ///         ceiling exists to prevent.
+    ///
+    ///         `newSecs == 0` CLEARS the override and returns the series to the global
+    ///         value. It does not mean "zero seconds", and it is the one place this
+    ///         setter's zero differs from `setMaxNavAgeSecs`, where zero is rejected
+    ///         because the global has no value to fall back to.
+    ///
+    ///         Requires the series to be registered, so a typo cannot park an override
+    ///         on an address that is not a series. `deregisterSeries` clears it again.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
+    /// @param token   Registered bond series to hold to its own threshold.
+    /// @param newSecs Max feed age in seconds for this series, or 0 to clear the
+    ///                override. Non-zero values must be <= MAX_NAV_AGE_CEILING (72 h).
+    function setMaxNavAgeSecsFor(address token, uint32 newSecs) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!_getStorage().registeredSeries[token]) revert UnregisteredSeries(token);
+        if (newSecs > MAX_NAV_AGE_CEILING) revert InvalidNavAge(newSecs);
+        _getStorage().maxNavAgeSecsOf[token] = newSecs;
+        emit MaxNavAgeForSeriesUpdated(token, newSecs);
+        _bumpQuoteEpoch();
+    }
+
+    /// @notice Cap the USDC notional one series may settle against a single NAV round.
+    /// @dev    Caller must hold DEFAULT_ADMIN_ROLE (audit FIND-021). Bounded by
+    ///         MAX_NAV_ROUND_NOTIONAL_CEILING; the permissive end is the guard as a no-op.
+    ///         PASSING ZERO DOES NOT PAUSE ANYTHING — zero clears the override and the
+    ///         series follows DEFAULT_MAX_NAV_ROUND_NOTIONAL. To halt swaps use `pause()`.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
+    /// @param token  Registered series to bound.
+    /// @param newCap USDC (6dp) per NAV round. 0 clears; otherwise <= the ceiling.
+    function setMaxNavRoundNotionalFor(address token, uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!_getStorage().registeredSeries[token]) revert UnregisteredSeries(token);
+        if (newCap > MAX_NAV_ROUND_NOTIONAL_CEILING) revert InvalidNavRoundNotional(newCap);
+        _getStorage().maxNavRoundNotionalOf[token] = newCap;
+        emit MaxNavRoundNotionalForSeriesUpdated(token, newCap);
+        _bumpQuoteEpoch();
+    }
+
+    /// @notice The max NAV age actually enforced for `token` by executeSwap.
+    /// @dev    Resolves the override against the global fallback, so this is what the
+    ///         StaleNav check will use — read this rather than `maxNavAgeSecs()` when
+    ///         reasoning about one series (audit FIND-022).
+    function maxNavAgeSecsFor(address token) external view returns (uint32) {
+        return _effectiveMaxNavAge(_getStorage(), token);
+    }
+
+    /// @notice The per-NAV-round notional cap actually enforced for `token` (FIND-021).
+    /// @dev    Resolves the override against the default, so this is what executeSwap
+    ///         will enforce — integrators must not read the raw slot.
+    function maxNavRoundNotionalFor(address token) external view returns (uint256) {
+        return _effectiveMaxNavRoundNotional(_getStorage(), token);
+    }
+
+    /// @notice Notional already settled against `token`'s current NAV round (FIND-021).
+    /// @dev    `round` is the feed `updatedAt` the counter belongs to. Callers must
+    ///         compare it against the feed's live `updatedAt`: a stale `round` means the
+    ///         budget has since reset and `drawn` no longer applies.
+    function navRoundNotionalDrawn(address token) external view returns (uint64 round, uint256 drawn) {
+        NavRoundDraw memory d = _getStorage().navRoundDrawOf[token];
+        return (d.round, d.drawn);
     }
 
     /// @notice Set the upper bound on quote lifetime (seconds).
@@ -722,12 +1038,14 @@ contract GyldAtomicSwap is
     ///         life, it forbids prompt execution until the quote is nearly expired. Keep
     ///         this above the service's longest issued TTL (~60s class today). See the
     ///         constant for the full rationale.
+    ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param newTtl Max quote lifetime in seconds (e.g. 90 = the shipped default).
     ///               0 resets to the default; otherwise 0 < newTtl <= 600 (10 min).
     function setMaxQuoteTtl(uint64 newTtl) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newTtl > MAX_QUOTE_TTL_CEILING) revert InvalidQuoteTtl(newTtl);
         _getStorage().maxQuoteTtl = newTtl;
         emit MaxQuoteTtlUpdated(newTtl);
+        _bumpQuoteEpoch();
     }
 
     /// @notice Add or remove `account` from the executeSwap taker allowlist.
@@ -772,17 +1090,24 @@ contract GyldAtomicSwap is
     ///         treasury drain must work during an incident pause so funds can be
     ///         evacuated.
     ///
-    ///         Scope of that exemption: it covers THIS contract's pause only. Moving a
-    ///         GyldBondToken calls its `transfer`, which is `whenNotPaused` on the token,
-    ///         so a paused bond token blocks its own evacuation — the revert is
-    ///         `EnforcedPause`, raised by that `whenNotPaused` modifier on
-    ///         GyldBondToken.transfer itself, not here and not in the token's
-    ///         `_update` (which carries only the sanctions check). That is a
-    ///         design requirement: a pause inventory can be moved through is not a pause,
-    ///         and the swap holds no privileged position on the token. Do not add a
-    ///         bypass. Operators unpause the token, withdraw, then re-pause (PAUSER_ROLE
-    ///         on the token — no admin, no timelock); see the runbook's "Evacuating a
-    ///         paused bond token". USDC has no pause and is unaffected.
+    ///         Scope of that exemption: it covers THIS contract's pause only. Two gates
+    ///         on the bond token can still block an evacuation:
+    ///
+    ///         (1) The token's pause — `transfer` is `whenNotPaused`, so the revert is
+    ///         `EnforcedPause` from the token, not here. Not a bug: a pause inventory can
+    ///         move through is not a pause. Unpause the token, withdraw, re-pause
+    ///         (PAUSER_ROLE, no timelock). Runbook: "Evacuating a paused bond token".
+    ///
+    ///         (2) Screening — `_update` screens `address(this)` AND the withdrawalWallet,
+    ///         so a flag on either, or a reverting oracle, gives `AccountSanctioned` and
+    ///         unpausing does not help (audit FIND-023). Fast levers, no timelock:
+    ///         `removeFromSanctionsList` (keeper) for a local flag,
+    ///         `setForwardingOracle(0)` (compliance Safe) for an upstream one. A faulty
+    ///         mirror is the exception: `setSanctionsList` per token behind the 48 h
+    ///         timelock, no faster path. Runbook: "Evacuating when screening, not the
+    ///         pause, is the blocker".
+    ///
+    ///         USDC has neither gate.
     ///
     ///         CEI: no state to write; single external transfer guarded by
     ///         nonReentrant (shared with executeSwap). The treasurer can never redirect
@@ -833,6 +1158,27 @@ contract GyldAtomicSwap is
     function renounceRole(bytes32 role, address callerConfirmation) public override {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdminRole();
         super.renounceRole(role, callerConfirmation);
+    }
+
+    /// @dev Audit FIND-007. `renounceRole` above refuses DEFAULT_ADMIN_ROLE, but the role
+    ///      admins itself, so the sole holder could self-revoke into the same bricked state.
+    ///      Guarding `_revokeRole` covers both paths. Removing a NON-last admin is untouched
+    ///      — that is the deploy handover (grant successor, then self-revoke).
+    ///      `<= 1` not `== 1`: a proxy upgraded to this code never wrote the slot, so it reads
+    ///      0 while holding one admin; blocking there is the safe direction.
+    uint256 public defaultAdminCount;
+
+    function _grantRole(bytes32 r, address a) internal override returns (bool granted) {
+        granted = super._grantRole(r, a);
+        if (granted && r == DEFAULT_ADMIN_ROLE) defaultAdminCount++;
+    }
+
+    function _revokeRole(bytes32 r, address a) internal override returns (bool revoked) {
+        revoked = super._revokeRole(r, a);
+        if (revoked && r == DEFAULT_ADMIN_ROLE) {
+            if (defaultAdminCount <= 1) revert CannotRemoveLastAdmin();
+            defaultAdminCount--;
+        }
     }
 
     // ── UUPS upgrade authorization ────────────────────────────────────────────

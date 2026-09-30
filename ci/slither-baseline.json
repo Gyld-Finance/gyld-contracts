@@ -34,6 +34,11 @@
     {
       "check": "incorrect-equality",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
+    },
+    {
+      "check": "incorrect-equality",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
     {
@@ -69,12 +74,7 @@
     {
       "check": "low-level-calls",
       "file": "contracts/GyldBondToken.sol",
-      "element": "initialize"
-    },
-    {
-      "check": "low-level-calls",
-      "file": "contracts/GyldBondToken.sol",
-      "element": "setSanctionsList"
+      "element": "_probeSanctions"
     },
     {
       "check": "low-level-calls",
@@ -124,7 +124,22 @@
     {
       "check": "missing-inheritance",
       "file": "contracts/test/NAVFeedForwarder.t.sol",
+      "element": "ConstantMetadataWrapper"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/NAVFeedForwarder.t.sol",
       "element": "MockFutureDatedOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/NAVFeedForwarder.t.sol",
+      "element": "UnprobedPathWrapper"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "CallerBackReferenceOracle"
     },
     {
       "check": "missing-inheritance",
@@ -140,6 +155,11 @@
       "check": "missing-inheritance",
       "file": "contracts/test/SanctionsOracleMirror.t.sol",
       "element": "SelectiveRevertingOracle"
+    },
+    {
+      "check": "missing-inheritance",
+      "file": "contracts/test/SanctionsOracleMirror.t.sol",
+      "element": "SelectiveRouter"
     },
     {
       "check": "naming-convention",
@@ -183,6 +203,21 @@
     },
     {
       "check": "timestamp",
+      "file": "contracts/GyldAtomicSwap.sol",
+      "element": "registerSeries"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/IssuanceManager.sol",
+      "element": "subscribe"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/KaleidoscopeNAVFeed.sol",
+      "element": "emergencyUpdateAnswer"
+    },
+    {
+      "check": "timestamp",
       "file": "contracts/KaleidoscopeNAVFeed.sol",
       "element": "getRoundData"
     },
@@ -215,6 +250,11 @@
       "check": "timestamp",
       "file": "contracts/NAVFeedForwarder.sol",
       "element": "_probeNotFutureDated"
+    },
+    {
+      "check": "timestamp",
+      "file": "contracts/TokenFactory.sol",
+      "element": "deployToken"
     },
     {
       "check": "unused-return",

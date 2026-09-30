@@ -6,6 +6,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 contract IssuanceManagerTest is Test {
     // Mirror events for vm.expectEmit (Solidity 0.8.20 doesn't support ContractName.Event syntax)
@@ -451,7 +452,9 @@ contract IssuanceManagerTest is Test {
     }
 
     function testFuzz_subscribe_redeem_roundTrip(uint256 amount) public {
-        amount = bound(amount, 1e18, 1_000_000e18);
+        // Upper bound is the daily cap (FIND-001) — above it subscribe fails closed,
+        // which test_subscribe_revertsOverDailyCap covers directly.
+        amount = bound(amount, 1e18, mgr.DEFAULT_DAILY_CAP());
 
         _subscribeAp(amount);
         _apSendsToMgr(amount);
@@ -492,6 +495,32 @@ contract IssuanceManagerTest is Test {
         assertFalse(mgr.hasRole(whitelistAdminRole, admin));
     }
 
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(mgr.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, admin);
+        assertTrue(mgr.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = mgr.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); mgr.grantRole(adminRole, timelock);
+        vm.prank(admin); mgr.revokeRole(adminRole, admin);
+        assertFalse(mgr.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(IssuanceManager.CannotRemoveLastAdmin.selector);
+        mgr.revokeRole(adminRole, timelock);
+    }
+
     // ── registerToken interface validation (GYL-298) ──────────────────────────
 
     function test_registerToken_nonContractAddress_reverts() public {
@@ -526,9 +555,11 @@ contract IssuanceManagerTest is Test {
         rtoken.arm(redeemer, ap, 1e18);
 
         // The burn() call on rtoken will attempt to re-enter redeem() — the
-        // ReentrancyGuard must reject the second call.
+        // ReentrancyGuard must reject the second call. Assert the guard's own selector,
+        // not a bare revert: a bare expectRevert is satisfied by any failure, including
+        // one that never reaches the guard.
         vm.prank(redeemer);
-        vm.expectRevert();
+        vm.expectRevert(ReentrancyGuardUpgradeable.ReentrancyGuardReentrantCall.selector);
         mgr.redeem(address(rtoken), ap, 1e18);
     }
 
@@ -544,7 +575,7 @@ contract IssuanceManagerTest is Test {
         rtoken.armMint(subscriber, ap, 1e18);
 
         vm.prank(subscriber);
-        vm.expectRevert();
+        vm.expectRevert(ReentrancyGuardUpgradeable.ReentrancyGuardReentrantCall.selector);
         mgr.subscribe(address(rtoken), ap, 1e18);
     }
     // ── ERC-7201 storage layout (GYL-1208) ────────────────────────────────────
@@ -599,6 +630,280 @@ contract IssuanceManagerTest is Test {
             "a registered token must NOT appear in whitelisted's slot (fields swapped?)"
         );
     }
+    // ── Daily mint cap (audit FIND-001) ───────────────────────────────────────
+
+    address pauser = address(0xA5);
+
+    /// Pins the literal. Every other cap test derives from DEFAULT_DAILY_CAP, so this is
+    /// the one place a change to the constant has to be acknowledged deliberately.
+    function test_dailyCap_defaultsTo1M() public view {
+        assertEq(mgr.dailyCap(address(token)), 1_000_000e18);
+    }
+
+    /// The finding: subscribe() bounded nothing, so one online key could mint without limit.
+    function test_subscribe_revertsOverDailyCap() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), cap + 1, cap));
+        mgr.subscribe(address(token), ap, cap + 1);
+    }
+
+    /// The cap must hold across many small mints, not just one large one.
+    function test_subscribe_capIsCumulativeWithinTheDay() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
+        for (uint256 i = 0; i < 10; i++) {
+            vm.prank(subscriber);
+            mgr.subscribe(address(token), ap, cap / 10);
+        }
+        (uint256 minted,) = mgr.mintedToday(address(token));
+        assertEq(minted, cap);
+
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), cap));
+        mgr.subscribe(address(token), ap, 1);
+    }
+
+    function test_subscribe_windowResetsAfterADay() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, cap);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, cap);
+        assertEq(token.totalSupply(), 2 * cap);
+    }
+
+    /// One second early must NOT reset, or the cap is bypassable by waiting slightly less.
+    function test_subscribe_windowDoesNotResetEarly() public {
+        uint256 cap = mgr.DEFAULT_DAILY_CAP();
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, cap);
+
+        vm.warp(block.timestamp + 1 days - 1);
+        vm.prank(subscriber);
+        vm.expectRevert(abi.encodeWithSelector(
+            IssuanceManager.DailyCapExceeded.selector, address(token), uint256(1), cap));
+        mgr.subscribe(address(token), ap, 1);
+    }
+
+    function test_setDailyCap_raisesAndZeroRestoresDefault() public {
+        uint256 raised = mgr.DEFAULT_DAILY_CAP() * 5;
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), raised);
+        assertEq(mgr.dailyCap(address(token)), raised);
+
+        vm.prank(subscriber);
+        mgr.subscribe(address(token), ap, raised);
+
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), 0);
+        assertEq(mgr.dailyCap(address(token)), mgr.DEFAULT_DAILY_CAP(), "zero restores the default");
+    }
+
+    /// Usage.minted is a uint192 and subscribe casts to it explicitly, which Solidity does
+    /// not check — a cap above that range would truncate the running total and silently
+    /// reset the counter. The setter is the only place that can create one.
+    function test_setDailyCap_rejectsCapAboveUint192() public {
+        uint256 tooBig = uint256(type(uint192).max) + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.InvalidCap.selector, tooBig));
+        mgr.setDailyCap(address(token), tooBig);
+
+        vm.prank(admin);
+        mgr.setDailyCap(address(token), type(uint192).max); // the boundary itself is fine
+        assertEq(mgr.dailyCap(address(token)), type(uint192).max);
+    }
+
+    /// A cap the online key could raise would not be a cap.
+    function test_setDailyCap_subscriberCannotRaiseIt() public {
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.setDailyCap(address(token), type(uint256).max);
+    }
+
+    // ── Beneficiary is unconstrained on-chain (audit FIND-015 / TEST-79) ─────
+
+    /// TEST-79. The NatSpec used to claim a rogue REDEEMER_ROLE key "cannot redirect the
+    /// off-chain USDC payment" because settlement keys off the beneficiary in the Redeemed
+    /// event. It can: the beneficiary IS the caller's argument, so the event records the
+    /// attacker's own choice. Alice deposits, the redeemer names Mallory, and the event
+    /// says Mallory. Pinned so the corrected comment cannot silently regress.
+    function test_redeem_beneficiaryNeedNotBeTheDepositor() public {
+        address alice   = address(0xA11CE);
+        address mallory = address(0x4A110C);
+        vm.startPrank(whitelistAdmin);
+        mgr.addToWhitelist(alice);
+        mgr.addToWhitelist(mallory);
+        vm.stopPrank();
+
+        // Alice is the only depositor: minted to her, and she sends the tokens in.
+        vm.prank(subscriber); mgr.subscribe(address(token), alice, 10e18);
+        vm.prank(alice);      token.transfer(address(mgr), 10e18);
+
+        // The redeemer names Mallory instead. Nothing on-chain objects.
+        vm.expectEmit(true, true, false, true);
+        emit Redeemed(address(token), mallory, 10e18);
+        vm.prank(redeemer);
+        mgr.redeem(address(token), mallory, 10e18);
+
+        assertEq(token.balanceOf(address(mgr)), 0, "Alice's deposit was burned");
+    }
+
+    /// The one real on-chain constraint: the whitelist. A non-whitelisted beneficiary is
+    /// refused, capping the blast radius of a compromised key at KYC-approved addresses.
+    function test_redeem_beneficiaryMustStillBeWhitelisted() public {
+        address alice = address(0xA11CE);
+        vm.prank(whitelistAdmin); mgr.addToWhitelist(alice);
+        vm.prank(subscriber);     mgr.subscribe(address(token), alice, 10e18);
+        vm.prank(alice);          token.transfer(address(mgr), 10e18);
+
+        vm.prank(redeemer);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.NotWhitelisted.selector, outsider));
+        mgr.redeem(address(token), outsider, 10e18);
+    }
+
+    // ── Pause ─────────────────────────────────────────────────────────────────
+
+    function _grantPauser() internal {
+        bytes32 role = mgr.ISSUANCE_PAUSER_ROLE();
+        vm.prank(admin);
+        mgr.grantRole(role, pauser);
+    }
+
+    function test_pauseIssuance_blocksSubscribe() public {
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(subscriber);
+        vm.expectRevert();
+        mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    /// Redeem stays open: trapping APs mid-incident makes the incident worse.
+    function test_pauseIssuance_leavesRedeemOpen() public {
+        vm.prank(whitelistAdmin); mgr.addToWhitelist(address(mgr));
+        vm.prank(subscriber); mgr.subscribe(address(token), address(mgr), 10e18);
+
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(redeemer);
+        mgr.redeem(address(token), ap, 10e18);
+        assertEq(token.totalSupply(), 0);
+    }
+
+    /// Asymmetric, like the swap (D-14): pauser stops it, only the timelock restarts it.
+    function test_unpauseIssuance_isTimelockOnly() public {
+        _grantPauser();
+        vm.prank(pauser); mgr.pauseIssuance();
+
+        vm.prank(pauser);
+        vm.expectRevert();
+        mgr.unpauseIssuance();
+
+        vm.prank(admin); mgr.unpauseIssuance();
+        vm.prank(subscriber); mgr.subscribe(address(token), ap, 1e18);
+    }
+
+    // ── Maturity gate on primary issuance (audit FIND-009 / TEST-61) ─────────
+
+    /// Deploy a second series with a real maturity, wired exactly like the fixture token.
+    /// The fixture's own `token` is open-ended (maturity 0), which is why every test above
+    /// this section is untouched by the gate.
+    function _deployMaturingSeries(uint256 maturity) internal returns (GyldBondToken s) {
+        GyldBondToken tokenImpl = new GyldBondToken();
+        s = GyldBondToken(address(new ERC1967Proxy(
+            address(tokenImpl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Maturing Bond", "MBOND", "US000000MATR", maturity,
+                address(this), address(this), address(mockSanctions)
+            ))
+        )));
+        s.grantRole(s.MINTER_ROLE(), address(mgr));
+        s.grantRole(s.BURNER_ROLE(), address(mgr));
+        vm.prank(registrar); mgr.registerToken(address(s));
+    }
+
+    /// subscribe() depends on maturityTimestamp(), so registration must reject a token that
+    /// lacks it — otherwise the failure surfaces later, as an opaque revert on a live
+    /// subscriber transaction, against a token the registry already blessed.
+    function test_registerToken_withoutMaturityTimestamp_reverts() public {
+        NoMaturityToken bad = new NoMaturityToken();
+        vm.prank(registrar);
+        vm.expectRevert(abi.encodeWithSelector(IssuanceManager.NotValidTokenContract.selector, address(bad)));
+        mgr.registerToken(address(bad));
+    }
+
+    /// TEST-61. The finding itself: a matured series must stop minting.
+    function test_subscribe_revertsOnceSeriesHasMatured() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18); // live: fine
+
+        vm.warp(maturity + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(IssuanceManager.SeriesMatured.selector, address(s), maturity, block.timestamp)
+        );
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+    }
+
+    /// The boundary is closed at the timestamp itself, matching TokenFactory.deployToken,
+    /// which requires a maturity strictly greater than the deploying block.
+    function test_subscribe_revertsAtTheMaturityTimestampItself() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+
+        vm.warp(maturity - 1);
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+        assertEq(s.balanceOf(ap), 1e18, "one second before maturity must still mint");
+
+        vm.warp(maturity);
+        vm.expectRevert(
+            abi.encodeWithSelector(IssuanceManager.SeriesMatured.selector, address(s), maturity, maturity)
+        );
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 1e18);
+    }
+
+    /// 0 is the documented open-ended sentinel — it must never be read as "matured at epoch".
+    function test_subscribe_openEndedSeriesNeverMatures() public {
+        vm.warp(4_000_000_000);
+        assertEq(token.maturityTimestamp(), 0, "fixture series must be open-ended");
+        vm.prank(subscriber); mgr.subscribe(address(token), ap, 1e18);
+        assertEq(token.balanceOf(ap), 1e18, "an open-ended series must keep minting");
+    }
+
+    /// The other half of the remediation: closing issuance must not trap holders. Redeem
+    /// and the token's own transfers stay open after maturity, so an AP can still exit.
+    function test_redeemAndTransferStayOpenAfterMaturity() public {
+        uint256 maturity = block.timestamp + 30 days;
+        GyldBondToken s = _deployMaturingSeries(maturity);
+        vm.prank(subscriber); mgr.subscribe(address(s), ap, 10e18);
+
+        vm.warp(maturity + 365 days);
+
+        // Secondary transfer: unaffected by maturity.
+        address other = address(0xBEEF);
+        vm.prank(ap); s.transfer(other, 1e18);
+        assertEq(s.balanceOf(other), 1e18, "transfers must stay open after maturity");
+
+        // Redemption path: AP sends to the manager, REDEEMER burns.
+        vm.prank(ap); s.transfer(address(mgr), 4e18);
+        vm.prank(redeemer); mgr.redeem(address(s), ap, 4e18);
+        assertEq(s.totalSupply(), 6e18, "redeem must stay open after maturity");
+    }
+
+}
+
+/// @dev Passes the MINTER_ROLE() probe but has no maturityTimestamp() — the shape
+///      registerToken must now reject (audit FIND-009).
+contract NoMaturityToken {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    function mint(address, uint256) external {}
+    function burn(address, uint256) external {}
 }
 
 /// @dev Malicious token that attempts to re-enter IssuanceManager on burn() or mint().
@@ -618,6 +923,11 @@ contract ReentrantToken {
     bool    private _armMint;
 
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    /// Open-ended. `subscribe` reads this before minting (audit FIND-009); without it the
+    /// staticcall reverts on an unknown selector and the reentrancy test above passes for
+    /// the wrong reason — never reaching the guard it exists to exercise.
+    function maturityTimestamp() external pure returns (uint256) { return 0; }
 
     constructor(address mgr) { _mgr = IssuanceManager(mgr); }
 
@@ -646,6 +956,7 @@ contract ReentrantToken {
             _mgr.subscribe(address(this), _mintRecipient, _mintAmount);
         }
     }
+
 }
 
 // Forge cheatcode interface needed inside ReentrantToken

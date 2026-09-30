@@ -7,6 +7,8 @@ import {GyldBondToken} from "../GyldBondToken.sol";
 import {IERC1643} from "../interfaces/IERC1643.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
+import {ISanctionsList} from "../interfaces/ISanctionsList.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 // ── V2 stub for upgrade test ──────────────────────────────────────────────────
 
@@ -387,26 +389,50 @@ contract GyldBondTokenTest is Test {
         assertEq(token.balanceOf(ap), 1_000e18, "tokens were burned despite no BURNER_ROLE");
     }
 
-    /// Property B: BURNER_ROLE can burn from any address without that address's allowance.
-    /// This is intentional: forced redemption is a compliance requirement for regulated bonds.
-    function test_burn_burnerRole_fromArbitraryAddress_noAllowanceNeeded() public {
+    /// Property B: BURNER_ROLE is NOT a clawback — `burn` requires `from == msg.sender`
+    /// (audit FIND-027). This asserted the opposite until the Information Memorandum
+    /// settled it: forced redemption is a capability the contract must NOT have.
+    function test_burn_burnerRole_cannotReachAnotherHoldersBalance() public {
         // Mint tokens to ap.
         vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
 
-        // ap has NOT approved directBurner — zero allowance.
         address directBurner = address(0xB1);
 
         // Cache role bytes before pranking — prank is consumed by the first external call,
         // so calling token.BURNER_ROLE() inside vm.prank would consume the prank on the getter.
         bytes32 burnerRole = token.BURNER_ROLE();
         vm.prank(admin); token.grantRole(burnerRole, directBurner);
-        assertEq(token.allowance(ap, directBurner), 0, "allowance should be zero");
 
-        // BURNER_ROLE burns from ap — no allowance check, no approval needed.
+        // The role alone does not reach ap's balance.
         vm.prank(directBurner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
         token.burn(ap, 500e18);
 
-        assertEq(token.balanceOf(ap), 500e18, "burn amount wrong");
+        // Nor the role PLUS a full allowance — `burn` never consults allowances.
+        vm.prank(ap); token.approve(directBurner, type(uint256).max);
+        vm.prank(directBurner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 500e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "a holder's balance was destroyed by BURNER_ROLE");
+    }
+
+    /// The other half: a BURNER_ROLE holder CAN destroy what it owns — the redemption path.
+    function test_burn_burnerRole_burnsItsOwnBalance() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        address directBurner = address(0xB1);
+        bytes32 burnerRole = token.BURNER_ROLE();
+        vm.prank(admin); token.grantRole(burnerRole, directBurner);
+
+        vm.prank(ap); token.transfer(directBurner, 500e18);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.prank(directBurner); token.burn(directBurner, 500e18);
+
+        assertEq(token.balanceOf(directBurner), 0,                  "burner kept units it destroyed");
+        assertEq(token.balanceOf(ap),           500e18,             "ap balance wrong");
+        assertEq(token.totalSupply(),           supplyBefore - 500e18, "supply not reduced");
     }
 
     /// Revoking BURNER_ROLE immediately removes the ability to burn.
@@ -417,9 +443,12 @@ contract GyldBondTokenTest is Test {
         bytes32 burnerRole = token.BURNER_ROLE();
         vm.prank(admin); token.grantRole(burnerRole, directBurner);
 
+        // Position the units on the burner — it can only destroy its own balance.
+        vm.prank(ap); token.transfer(directBurner, 200e18);
+
         // Burn works with the role.
-        vm.prank(directBurner); token.burn(ap, 100e18);
-        assertEq(token.balanceOf(ap), 900e18);
+        vm.prank(directBurner); token.burn(directBurner, 100e18);
+        assertEq(token.balanceOf(directBurner), 100e18);
 
         // Role is revoked.
         vm.prank(admin); token.revokeRole(burnerRole, directBurner);
@@ -427,7 +456,79 @@ contract GyldBondTokenTest is Test {
         // Burn now reverts.
         vm.prank(directBurner);
         vm.expectRevert();
-        token.burn(ap, 100e18);
+        token.burn(directBurner, 100e18);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // audit FIND-027 — supply destruction cannot reach a balance it does not own
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// TEST-78. `burn` moved a balance unscreened; the fix removes the capability rather
+    /// than screening it, so no unscreened third-party destruction is left to screen.
+    function test_burn_fromAnotherAccount_reverts_FIND027() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        // The production burner — the only address holding the role today.
+        vm.prank(address(mgr));
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "IssuanceManager reached a holder's balance");
+    }
+
+    /// The escalation the finding is really about: admin can grant itself BURNER_ROLE and
+    /// still cannot touch a holder. Only a proxy upgrade could change that.
+    function test_burn_adminSelfGrantingBurnerRole_stillCannotClawBack() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        bytes32 burnerRole = token.BURNER_ROLE();
+        vm.prank(admin); token.grantRole(burnerRole, admin);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1_000e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "admin clawed back a holder's balance");
+    }
+
+    /// A sanctioned holder is frozen, not expropriated — `_update` blocks its transfers and
+    /// `burn` cannot destroy it. Any future seizure power needs its own role, not this one.
+    function test_burn_sanctionedHolder_balanceCannotBeDestroyed() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = ap;
+        mockSanctions.addToSanctionsList(addrs);
+
+        vm.prank(address(mgr));
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, ap));
+        token.burn(ap, 1_000e18);
+
+        assertEq(token.balanceOf(ap), 1_000e18, "sanctioned balance was destroyed, not frozen");
+    }
+
+    /// No screening crept in by the back door: a self-burn succeeds while the caller is
+    /// listed. D-38 liveness — IssuanceManager's own position must never be stranded.
+    function test_burn_selfBurn_succeedsWhileCallerIsSanctioned() public {
+        vm.prank(issuer); mgr.subscribe(address(token), ap, 1_000e18);
+        vm.prank(ap); token.transfer(address(mgr), 400e18);
+
+        address[] memory addrs = new address[](1);
+        addrs[0] = address(mgr);
+        mockSanctions.addToSanctionsList(addrs);
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.prank(address(mgr)); token.burn(address(mgr), 400e18);
+
+        assertEq(token.balanceOf(address(mgr)), 0, "self-burn blocked by the caller's own listing");
+        assertEq(token.totalSupply(), supplyBefore - 400e18, "supply not reduced");
+    }
+
+    /// The zero-address guard still fires first, so `burn(0, x)` keeps its existing error.
+    function test_burn_zeroAddress_stillReportsZeroAddress() public {
+        vm.prank(address(mgr));
+        vm.expectRevert(GyldBondToken.ZeroAddress.selector);
+        token.burn(address(0), 1e18);
     }
 
     // ── initialize sanctions oracle probe (M-04) ──────────────────────────────
@@ -460,24 +561,28 @@ contract GyldBondTokenTest is Test {
 
     // ── setSanctionsList probe ────────────────────────────────────────────────
 
+    /// Stand-in for an address on the CURRENT SDN list, supplied by the proposer.
+    address constant SDN_FLAGGED = address(0x5D17);
+
     function test_setSanctionsList_validOracle_succeeds() public {
         MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        newOracle.setSanctioned(SDN_FLAGGED, true);
         vm.prank(admin);
-        token.setSanctionsList(address(newOracle));
+        token.setSanctionsList(address(newOracle), SDN_FLAGGED);
         assertEq(address(token.sanctionsList()), address(newOracle));
     }
 
     function test_setSanctionsList_zeroAddress_reverts() public {
         vm.prank(admin);
         vm.expectRevert(GyldBondToken.ZeroAddress.selector);
-        token.setSanctionsList(address(0));
+        token.setSanctionsList(address(0), SDN_FLAGGED);
     }
 
     function test_setSanctionsList_eoa_reverts() public {
         address eoa = address(0xBEEF);
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, eoa));
-        token.setSanctionsList(eoa);
+        token.setSanctionsList(eoa, SDN_FLAGGED);
     }
 
     function test_setSanctionsList_wrongContract_reverts() public {
@@ -485,14 +590,149 @@ contract GyldBondTokenTest is Test {
         address wrongContract = address(new MockWrongContract());
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, wrongContract));
-        token.setSanctionsList(wrongContract);
+        token.setSanctionsList(wrongContract, SDN_FLAGGED);
     }
 
+    /// The oracle is VALID here, so the role check is the only thing that can revert — a
+    /// bad oracle would satisfy a bare expectRevert() and hide a missing onlyRole.
     function test_setSanctionsList_onlyAdmin_reverts() public {
         MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        newOracle.setSanctioned(SDN_FLAGGED, true);
         vm.prank(address(0xDEAD));
-        vm.expectRevert();
-        token.setSanctionsList(address(newOracle));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(0xDEAD), bytes32(0)
+            )
+        );
+        token.setSanctionsList(address(newOracle), SDN_FLAGGED);
+    }
+
+    // ── Sanctions-oracle admission: interface check (audit FIND-008) ─────────
+    //
+    // The probe used to check only that the reply was 32 bytes long. It now also requires
+    // a contract, and a canonical `false` — the same terms `_requireAccess` decodes on,
+    // since that is a HIGH-LEVEL call and solc's ABI bool validator reverts with no reason
+    // data on any word above 1. A length-only probe admitted such an oracle and then
+    // reverted EVERY transfer of the series.
+    //
+    // The `address(0)` probe proves the oracle ANSWERS. Since FIND-008 was reopened, a
+    // rotation also proves it SCREENS: the candidate must flag a proposer-supplied SDN
+    // address, which is what refuses the two oracles that used to be accepted limits.
+
+    function test_setSanctionsList_nonCanonicalBool_reverts() public {
+        address bad = address(new NonCanonicalSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+    }
+
+    function test_initialize_nonCanonicalBool_sanctionsList_reverts() public {
+        GyldBondToken impl = new GyldBondToken();
+        address bad = address(new NonCanonicalSanctionsList());
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        new ERC1967Proxy(
+            address(impl),
+            abi.encodeCall(GyldBondToken.initialize, (
+                "Test Bond", "TST", "XX0000000001", 0,
+                address(0xAD), address(0xAD), bad
+            ))
+        );
+    }
+
+    /// The always-`true` oracle from the finding. `address(0)` is the canonical clean
+    /// address — `SanctionsOracleMirror.addToSanctionsList` cannot even hold it — so an
+    /// oracle flagging it flags everything. Caught with no fixture and nothing to go stale.
+    function test_setSanctionsList_alwaysTrueOracle_reverts() public {
+        address bad = address(new AlwaysTrueSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+    }
+
+    /// An oracle that reverts the read is refused, not stored.
+    function test_setSanctionsList_revertingOracle_reverts() public {
+        address bad = address(new RevertingSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
+    }
+
+    /// Returndata shorter than a word is refused.
+    function test_setSanctionsList_shortReturnData_reverts() public {
+        address bad = address(new ShortReturnSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+    }
+
+    /// The case Halborn reopened FIND-008 on. An oracle wired to `false` answers `address(0)`
+    /// exactly as a healthy one does, so the interface probe admits it and screening is
+    /// silently off. It cannot flag the supplied SDN address, so the rotation is refused and
+    /// the working oracle stays.
+    function test_setSanctionsList_alwaysFalseOracle_isRejected() public {
+        address blind = address(new AlwaysFalseSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldBondToken.SanctionsOracleMissesFlagged.selector, blind, SDN_FLAGGED)
+        );
+        token.setSanctionsList(blind, SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
+    }
+
+    /// The second former accepted limit: canonical for `address(0)`, garbage (a word of 2)
+    /// for everyone else, which would revert every transfer. Its garbage answer for the
+    /// caller is not a canonical `false`, so the clean-caller probe refuses it first.
+    function test_setSanctionsList_canonicalOnlyForZero_isRejected() public {
+        address dirty = address(new DirtyForNonZeroSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, dirty));
+        token.setSanctionsList(dirty, SDN_FLAGGED);
+    }
+
+    /// A healthy, correctly built oracle that simply is not seeded with the supplied address
+    /// — an unseeded mirror, or an address delisted inside the 48 h timelock window. Refused
+    /// loudly; the current oracle stays in place, and the proposal is re-made.
+    function test_setSanctionsList_unseededOracle_isRejected() public {
+        MockSanctionsList unseeded = new MockSanctionsList(address(this));
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GyldBondToken.SanctionsOracleMissesFlagged.selector, address(unseeded), SDN_FLAGGED
+            )
+        );
+        token.setSanctionsList(address(unseeded), SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), address(mockSanctions), "must keep the working oracle");
+    }
+
+    /// A zero `knownFlagged` would fail the flagged probe anyway; naming it is clearer.
+    function test_setSanctionsList_zeroKnownFlagged_reverts() public {
+        MockSanctionsList newOracle = new MockSanctionsList(address(this));
+        vm.prank(admin);
+        vm.expectRevert(GyldBondToken.ZeroAddress.selector);
+        token.setSanctionsList(address(newOracle), address(0));
+    }
+
+    /// "Wired to true" in the shape the `address(0)` probe misses: it clears only zero and
+    /// flags everyone else, so every transfer would revert. It flags the caller — the
+    /// timelock — so the clean-caller probe refuses it.
+    function test_setSanctionsList_flagsAllButZeroOracle_isRejected() public {
+        address bad = address(new FlagsAllButZeroSanctionsList());
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.NotValidSanctionsList.selector, bad));
+        token.setSanctionsList(bad, SDN_FLAGGED);
+    }
+
+    /// ACCEPTED LIMIT, pinned so it is not mistaken for coverage. An oracle that flags only
+    /// the one address it is probed with passes: any fixed probe can be gamed by an oracle
+    /// that chooses its answer per address. The threat here is governance error behind a
+    /// 48 h timelock, not an adversarial oracle — and whoever holds DEFAULT_ADMIN_ROLE can
+    /// upgrade this token outright, which is strictly worse. D-33.
+    function test_setSanctionsList_singleAddressOracle_isAdmitted_acceptedLimit() public {
+        address narrow = address(new FlagsOnlySanctionsList(SDN_FLAGGED));
+        vm.prank(admin);
+        token.setSanctionsList(narrow, SDN_FLAGGED);
+        assertEq(address(token.sanctionsList()), narrow);
     }
 
     // ── Fail-closed on an unset sanctions list (audit §4.1) ───────────────────
@@ -594,6 +834,32 @@ contract GyldBondTokenTest is Test {
         vm.prank(pauser2);
         token.renounceRole(pauserRole, pauser2);
         assertFalse(token.hasRole(pauserRole, pauser2));
+    }
+
+
+    // ── revokeRole last-admin guard (audit FIND-007 / TEST-59) ────────────────
+
+    /// TEST-59. renounceRole was guarded, revokeRole was not, and DEFAULT_ADMIN_ROLE admins
+    /// itself — so the sole holder could self-revoke into the same bricked state.
+    function test_revokeRole_lastAdmin_reverts() public {
+        bytes32 adminRole = token.DEFAULT_ADMIN_ROLE(); // cache: the getter would eat the prank
+        assertEq(token.defaultAdminCount(), 1);
+        vm.prank(admin);
+        vm.expectRevert(GyldBondToken.CannotRemoveLastAdmin.selector);
+        token.revokeRole(adminRole, admin);
+        assertTrue(token.hasRole(adminRole, admin));
+    }
+
+    /// The handover every deploy script performs — grant successor, then self-revoke.
+    function test_revokeRole_nonLastAdmin_succeeds() public {
+        bytes32 adminRole = token.DEFAULT_ADMIN_ROLE();
+        address timelock = address(0xADAD);
+        vm.prank(admin); token.grantRole(adminRole, timelock);
+        vm.prank(admin); token.revokeRole(adminRole, admin);
+        assertFalse(token.hasRole(adminRole, admin));
+        vm.prank(timelock);
+        vm.expectRevert(GyldBondToken.CannotRemoveLastAdmin.selector);
+        token.revokeRole(adminRole, timelock);
     }
 
     // ── decimals() is a cross-contract invariant ──────────────────────────────
@@ -864,3 +1130,65 @@ contract GyldBondTokenTest is Test {
 
 /// @dev A deployed contract with no isSanctioned() function — used to test the probe rejection.
 contract MockWrongContract {}
+
+
+// ── Sanctions-oracle doubles for the admission probe (audit FIND-008) ─────────
+
+/// @dev Reverts on every screen — a broken, paused or self-destructed oracle.
+contract RevertingSanctionsList is ISanctionsList {
+    error Down();
+    function isSanctioned(address) external pure override returns (bool) { revert Down(); }
+}
+
+/// @dev Replies with 16 bytes. Written in assembly on purpose: any Solidity return type
+///      narrower than a word is still ABI-padded to 32 bytes, so it could not produce this.
+contract ShortReturnSanctionsList {
+    fallback() external {
+        assembly { mstore(0, 1) return(0, 16) }
+    }
+}
+
+/// @dev Replies with a full word whose value is 2. Length-correct, so the old probe took
+///      it; the hot path's ABI bool validator rejects it, so every transfer reverted.
+contract NonCanonicalSanctionsList {
+    fallback() external {
+        assembly { mstore(0, 2) return(0, 32) }
+    }
+}
+
+/// @dev Flags every address except `address(0)` — "wired to true", past the zero probe.
+contract FlagsAllButZeroSanctionsList is ISanctionsList {
+    function isSanctioned(address addr) external pure override returns (bool) { return addr != address(0); }
+}
+
+/// @dev Flags exactly one address and nothing else — the per-address oracle D-33 names.
+contract FlagsOnlySanctionsList is ISanctionsList {
+    address public immutable only;
+    constructor(address only_) { only = only_; }
+    function isSanctioned(address addr) external view override returns (bool) { return addr == only; }
+}
+
+/// @dev Canonical for `address(0)` and a non-canonical word (2) for every other address.
+///      Passes the `address(0)` probe; refused on rotation by the flagged-address probe.
+contract DirtyForNonZeroSanctionsList {
+    fallback() external {
+        assembly {
+            switch calldataload(4)
+            case 0 { mstore(0, 0) }
+            default { mstore(0, 2) }
+            return(0, 32)
+        }
+    }
+}
+
+
+/// @dev Answers `false` for everything — the silent case. Passes the `address(0)` probe;
+///      refused on rotation because it cannot flag the supplied SDN address (FIND-008).
+contract AlwaysFalseSanctionsList is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) { return false; }
+}
+
+/// @dev Flags every address, `address(0)` included — the always-`true` case (FIND-008).
+contract AlwaysTrueSanctionsList is ISanctionsList {
+    function isSanctioned(address) external pure override returns (bool) { return true; }
+}

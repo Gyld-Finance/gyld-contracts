@@ -29,7 +29,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///          instructions if the broadcaster lacks WHITELIST_ADMIN_ROLE (prod: ops Safe
 ///          runs it separately).
 ///   3. Per series: swap.registerSeries(token, factory.forwarderOf(token))
-///        — forwarder probed for decimals() == 8 on-chain; reverts otherwise.
+///        — forwarder probed for decimals() == 8 and, since FIND-002, for a readable
+///          positive latestRoundData(): an unpushed NAV reverts NavFeedNotPriced here.
 ///   4. swap.setWithdrawalWallet(WITHDRAWAL_WALLET) — fixed treasury destination the
 ///        treasurer withdraws NET flow to (required env; defaults to treasurer in dev).
 ///   5. Grant ALLOWLIST_ADMIN_ROLE to the deployer (needed for step 6) and to
@@ -57,6 +58,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 /// Pre-requisites:
 ///   - Each SERIES_TOKENS forwarder must have a NAV pushed (executeSwap fails closed on
 ///     a non-positive or stale NAV). Push via KaleidoscopeNAVFeed.updateAnswer first.
+///     Since FIND-002 this is ENFORCED, not just documented — registerSeries reverts.
 ///
 /// ── Environment variables ──────────────────────────────────────────────────
 /// Required on EVERY chain:
@@ -153,7 +155,8 @@ contract DeployAtomicSettlement is Script {
         _whitelistSwapAsAp(c);
 
         // 3. Register each series with its NAV forwarder (factory lookup).
-        //    registerSeries probes forwarder.decimals() == 8 on-chain.
+        //    registerSeries probes forwarder.decimals() == 8 and, since FIND-002, that
+        //    latestRoundData() answers — a missing updateAnswer fails here, not at trade.
         _registerSeries();
 
         // 4. Set the fixed treasury withdrawal wallet — the treasurer can only ever

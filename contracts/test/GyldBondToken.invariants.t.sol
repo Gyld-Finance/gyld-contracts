@@ -31,12 +31,16 @@ contract TokenHandler is CommonBase, StdCheats, StdUtils {
         token.mint(to, amount);
     }
 
+    /// The redemption flow, the only one `burn` now permits: the holder hands units to the
+    /// BURNER_ROLE holder, which destroys its OWN balance (audit FIND-027).
     function burn(uint256 actorSeed, uint256 amount) external {
         address from = actors[actorSeed % actors.length];
         uint256 bal = token.balanceOf(from);
         if (bal == 0) return;
         amount = bound(amount, 1, bal);
-        token.burn(from, amount);
+        vm.prank(from);
+        token.transfer(address(this), amount);
+        token.burn(address(this), amount);
     }
 
     function transfer(uint256 fromSeed, uint256 toSeed, uint256 amount) external {
@@ -263,10 +267,12 @@ contract GyldBondTokenFuzzTest is Test {
         uint256 supplyBefore = token.totalSupply();
 
         vm.prank(minter); token.mint(alice, amount);
-        vm.prank(burner); token.burn(alice, amount);
+        vm.prank(alice);  token.transfer(burner, amount);
+        vm.prank(burner); token.burn(burner, amount);
 
         assertEq(token.totalSupply(),    supplyBefore, "totalSupply changed after roundtrip");
         assertEq(token.balanceOf(alice), 0,            "balance non-zero after full burn");
+        assertEq(token.balanceOf(burner), 0,           "burner kept units it destroyed");
     }
 
     /// Multiple mints then burning all results in zero balance and restored supply.
@@ -278,7 +284,8 @@ contract GyldBondTokenFuzzTest is Test {
         vm.prank(minter); token.mint(alice, a);
         vm.prank(minter); token.mint(alice, b);
 
-        vm.prank(burner); token.burn(alice, a + b);
+        vm.prank(alice);  token.transfer(burner, a + b);
+        vm.prank(burner); token.burn(burner, a + b);
 
         assertEq(token.balanceOf(alice), 0,            "shares remain after full burn");
         assertEq(token.totalSupply(),    supplyBefore, "totalSupply not restored");
@@ -332,18 +339,29 @@ contract GyldBondTokenFuzzTest is Test {
     }
 
     /// Mint and burn are unaffected by sanctions (IssuanceManager pre-screens off-chain).
+    /// Since FIND-027 the burn half is a SELF-burn: a listed address keeps control of its
+    /// own supply position. What sanctions take away is movement, not destruction.
     function testFuzz_sanctions_doNotBlockMintBurn(uint256 amount) external {
         amount = bound(amount, 1, 1_000_000e18);
-        address[] memory addrs = new address[](1);
+        address[] memory addrs = new address[](2);
         addrs[0] = alice;
+        addrs[1] = burner;
         mockSanctions.addToSanctionsList(addrs);
 
-        // Mint and burn must succeed even when alice is sanctioned.
+        // Minting to a sanctioned address still succeeds — `_update` skips a zero side.
         vm.prank(minter); token.mint(alice, amount);
         assertEq(token.balanceOf(alice), amount);
 
-        vm.prank(burner); token.burn(alice, amount);
-        assertEq(token.balanceOf(alice), 0);
+        // A sanctioned BURNER_ROLE holder can still destroy its own units.
+        vm.prank(minter); token.mint(burner, amount);
+        vm.prank(burner); token.burn(burner, amount);
+        assertEq(token.balanceOf(burner), 0);
+
+        // Alice's balance is frozen, not destroyable — there is no clawback (FIND-027).
+        vm.prank(burner);
+        vm.expectRevert(abi.encodeWithSelector(GyldBondToken.CannotBurnFromOtherAccount.selector, alice));
+        token.burn(alice, amount);
+        assertEq(token.balanceOf(alice), amount, "a sanctioned holder's balance was destroyed");
     }
 
     // ── Permit ────────────────────────────────────────────────────────────────
