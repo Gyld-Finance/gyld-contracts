@@ -510,8 +510,8 @@ contract DeployDevNet is Script {
 
         // CAT — Caterpillar Inc 3.7% 2028 (ISIN US14913UBF66, CUSIP 14913UBF6, matures 2028-09-06)
         {
-            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
-            // costs the identifier. Both are still free to fix here.
+            // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin
+            // proposal. A typo or a repeat is still free to fix here.
             DeployGuards.requireValidIsin("US14913UBF66");
             DeployGuards.requireIsinVacant(address(factory_), "US14913UBF66");
             address cat = factory_.predictTokenAddress("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200);
@@ -530,8 +530,8 @@ contract DeployDevNet is Script {
 
         // C — Citigroup Inc 3.887% 2028 (ISIN US172967LD18, CUSIP 172967LD1, matures 2028-01-10)
         {
-            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
-            // costs the identifier. Both are still free to fix here.
+            // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin
+            // proposal. A typo or a repeat is still free to fix here.
             DeployGuards.requireValidIsin("US172967LD18");
             DeployGuards.requireIsinVacant(address(factory_), "US172967LD18");
             address c = factory_.predictTokenAddress("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200);
@@ -550,8 +550,8 @@ contract DeployDevNet is Script {
 
         // KO — Coca-Cola Co 2.25% 2032 (ISIN US191216DP21, CUSIP 191216DP2, matures 2032-09-01)
         {
-            // Audit FIND-012: the ISIN claim is one-way, so a typo or a repeat
-            // costs the identifier. Both are still free to fix here.
+            // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin
+            // proposal. A typo or a repeat is still free to fix here.
             DeployGuards.requireValidIsin("US191216DP21");
             DeployGuards.requireIsinVacant(address(factory_), "US191216DP21");
             address ko = factory_.predictTokenAddress("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP21", 1_977_609_600);

@@ -98,7 +98,7 @@ contract DeployAtomicSettlementE2E is Script {
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
         // CAT-style series — deployer is factory owner so deployToken is direct.
-        // Audit FIND-012: the ISIN claim is one-way — validate and check vacancy first.
+        // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin — validate first.
         DeployGuards.requireValidIsin("US14913UBF66");
         DeployGuards.requireIsinVacant(address(factory), "US14913UBF66");
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(

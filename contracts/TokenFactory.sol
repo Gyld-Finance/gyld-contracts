@@ -51,6 +51,13 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// token address → its paired NAVFeedForwarder address (DeFi protocols integrate this)
     mapping(address => address) public forwarderOf;
 
+    /// token address → the IssuanceManager it was registered with at deploy time.
+    /// Recorded for {releaseIsin}: `deregisterToken` is `REGISTRAR_ROLE`-gated and this
+    /// factory is the holder, so nothing else can un-register a stale series. Taking the
+    /// manager as a call parameter instead would let a wrong address silently deregister
+    /// nothing, which is the one failure a release must not have.
+    mapping(address => address) public issuanceManagerOf;
+
     /// ISIN bond-salt (`_bondSalt`) → the token deployed for that ISIN on this chain,
     /// `address(0)` if none. Prevents any same-ISIN deployment regardless of
     /// name/symbol/maturity variations, because the CREATE2 address includes initcode
@@ -73,6 +80,10 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     /// audit FIND-013 — the ISIN is not 12 uppercase alphanumerics.
     error MalformedIsin(string isin);
     error IsinAlreadyDeployed(string isin);
+    /// audit FIND-012 — {releaseIsin} named an ISIN this factory never deployed.
+    error IsinNotDeployed(string isin);
+    /// audit FIND-012 — the series has holders, so it is live and must not be released.
+    error IsinInUse(string isin, address token, uint256 totalSupply);
     error MaturityInPast(uint256 maturityTimestamp, uint256 nowTs);
     error MissingRegistrarRole(address factory, address issuanceManager);
     error ProxyDeployFailed();
@@ -97,6 +108,12 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         address issuanceManager,
         string isin
     );
+
+    /// audit FIND-012. Emitted when an ISIN returns to the registry and becomes
+    /// deployable again. Mirrors {TokenDeployed}'s topic layout — `isinKey` to filter on,
+    /// the readable `isin` in the data — so an indexer reconstructs the registry's whole
+    /// history from the two events together.
+    event IsinReleased(bytes32 indexed isinKey, address indexed token, string isin);
 
     /// @param bondTokenLogic_ GyldBondToken implementation every proxy delegates to.
     /// @param sanctionsList_  on-chain sanctions oracle baked into every token deployed here.
@@ -252,8 +269,9 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         // navFeed directly and has no control over the forwarder pointer.
         forwarder = address(new NAVFeedForwarder(navFeed, owner()));
 
-        navFeedOf[token]   = navFeed;
-        forwarderOf[token] = forwarder;
+        navFeedOf[token]         = navFeed;
+        forwarderOf[token]       = forwarder;
+        issuanceManagerOf[token] = issuanceManager;
         emit TokenDeployed(token, navFeed, isinKey, forwarder, issuanceManager, isin);
         IssuanceManager(issuanceManager).registerToken(token);
     }
@@ -270,6 +288,49 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     ///         this guard lack it.
     function renounceOwnership() public virtual override {
         revert CannotRenounceOwnership();
+    }
+
+    /// @notice Return `isin` to the registry so the bond can be deployed again.
+    /// @dev    Audit FIND-012. Scope is `name` / `symbol` / `maturityTimestamp` — set at
+    ///         `initialize` with no setter, and carried by `_tokenInitCode`, so a corrected
+    ///         redeploy lands at a new CREATE2 address. The three role addresses need no
+    ///         release: `issuanceManager`'s roles are rotatable on the live token by the
+    ///         timelock that owned the factory at deploy time, and a wrong `navFeedOwner`
+    ///         or `operator` (the feed's immutable `emergencyUpdater`) is fixed by a
+    ///         replacement feed behind `setUpstreamOracle`. Releasing for a role-only
+    ///         change and re-deploying reverts `ProxyDeployFailed` — identical initcode.
+    ///
+    ///         `totalSupply() == 0` is a backstop, not the control: the control is
+    ///         `onlyOwner`, a 48 h timelock proposal. A fully-redeemed live series also
+    ///         reads zero, so governance — not this check — is what refuses one.
+    ///         The old token keeps reporting `isin()`; this frees the REGISTRY. D-31.
+    function releaseIsin(string calldata isin) external onlyOwner nonReentrant {
+        _requireCanonicalIsin(isin);
+
+        bytes32 isinKey = _bondSalt(isin);
+        address token = tokenOfIsinKey[isinKey];
+        if (token == address(0)) revert IsinNotDeployed(isin);
+
+        uint256 supply = GyldBondToken(token).totalSupply();
+        if (supply != 0) revert IsinInUse(isin, token, supply);
+
+        // Legibility, not rescue: a revoked REGISTRAR_ROLE blocks release either way, and
+        // this names why. Re-grant it (the timelock admins the manager) — `deployToken`
+        // needs the same role to redeploy the corrected series anyway.
+        address issuanceManager = issuanceManagerOf[token];
+        if (!IssuanceManager(issuanceManager).hasRole(
+            IssuanceManager(issuanceManager).REGISTRAR_ROLE(),
+            address(this)
+        )) revert MissingRegistrarRole(address(this), issuanceManager);
+
+        // Effects before the interaction, as `deployToken` does.
+        delete tokenOfIsinKey[isinKey];
+        emit IsinReleased(isinKey, token, isin);
+
+        // A zero-supply token left registered is still mint-eligible, so a corrected
+        // redeploy would leave two subscribable tokens for one bond. `navFeedOf`,
+        // `forwarderOf` and `issuanceManagerOf` stay: keyed by token, still true of it.
+        IssuanceManager(issuanceManager).deregisterToken(token);
     }
 
     /// @notice The GyldBondToken deployed for `isin` on this chain, `address(0)` if none.

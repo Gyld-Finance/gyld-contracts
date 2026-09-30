@@ -257,8 +257,8 @@ library DeployGuards {
     }
 
     /// @notice `isin` must be a well-formed ISO 6166 identifier, check digit included.
-    /// @dev    Audit FIND-012. deployToken claims an ISIN permanently and nothing on-chain
-    ///         validates it, so a typo burns the identifier on that factory. Checked here,
+    /// @dev    Audit FIND-012. Nothing on-chain validates the check digit, and a wrong
+    ///         claim is undone only by a 48 h `releaseIsin` proposal. Checked here,
     ///         where a typo is still free. Not dev-gated: a malformed ISIN is malformed on
     ///         every chain.
     function requireValidIsin(string memory isin) internal pure {
@@ -305,8 +305,8 @@ library DeployGuards {
     }
 
     /// @notice `factory` must not already have deployed `isin`.
-    /// @dev    Audit FIND-012. The claim is one-way, so hitting IsinAlreadyDeployed on-chain
-    ///         costs the identifier. Fail here, before the timelock proposal is built.
+    /// @dev    Audit FIND-012. Hitting IsinAlreadyDeployed on-chain wastes a whole 48 h
+    ///         timelock round-trip. Fail here, before the proposal is built.
     function requireIsinVacant(address factory, string memory isin) internal view {
         (bool ok, bytes memory data) =
             factory.staticcall(abi.encodeWithSignature("tokenByIsin(string)", isin));

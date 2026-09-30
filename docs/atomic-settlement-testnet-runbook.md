@@ -616,7 +616,7 @@ only the guardian can submit it — so it is safe to paste into an ops channel.
 
 ## 7. Rollback / incident procedure
 
-There is no "undeploy". Incident response is: stop the hot path, invalidate paper,
+There is no "undeploy" (the one partial exception, `releaseIsin`, is below). Incident response is: stop the hot path, invalidate paper,
 evacuate funds, then fix under the timelock.
 
 | Action | Who (role) | Command | Effect |
@@ -627,9 +627,62 @@ evacuate funds, then fix under the timelock.
 | Rotate a compromised quote signer | grant/revoke: timelock; epoch bump: timelock | timelock: `grantRole(QUOTE_SIGNER_ROLE, new)`, `revokeRole(QUOTE_SIGNER_ROLE, old)`, then `bumpQuoteEpoch()` | Old key's quotes dead even if the revoke lags — epoch bump is the fast kill |
 | Evacuate inventory | `TREASURER_ROLE` — treasurer key | `cast send $SWAP "withdraw(address,uint256)" <token> <amount> --private-key $TREASURER_KEY` | Funds move **only** to the admin-fixed `withdrawalWallet` — the treasurer cannot redirect. Works while the **swap** is paused. **Two things on the bond token can still block it**: the token's own pause (`EnforcedPause`) and sanctions screening of the swap or the `withdrawalWallet` (`AccountSanctioned`) — see "Evacuating a paused bond token" and "Evacuating when screening, not the pause, is the blocker" below |
 | Rotate a series' NAV forwarder | `DEFAULT_ADMIN_ROLE` — timelock (schedule + execute) | timelock **batch**: `registerSeries(token, newForwarder)` **and** `bumpQuoteEpoch()` in the same proposal | Repoints the price source for a live series. **The `bumpQuoteEpoch()` is not optional and is not enforced on-chain** — quotes sign no forwarder, so without it every outstanding quote is band-checked against the new feed for the rest of its TTL. Runs all five registration probes, so a rotation onto an unpriced or future-dated forwarder reverts and leaves the series on the working one. **Not gated on inventory** (audit FIND-026, D-37) — deliberate, so dust cannot pin a series to a broken feed. Emits `SeriesForwarderRotated(token, previous, new)` alongside `SeriesRegistered`; also note a newer `updatedAt` opens a fresh per-round notional budget immediately |
+| Free the ISIN of a **misconfigured, never-issued** series | `owner` of `TokenFactory` — timelock (schedule + execute) | timelock proposal calling `releaseIsin(string)` on `$FACTORY` | Returns the identifier to the registry so the corrected series can take it, and deregisters the stale token from the IssuanceManager. **Reverts `IsinInUse` if `totalSupply() != 0`** — a series with holders is never releasable. Scope is `name`/`symbol`/`maturity` only; a wrong role address needs no release (see below). Emits `IsinReleased`. Audit FIND-012 |
 | Resume | `DEFAULT_ADMIN_ROLE` — timelock only | timelock proposal calling `unpause()` | Asymmetric by design: pausing is cheap, resuming is deliberate |
 | Correct a NAV that has **gapped >10 %** | **Two keys**: ops multisig (`emergencyUpdater`, immutable) **calls**; KMS signer **signs** | Full procedure in [§6.9](#69-signing-an-emergency-nav-correction-audit-find-003): `cast call $NAVFEED "hashEmergencyUpdate(int256,uint256)"` for the digest, owner signs it raw, **dry-run with `cast call` before spending the Safe quorum**, then submit from the ops multisig | **Verify the true NAV from two sources first — this path skips the deviation cap, which is what normally catches a bad number.** Answer must land in **$0.50-$2.00** (`5e7`-`2e8`); outside that it reverts `EmergencyAnswerOutOfRange` and the ±10 %/h walk-back is the only route. Locks for `EMERGENCY_COOLDOWN` (1 h) afterwards — the same cadence as the routine path, so a cascading event can be corrected again within the hour. Full procedure: ARCHITECTURE.md §11.5 Case C (audit FIND-003) |
 | Correct a wrong NAV **within 10 %** (fat-finger) | `owner` of `KaleidoscopeNAVFeed` — KMS signer | `cast send $NAVFEED "updateAnswer(int256)" <answer> --private-key $NAVFEED_KEY`, once per hour | **Check the direction first — do not pause by reflex.** Answer too **low** → pause the bond token, then walk it back. Answer too **high** → **do not pause**: the pause blocks liquidation but not `borrow`, so it disables the remedy and leaves the harm open. Full procedure and reasoning: ARCHITECTURE.md §11.5 (audit FIND-004) |
+
+### Releasing the ISIN of a misconfigured series (audit FIND-012)
+
+**First, check whether you need this at all.** Only three fields make a series
+unfixable in place, because `GyldBondToken.initialize` sets them and nothing has a setter:
+**`name`, `symbol`, `maturityTimestamp`**. Everything else is correctable on the live
+token and needs no release, no new address and no downtime:
+
+| Wrong value | Fix | Who |
+|---|---|---|
+| `operator` | rotate `PAUSER_ROLE` / `DOCUMENT_ROLE` on the token **and** replace the feed as for `navFeedOwner` below — `operator` is also the feed's `emergencyUpdater`, which is `immutable` | the timelock that owned the factory when the series was deployed (it holds `DEFAULT_ADMIN_ROLE` on that token) |
+| `issuanceManager` | rotate `MINTER_ROLE` / `BURNER_ROLE` on the token | same timelock |
+| `navFeedOwner` | deploy a replacement `KaleidoscopeNAVFeed`, then `forwarder.setUpstreamOracle(newFeed)` | same timelock (it owns that forwarder) — the mechanism the Kaleidoscope to RedStone to Chainlink migration uses |
+
+Do **not** release and re-deploy for one of those. The three role addresses are absent
+from `_tokenInitCode`, so a redeploy changing only one of them is byte-identical, CREATE2
+targets the occupied address, and `deployToken` reverts **`ProxyDeployFailed`** — after
+the ISIN has already been freed and the stale token deregistered. A CREATE2 collision
+also consumes all the gas forwarded to it, so that `execute` burns its whole gas limit. Pinned by
+`test_releaseIsin_doesNotEnableARoleOnlyRedeploy`.
+
+**If it is one of the three immutable fields, the sequence is:**
+
+1. **Confirm the series has never been issued.** `cast call $FACTORY "tokenByIsin(string)" <ISIN>`
+   then `cast call <token> "totalSupply()"`. Must be `0` — `releaseIsin` reverts
+   `IsinInUse` otherwise, and that check is a backstop beneath this one, not a
+   substitute for it. Note a **fully redeemed** live series also reads zero; the
+   timelock review is what must refuse that, since the contract cannot tell the two
+   apart (`IssuanceManager.redeem` has no maturity gate).
+2. **Schedule `releaseIsin(<ISIN>)`** on the factory — 48 h, the factory `owner` (the timelock).
+   Confirm `IsinReleased` and that `tokenByIsin` now returns the zero address.
+3. **Retire the stale token from the swap**, if it was ever registered there:
+   `deregisterSeries(token)` plus `bumpQuoteEpoch()`, per the section above.
+   **`releaseIsin` cannot do this** — the factory holds no role on `GyldAtomicSwap` —
+   and skipping it leaves `registeredSeriesList()` enumerating two addresses that both
+   answer `isin() == <ISIN>`.
+4. **Stop the NAV keeper pushing to the orphaned feed.** The old feed and forwarder keep
+   working; nothing on chain retires them.
+5. **Pause the stale token** via `operator` (`PAUSER_ROLE`). The factory self-revokes its
+   own `PAUSER_ROLE` in `_wireRoles`, so this is an ops action.
+6. **Re-deploy with the corrected parameters.** The new token lands at a different
+   address because the initcode carries the corrected field.
+7. **Do not publish the old address.** Leave it out of `DEPLOYMENTS.md`, the same way the
+   abandoned gen-1 addresses are treated.
+
+**The one thing none of this undoes:** `GyldBondToken.isin()` has no setter, so the
+released token reports that ISIN for ever. Two contracts then answer to one bond
+identifier. **`TokenFactory.tokenByIsin` is authoritative; `isin()` on a token is a
+claim.** Any indexer, explorer or reconciliation job that resolves a bond by reading
+`isin()` off token contracts rather than by asking the factory can find the wrong one —
+that is the residual FIND-012 leaves, and it is a records hazard, not a value one: the
+released token has zero supply, is deregistered, and has no mint path.
 
 ### Evacuating a paused bond token
 

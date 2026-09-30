@@ -321,9 +321,8 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         harness.requireIsinVacant(address(factory), APPLE);
     }
 
-    /// The case the guard exists for. `deployToken` claims an ISIN one-way, so reaching
-    /// `IsinAlreadyDeployed` on chain BURNS the identifier on that factory; this fails
-    /// while the mistake is still free.
+    /// The case the guard exists for. Reaching `IsinAlreadyDeployed` on chain wastes a
+    /// whole 48 h timelock round-trip; this fails while the mistake is still free.
     function test_requireIsinVacant_rejectsAnAlreadyDeployedIsin() public {
         MockIsinRegistry factory = new MockIsinRegistry();
         factory.setToken(APPLE, address(0xB0AD));

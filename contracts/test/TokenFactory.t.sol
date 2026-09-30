@@ -101,6 +101,156 @@ contract TokenFactoryTest is Test {
         );
     }
 
+    // ── releaseIsin (audit FIND-012) ─────────────────────────────────────────
+    //
+    // The recommendation's first option, and the one TEST-64 asks for. `deployToken`
+    // claims an ISIN before any external call and D-31 recorded the missing removal path
+    // as an accepted residual, so a deploy that produced the wrong result consumed the
+    // identifier for good. Scope is deliberately narrow: this exists for the three
+    // IMMUTABLE token fields, and the negative test below pins that a role-address
+    // "correction" is not among them.
+
+    /// The case the function exists for: a wrong maturity. The corrected redeploy lands at
+    /// a DIFFERENT address because `_tokenInitCode` carries the maturity, even though the
+    /// CREATE2 salt is the ISIN alone.
+    function test_releaseIsin_freesTheIdentifierForACorrectedRedeploy() public {
+        (address wrong,,) = factory.deployToken(
+            "Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY + 365 days, operator, address(issuanceMgr), navFeedOwner
+        );
+        assertEq(factory.tokenByIsin(TEST_ISIN), wrong, "the wrong series holds the ISIN");
+
+        factory.releaseIsin(TEST_ISIN);
+        assertEq(factory.tokenByIsin(TEST_ISIN), address(0), "ISIN is vacant again");
+        // Release frees the REGISTRY, not the name: the stale token still reports the ISIN.
+        assertEq(GyldBondToken(wrong).isin(), TEST_ISIN, "released token keeps its isin()");
+
+        (address right,,) = _deploy();
+        assertEq(factory.tokenByIsin(TEST_ISIN), right, "the corrected series holds the ISIN");
+        assertTrue(right != wrong, "corrected redeploy must not collide with the released token");
+        assertEq(GyldBondToken(right).maturityTimestamp(), TEST_MATURITY, "corrected maturity");
+        assertTrue(issuanceMgr.registeredTokens(right), "corrected series is registered for issuance");
+        assertFalse(issuanceMgr.registeredTokens(wrong), "released series is not");
+    }
+
+    /// The boundary of what release is FOR. A wrong `navFeedOwner` / `operator` /
+    /// `issuanceManager` is absent from `_tokenInitCode`, so a redeploy changing only one
+    /// of them is byte-identical and CREATE2 targets the occupied address. Those are fixed
+    /// by rotating the role or repointing the forwarder, never by releasing — and this
+    /// pins it so the NatSpec's scope cannot quietly drift.
+    function test_releaseIsin_doesNotEnableARoleOnlyRedeploy() public {
+        (address token,,) = _deploy();
+        factory.releaseIsin(TEST_ISIN);
+
+        address differentNavFeedOwner = address(0xD1FF);
+        vm.expectRevert(TokenFactory.ProxyDeployFailed.selector);
+        factory.deployToken(
+            "Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY, operator, address(issuanceMgr), differentNavFeedOwner
+        );
+        // The token that occupies the address is the original one.
+        assertTrue(token.code.length != 0, "the released token still occupies its address");
+    }
+
+    /// The gate that separates a mistake from a live series. One wei is enough.
+    function test_releaseIsin_refusesASeriesThatHasHolders() public {
+        (address token,,) = _deploy();
+        GyldBondToken t = GyldBondToken(token);
+        t.grantRole(t.MINTER_ROLE(), address(this)); // factory owner holds DEFAULT_ADMIN_ROLE
+        t.mint(address(0xB0B), 1);
+
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.IsinInUse.selector, TEST_ISIN, token, uint256(1)));
+        factory.releaseIsin(TEST_ISIN);
+        assertEq(factory.tokenByIsin(TEST_ISIN), token, "a live series keeps its ISIN");
+    }
+
+    /// The load-bearing half. A zero-supply token left registered is still mint-eligible,
+    /// so a corrected redeploy would leave two subscribable tokens for one bond.
+    function test_releaseIsin_deregistersTheStaleToken() public {
+        (address token,,) = _deploy();
+        assertTrue(issuanceMgr.registeredTokens(token), "deployToken registers");
+        assertEq(factory.issuanceManagerOf(token), address(issuanceMgr), "manager recorded at deploy");
+
+        factory.releaseIsin(TEST_ISIN);
+
+        assertFalse(issuanceMgr.registeredTokens(token), "released series must not stay mintable");
+        // Kept, like navFeedOf / forwarderOf: keyed by token and still true of it.
+        assertEq(factory.issuanceManagerOf(token), address(issuanceMgr), "manager record kept");
+        assertEq(factory.navFeedOf(token) != address(0), true, "navFeedOf kept");
+        assertEq(factory.forwarderOf(token) != address(0), true, "forwarderOf kept");
+    }
+
+    /// The residual the NatSpec, D-31 and the runbook all name: `redeem` has no maturity
+    /// gate, so a LIVE series that has been fully redeemed reads zero supply and passes the
+    /// gate. The contract cannot tell "never issued" from "temporarily empty" — the 48 h
+    /// timelock review is what must refuse this. Pinned so the gate is never mistaken for
+    /// more than a backstop.
+    function test_releaseIsin_gateAdmitsAFullyRedeemedLiveSeries_acceptedResidual() public {
+        (address token,,) = _deploy();
+        address ap = address(0xA9);
+        issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), address(this));
+        issuanceMgr.addToWhitelist(ap);
+
+        issuanceMgr.subscribe(token, ap, 1000e18);           // issued: live series
+        vm.prank(ap);
+        GyldBondToken(token).transfer(address(issuanceMgr), 1000e18);
+        issuanceMgr.redeem(token, ap, 1000e18);              // fully redeemed, pre-maturity
+        assertEq(GyldBondToken(token).totalSupply(), 0, "fully redeemed");
+        assertLt(block.timestamp, TEST_MATURITY, "still before maturity");
+
+        factory.releaseIsin(TEST_ISIN);                      // the gate does not stop it
+        assertEq(factory.tokenByIsin(TEST_ISIN), address(0), "a redeemed live series is releasable");
+    }
+
+    /// Without the preflight this reverts with an opaque AccessControlUnauthorizedAccount
+    /// from a contract the caller never named — and the ISIN is then unreleasable for good.
+    function test_releaseIsin_namesTheMissingRegistrarRole() public {
+        _deploy();
+        issuanceMgr.revokeRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TokenFactory.MissingRegistrarRole.selector, address(factory), address(issuanceMgr)
+            )
+        );
+        factory.releaseIsin(TEST_ISIN);
+    }
+
+    function test_releaseIsin_emitsIsinReleased() public {
+        (address token,,) = _deploy();
+        bytes32 isinKey = keccak256(abi.encodePacked(TEST_ISIN, block.chainid));
+        vm.expectEmit(true, true, false, true, address(factory));
+        emit TokenFactory.IsinReleased(isinKey, token, TEST_ISIN);
+        factory.releaseIsin(TEST_ISIN);
+    }
+
+    /// Also covers a double release: the second call sees a cleared slot.
+    function test_releaseIsin_refusesAnIsinThisFactoryDoesNotHold() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.IsinNotDeployed.selector, TEST_ISIN));
+        factory.releaseIsin(TEST_ISIN);
+
+        _deploy();
+        factory.releaseIsin(TEST_ISIN);
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.IsinNotDeployed.selector, TEST_ISIN));
+        factory.releaseIsin(TEST_ISIN);
+    }
+
+    /// Same canonical-form check `deployToken` runs, so a case variant can never release an
+    /// entry it could not have created (audit FIND-013).
+    function test_releaseIsin_refusesAMalformedIsin() public {
+        _deploy();
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.MalformedIsin.selector, "us912797kr72"));
+        factory.releaseIsin("us912797kr72");
+    }
+
+    /// On production `owner()` is the TimelockController, so a release carries the same
+    /// 48 h governance weight as the deploy it reverses.
+    function test_releaseIsin_isOwnerOnly() public {
+        _deploy();
+        vm.prank(address(0xBAD));
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", address(0xBAD)));
+        factory.releaseIsin(TEST_ISIN);
+        assertTrue(factory.tokenByIsin(TEST_ISIN) != address(0), "a non-owner must not release");
+    }
+
     // ── Post-deploy privilege surface (audit §18 item 1) ─────────────────────
     //
     // The factory's header used to claim it "holds no permanent permissions after
