@@ -9,6 +9,7 @@ import {GyldBondToken} from "../GyldBondToken.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {MockUSDC} from "./MockUSDC.sol";
 import {MockUSDCPermit} from "./MockUSDCPermit.sol";
+import {MockStablecoin} from "./MockStablecoin.sol";
 import {MockNavForwarder} from "./MockNavForwarder.sol";
 import {MockReentrantToken, ISwapReentryTarget} from "./MockReentrantToken.sol";
 
@@ -1597,15 +1598,19 @@ contract GyldAtomicSwapTest is Test {
         );
     }
 
-    /// F-1: initialize probes the cash token's decimals on-chain — an 18-decimal
-    /// "USDC" (the bond token standing in) must be rejected before any state is set.
+    /// F-1: initialize probes the cash token's decimals on-chain — a cash token outside
+    /// 6..18 (GLD-713 widened the old `== 6`; 18dp is now legal) must be rejected before
+    /// any state is set. 19dp is the first value past the ceiling.
     function test_initialize_wrongDecimalsUsdc_reverts() public {
+        MockStablecoin cash19 = new MockStablecoin(19);
         GyldAtomicSwap impl = new GyldAtomicSwap();
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(token), uint8(18)));
+        vm.expectRevert(
+            abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(cash19), uint8(19))
+        );
         new ERC1967Proxy(
             address(impl),
             abi.encodeCall(
-                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(token), MAX_BPS, MAX_NAV_AGE)
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(cash19), MAX_BPS, MAX_NAV_AGE)
             )
         );
     }
@@ -1634,10 +1639,13 @@ contract GyldAtomicSwapTest is Test {
     /// the live wiring, not just the rejection paths: 18 (bond) + 8 (NAV) - 6 (cash) = 20.
     /// GyldBondToken.t.sol carries the matching assertion on the token side — if either
     /// contract's precision moves, one of the two fails and names the divisor.
+    /// GLD-713: the divisor is now derived as 10**(26 - cashDecimals); this pins the 6dp
+    /// fixture, GyldAtomicSwap.cashDecimals.t.sol pins 18dp.
     function test_decimalsLadder_matchesHardcodedDivisor() public view {
         assertEq(token.decimals(), 18, "bond leg");
         assertEq(navFeed.decimals(), 8, "NAV leg");
         assertEq(usdc.decimals(), 6, "cash leg");
+        assertEq(swap.cashDecimals(), 6, "stored cash leg");
 
         // The exponent the divisor encodes, derived rather than restated.
         uint256 exponent = uint256(token.decimals()) + uint256(navFeed.decimals()) - uint256(usdc.decimals());
