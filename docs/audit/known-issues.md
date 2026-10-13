@@ -142,7 +142,7 @@ anything.
 that *skips* `MIN_UPDATE_INTERVAL` and so has no rate guard of its own besides the
 1 h cooldown. A proposer with seconds of latitude who moved `block.timestamp`
 across that boundary would buy one emergency correction marginally early — and
-that correction still needs **both** keys and still lands inside $0.50-$2.00, so
+that correction still needs **both** keys and still lands inside the answer range, so
 the latitude grants no capability the pair did not already have. The `deadline`
 comparison is the owner's own chosen expiry, measured in minutes to hours.
 

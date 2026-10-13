@@ -101,6 +101,21 @@ contract TokenFactoryTest is Test {
         );
     }
 
+    // ── The factory owner becomes each feed's range governor ────────────────
+    //
+    // It must therefore differ from the feed owner and the guardian, or one key could widen
+    // its own range. Refused by name at the factory, before any contract is deployed.
+
+    function test_deployToken_refusesTheFactoryOwnerAsNavFeedOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.FactoryOwnerHoldsFeedRole.selector, address(this)));
+        factory.deployToken("Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY, operator, address(issuanceMgr), address(this));
+    }
+
+    function test_deployToken_refusesTheFactoryOwnerAsOperator() public {
+        vm.expectRevert(abi.encodeWithSelector(TokenFactory.FactoryOwnerHoldsFeedRole.selector, address(this)));
+        factory.deployToken("Test Bond", "tBOND", TEST_ISIN, TEST_MATURITY, address(this), address(issuanceMgr), navFeedOwner);
+    }
+
     // ── releaseIsin (audit FIND-012) ─────────────────────────────────────────
     //
     // The recommendation's first option, and the one TEST-64 asks for. `deployToken`
@@ -677,6 +692,8 @@ contract TokenFactoryTest is Test {
         assertEq(feed.emergencyUpdater(), operator, "guardian must be the ops operator");
         assertEq(feed.owner(), navFeedOwner, "and the signer must be the KMS feed owner");
         assertTrue(feed.emergencyUpdater() != feed.owner(), "the 2-of-2 must not collapse");
+        // Only the factory owner (the timelock in production) may widen the answer range.
+        assertEq(feed.rangeGovernor(), factory.owner(), "range governor must be the factory owner");
     }
 
     /// The same address in both roles would make the emergency path a 1-of-1. The feed's

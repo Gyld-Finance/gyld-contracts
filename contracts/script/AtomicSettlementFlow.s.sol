@@ -65,6 +65,8 @@ contract AtomicSettlementFlow is Script {
     // emergency path is a 2-of-2 (guardian = operator, signer = navFeedOwner) and
     // TokenFactory.deployToken reverts NavFeedOwnerIsOperator if they collapse into one.
     uint256 immutable OPERATOR_PK = vm.deriveKey(ANVIL_MNEMONIC, 3); // acct[3]
+    // Factory owner, so each feed's `rangeGovernor`: must differ from the NAV feed owner.
+    uint256 immutable FACTORY_OWNER_PK = vm.deriveKey(ANVIL_MNEMONIC, 6); // acct[6]
 
     // NAV $1.00 per token (8dp): 1e18 token <-> 1e6 USDC. 8 decimals.
     int256 constant NAV = 1e8; // 100000000
@@ -108,14 +110,16 @@ contract AtomicSettlementFlow is Script {
         // against this stack instead of reverting for want of a holder.
         issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), vm.addr(OPERATOR_PK));
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), vm.addr(FACTORY_OWNER_PK));
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
-        // CAT-style series — deployer is factory owner so deployToken is called directly
-        // (DEFAULT_ADMIN on the token is the deployer; fine for a dev demo).
+        // CAT-style series — signed by the factory owner (acct[6]), which is therefore the
+        // token's DEFAULT_ADMIN and the feed's range governor; nothing below needs either.
         // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin — validate first.
         DeployGuards.requireValidIsin("US14913UBF66");
         DeployGuards.requireIsinVacant(address(factory), "US14913UBF66");
+        vm.stopBroadcast();
+        vm.broadcast(FACTORY_OWNER_PK);
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
@@ -125,6 +129,7 @@ contract AtomicSettlementFlow is Script {
             address(issuanceMgr),
             deployer // NAV feed owner — the broadcaster, so it can push NAV below
         );
+        vm.startBroadcast();
         GyldBondToken token = GyldBondToken(token_);
         KaleidoscopeNAVFeed navFeed = KaleidoscopeNAVFeed(navFeed_);
         console2.log("[1] base wired");

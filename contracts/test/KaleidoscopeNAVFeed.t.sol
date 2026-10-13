@@ -17,6 +17,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     address stranger         = address(0xB2);
     address newOwner         = address(0xC3);
     address guardian         = address(0xD4);
+    address governor         = address(0xE5); // the timelock: only it may change the answer range
 
     uint256 constant ONE_HOUR          = 1 hours;
     // Rescaled from $0.9542 by /100 when FIND-003 tightened MIN/MAX_ANSWER to $0.10-$5.00
@@ -26,7 +27,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     int256  constant ANSWER_PLUS_SMALL = 95_420_001; // tiny move, well within 10%
 
     function setUp() public {
-        feed = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian);
+        feed = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian, governor);
     }
 
     // ── decimals ──────────────────────────────────────────────────────────────
@@ -164,9 +165,9 @@ contract KaleidoscopeNAVFeedTest is Test {
     function test_updateAnswer_deviationCheckSkippedOnFirstUpdate() public {
         // Even a big price on first update is fine — no previous to compare
         vm.prank(owner);
-        feed.updateAnswer(499_000_000); // $4.99 — 5x ANSWER, far beyond the 10% band
+        feed.updateAnswer(199_000_000); // $1.99 — 2x ANSWER, far beyond the 10% band
         (, int256 answer,,,) = feed.latestRoundData();
-        assertEq(answer, 499_000_000);
+        assertEq(answer, 199_000_000);
     }
 
     function test_updateAnswer_within10PercentAllowed() public {
@@ -253,7 +254,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// The other end: above ~int256.max / BPS_DENOMINATOR the deviation arithmetic
     /// overflows and every later push panics. The ceiling keeps it unreachable.
     function test_updateAnswer_firstPushAboveCeilingReverts() public {
-        int256 tooBig = int256(feed.MAX_ANSWER()) + 1; // cached before the prank
+        int256 tooBig = int256(uint256(feed.maxAnswer())) + 1; // cached before the prank
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, tooBig));
         feed.updateAnswer(tooBig);
@@ -261,14 +262,14 @@ contract KaleidoscopeNAVFeedTest is Test {
 
     function test_updateAnswer_rangeBoundariesAreInclusive() public {
         // Cache before pranking — the getter would otherwise consume it (see setUp).
-        int256 floor_ = int256(feed.MIN_ANSWER());
-        int256 ceiling = int256(feed.MAX_ANSWER());
+        int256 floor_ = int256(uint256(feed.minAnswer()));
+        int256 ceiling = int256(uint256(feed.maxAnswer()));
 
         vm.prank(owner);
         feed.updateAnswer(floor_);
         assertEq(feed.latestAnswer(), floor_);
 
-        KaleidoscopeNAVFeed f2 = new KaleidoscopeNAVFeed(owner, "ceiling", guardian);
+        KaleidoscopeNAVFeed f2 = new KaleidoscopeNAVFeed(owner, "ceiling", guardian, governor);
         vm.prank(owner);
         f2.updateAnswer(ceiling);
         assertEq(f2.latestAnswer(), ceiling);
@@ -289,7 +290,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// A feed at the floor must still be able to move — proving the floor is above the
     /// stuck region rather than merely inside a legal-looking range.
     function test_updateAnswer_feedAtTheFloorCanStillMove() public {
-        int256 floor_ = int256(feed.MIN_ANSWER());
+        int256 floor_ = int256(uint256(feed.minAnswer()));
 
         vm.prank(owner);
         feed.updateAnswer(floor_);
@@ -298,6 +299,289 @@ contract KaleidoscopeNAVFeedTest is Test {
         vm.prank(owner);
         feed.updateAnswer(floor_ + 1); // 1 unit is well inside 10%
         assertEq(feed.latestAnswer(), floor_ + 1, "the floor is recoverable");
+    }
+
+    // ── Answer range: the timelock-only setter (Halborn, on the FIND-003 fix) ──
+    //
+    // The range used to be `constant`s in a feed with no proxy. NAV accretes with no reset,
+    // so a long-dated series could outgrow it and every push would revert. It now starts
+    // at the default and only `rangeGovernor` can move it. Both write paths read it.
+
+    function test_answerRange_startsAtTheDefaultAndIsEvented() public {
+        assertEq(feed.minAnswer(), 1e7, "$0.10");
+        assertEq(feed.maxAnswer(), 2e8, "$2.00");
+        assertEq(feed.rangeGovernor(), governor);
+
+        vm.expectEmit(false, false, false, true);
+        emit KaleidoscopeNAVFeed.AnswerRangeUpdated(1e7, 2e8);
+        new KaleidoscopeNAVFeed(owner, "defaults", guardian, governor);
+    }
+
+    /// The case Halborn raised: a series that has accreted to the default ceiling can keep
+    /// being priced once governance slides the range. Before that, the push reverts. It can
+    /// grow to $4.50, but the timelock can never lift the ceiling past the absolute $5.00.
+    function test_setAnswerRange_letsAnAccretedSeriesGrowPastTheDefaultCeiling() public {
+        vm.warp(T0);
+        vm.prank(owner);
+        feed.updateAnswer(190_000_000); // $1.90, near the $2.00 default ceiling
+
+        vm.warp(T0 + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(205_000_000)));
+        feed.updateAnswer(205_000_000); // +8%: within the band, above the ceiling
+
+        vm.prank(governor);
+        feed.setAnswerRange(2e7, 5e8); // slid up to $0.20-$5.00, the absolute ceiling
+
+        vm.prank(owner);
+        feed.updateAnswer(205_000_000);
+        assertEq(feed.latestAnswer(), 205_000_000, "priced past the old ceiling");
+
+        // Keeps accreting through routine pushes, each within 10% and an hour apart, to
+        // $4.50. `t` is a local on purpose: see the viaIR note on T0.
+        uint256 t = T0 + ONE_HOUR;
+        int256 nav = 205_000_000;
+        while (nav < 450_000_000) {
+            int256 next = (nav * 11) / 10; // +10%, the inclusive edge of the band
+            nav = next > 450_000_000 ? int256(450_000_000) : next;
+            t += ONE_HOUR;
+            vm.warp(t);
+            vm.prank(owner);
+            feed.updateAnswer(nav);
+        }
+        assertEq(feed.latestAnswer(), 450_000_000, "an accreted $4.50 series is priced");
+
+        // But $5.00 is as far as the range can ever go — the ceiling is absolute.
+        vm.prank(governor);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(2e7), uint256(501_000_000))
+        );
+        feed.setAnswerRange(2e7, 501_000_000); // $5.01
+        assertEq(feed.maxAnswer(), 5e8, "the ceiling stays at $5.00");
+    }
+
+    /// The emergency path reads the live range too, so it can correct a series above $2.00.
+    function test_setAnswerRange_movesTheEmergencyPathToo() public {
+        _seedPrice();
+        vm.prank(governor);
+        feed.setAnswerRange(5e7, 5e8);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _ownerSig(300_000_000, deadline); // $3.00, outside the default
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(300_000_000, deadline, sig);
+        assertEq(feed.latestAnswer(), 300_000_000);
+    }
+
+    /// Narrowing is enforced on the routine path as well — the live range is what binds.
+    function test_setAnswerRange_narrowingBindsTheRoutinePath() public {
+        _seedPrice(); // $0.9542
+        vm.prank(governor);
+        feed.setAnswerRange(5e7, 1e8);
+
+        vm.warp(block.timestamp + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(101_000_000)));
+        feed.updateAnswer(101_000_000);
+    }
+
+    /// The owner is the KMS signer. If it could widen its own range it would hold the
+    /// unbounded price reach D-7 was killed for. Neither it nor the guardian can.
+    function test_setAnswerRange_isGovernorOnly() public {
+        // A range the governor itself could set, so the caller check is all that fires.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.NotRangeGovernor.selector, owner));
+        feed.setAnswerRange(5e7, 5e8);
+
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.NotRangeGovernor.selector, guardian));
+        feed.setAnswerRange(5e7, 5e8);
+
+        assertEq(feed.maxAnswer(), 2e8, "range unchanged");
+    }
+
+    /// Every limit the setter enforces, each on its own boundary.
+    function test_setAnswerRange_enforcesTheInvariants() public {
+        bytes4 sel = KaleidoscopeNAVFeed.InvalidAnswerRange.selector;
+        vm.startPrank(governor);
+        // floor below $0.10
+        vm.expectRevert(abi.encodeWithSelector(sel, 1e7 - 1, 1e8));
+        feed.setAnswerRange(1e7 - 1, 1e8);
+        // ceiling above $5.00
+        vm.expectRevert(abi.encodeWithSelector(sel, 1e8, 5e8 + 1));
+        feed.setAnswerRange(1e8, 5e8 + 1);
+        // empty range
+        vm.expectRevert(abi.encodeWithSelector(sel, 1e8, 1e8));
+        feed.setAnswerRange(1e8, 1e8);
+        // inverted range
+        vm.expectRevert(abi.encodeWithSelector(sel, 2e8, 1e7));
+        feed.setAnswerRange(2e8, 1e7);
+        vm.stopPrank();
+        assertEq(feed.maxAnswer(), 2e8, "range unchanged");
+    }
+
+    /// The exact limits are admitted: the full $0.10-$5.00 in one range.
+    function test_setAnswerRange_admitsTheExactLimits() public {
+        vm.prank(governor);
+        feed.setAnswerRange(1e7, 5e8);
+        assertEq(feed.minAnswer(), 1e7);
+        assertEq(feed.maxAnswer(), 5e8);
+    }
+
+    /// One unit under the absolute floor, paired with the exact ceiling: refused, so the
+    /// floor is exactly $0.10 (test_setAnswerRange_admitsTheExactLimits is the control).
+    function test_setAnswerRange_oneUnitBelowTheAbsoluteFloorReverts() public {
+        vm.prank(governor);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(1e7 - 1), uint256(5e8))
+        );
+        feed.setAnswerRange(1e7 - 1, 5e8);
+        assertEq(feed.minAnswer(), 1e7, "range unchanged");
+    }
+
+    /// One unit over the absolute ceiling, paired with the exact floor: refused, so the
+    /// ceiling is exactly $5.00.
+    function test_setAnswerRange_oneUnitAboveTheAbsoluteCeilingReverts() public {
+        vm.prank(governor);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(1e7), uint256(5e8 + 1))
+        );
+        feed.setAnswerRange(1e7, 5e8 + 1);
+        assertEq(feed.maxAnswer(), 2e8, "range unchanged");
+    }
+
+    /// Whatever it asks for, the timelock gets a range inside $0.10-$5.00 or a revert —
+    /// the absolute bounds are the outer limit of every range this feed can ever hold.
+    function testFuzz_setAnswerRange_neverLeavesTheAbsoluteBounds(uint256 newMin, uint256 newMax) public {
+        newMin = bound(newMin, 0, 1e9); // straddles both bounds
+        newMax = bound(newMax, 0, 1e9);
+
+        vm.prank(governor);
+        try feed.setAnswerRange(newMin, newMax) {
+            assertEq(feed.minAnswer(), newMin, "stored as asked");
+            assertEq(feed.maxAnswer(), newMax, "stored as asked");
+            assertGe(feed.minAnswer(), 1e7, "never below $0.10");
+            assertLe(feed.maxAnswer(), 5e8, "never above $5.00");
+            assertLt(feed.minAnswer(), feed.maxAnswer(), "never empty");
+        } catch (bytes memory reason) {
+            assertEq(
+                reason,
+                abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, newMin, newMax),
+                "refused by name"
+            );
+            assertTrue(newMin < 1e7 || newMax > 5e8 || newMin >= newMax, "and only when invalid");
+            assertEq(feed.minAnswer(), 1e7, "range unchanged");
+            assertEq(feed.maxAnswer(), 2e8, "range unchanged");
+        }
+    }
+
+    /// The floor is absolute: a defaulted series is followed down to $0.10 and no further.
+    /// The timelock cannot slide the range below it, so a sub-$0.10 recovery value is
+    /// refused by both write paths and never published — pause the bond token instead
+    /// (test_TEST55_outOfRangeTruePrice_isRefusedByBothPaths).
+    function test_setAnswerRange_cannotSlideTheFloorBelowTenCents() public {
+        vm.warp(T0);
+        vm.prank(owner);
+        feed.updateAnswer(1e7); // $0.10, the default floor — and the absolute one
+
+        vm.prank(governor);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(1e6), uint256(2e7))
+        );
+        feed.setAnswerRange(1e6, 2e7); // $0.01-$0.20
+
+        bytes memory sig = _ownerSig(2_000_000, FAR_FUTURE); // $0.02 recovery value
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(2_000_000)));
+        feed.emergencyUpdateAnswer(2_000_000, FAR_FUTURE, sig);
+
+        assertEq(feed.minAnswer(), 1e7, "the floor did not move");
+        assertEq(feed.latestAnswer(), 1e7, "and $0.02 was never published");
+    }
+
+    /// A range that excludes the current NAV would strand the feed: the next push must land
+    /// inside it and within 10% of a price outside it. Refused.
+    function test_setAnswerRange_refusesToStrandTheCurrentAnswer() public {
+        _seedPrice(); // $0.9542
+        vm.prank(governor);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutsideNewRange.selector, ANSWER));
+        feed.setAnswerRange(1e8, 5e8);
+    }
+
+    /// Before any price exists there is nothing to strand, so any valid range is accepted —
+    /// e.g. a replacement feed for a series that has already accreted past the default.
+    function test_setAnswerRange_beforeTheFirstPush_acceptsAnyValidRange() public {
+        vm.prank(governor);
+        feed.setAnswerRange(2e8, 5e8);
+        assertEq(feed.minAnswer(), 2e8);
+
+        vm.prank(owner);
+        feed.updateAnswer(450_000_000); // first push, priced inside the slid range
+        assertEq(feed.latestAnswer(), 450_000_000);
+    }
+
+    /// The stranding check covers the TOP of the new range too.
+    function test_setAnswerRange_refusesToStrandTheCurrentAnswerAboveTheNewMax() public {
+        _seedPrice(); // $0.9542
+        vm.prank(governor);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutsideNewRange.selector, ANSWER));
+        feed.setAnswerRange(1e7, 9e7);
+    }
+
+    /// The current answer sitting exactly on a new limit is not stranded.
+    function test_setAnswerRange_admitsTheCurrentAnswerOnTheNewLimit() public {
+        _seedPrice();
+        vm.startPrank(governor);
+        feed.setAnswerRange(uint256(ANSWER), uint256(ANSWER) * 2);
+        feed.setAnswerRange(uint256(ANSWER) / 2, uint256(ANSWER));
+        vm.stopPrank();
+        assertEq(feed.maxAnswer(), uint256(ANSWER));
+    }
+
+    function test_setAnswerRange_emitsAnswerRangeUpdated() public {
+        vm.expectEmit(false, false, false, true, address(feed));
+        emit KaleidoscopeNAVFeed.AnswerRangeUpdated(5e7, 5e8);
+        vm.prank(governor);
+        feed.setAnswerRange(5e7, 5e8);
+    }
+
+    /// Narrowing binds the emergency path as well: the live range is what it reads.
+    function test_setAnswerRange_narrowingBindsTheEmergencyPath() public {
+        _seedPrice();
+        vm.prank(governor);
+        feed.setAnswerRange(6e7, 1e8);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _ownerSig(55_000_000, deadline); // inside the default, outside the new one
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(55_000_000)));
+        feed.emergencyUpdateAnswer(55_000_000, deadline, sig);
+    }
+
+    /// A feed cannot be its own governor.
+    function test_constructor_rejectsItselfAsRangeGovernor() public {
+        address self = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidRangeGovernor.selector, self));
+        new KaleidoscopeNAVFeed(owner, "g-self", guardian, self);
+    }
+
+    /// The governor must be a distinct key from both the owner and the guardian, or the
+    /// separation above collapses.
+    function test_constructor_rejectsAnInvalidRangeGovernor() public {
+        bytes4 sel = KaleidoscopeNAVFeed.InvalidRangeGovernor.selector;
+        vm.expectRevert(abi.encodeWithSelector(sel, address(0)));
+        new KaleidoscopeNAVFeed(owner, "g0", guardian, address(0));
+        vm.expectRevert(abi.encodeWithSelector(sel, owner));
+        new KaleidoscopeNAVFeed(owner, "g-owner", guardian, owner);
+        vm.expectRevert(abi.encodeWithSelector(sel, guardian));
+        new KaleidoscopeNAVFeed(owner, "g-guardian", guardian, guardian);
+    }
+
+    /// Nor can ownership later be rotated onto the governor.
+    function test_transferOwnership_refusesTheRangeGovernor() public {
+        vm.prank(owner);
+        vm.expectRevert(KaleidoscopeNAVFeed.OwnerCannotBeRangeGovernor.selector);
+        feed.transferOwnership(governor);
     }
 
     // ── latestRoundData ───────────────────────────────────────────────────────
@@ -652,7 +936,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// ever swapped for a custom initialiser.
     function test_constructor_zeroOwnerReverts() public {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new KaleidoscopeNAVFeed(address(0), "TLT / USD NAV", guardian);
+        new KaleidoscopeNAVFeed(address(0), "TLT / USD NAV", guardian, governor);
     }
 
     /// The other premise: transferOwnership(address(0)) cancels a pending transfer
@@ -724,7 +1008,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     uint256 constant IMPOSTOR_PK = 0xBAD;
 
     /// $1.50 — +57% from ANSWER ($0.9542), far outside the 10% band, and inside
-    /// [EMERGENCY_MIN_ANSWER, EMERGENCY_MAX_ANSWER].
+    /// [minAnswer, maxAnswer].
     int256 constant EMERGENCY_ANSWER = 150_000_000;
     /// $1.20 — a second in-band emergency target, for the tests that need two.
     int256 constant EMERGENCY_ANSWER_2 = 120_000_000;
@@ -812,8 +1096,8 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// never grows a setter back: the contract declares no fallback, so a call carrying a
     /// selector it does not implement reverts and `success` is false. If `setOk` ever
     /// returns true, D-7 is back and the entire FIND-003 security argument collapses with
-    /// it — the emergency band being a strict subset of the normal one
-    /// (test_emergencyRangeIsStrictSubsetOfNormalRange) only buys anything while the
+    /// it — the emergency path sharing the routine range
+    /// (test_emergencyPathSharesTheRoutineRange) only buys anything while the
     /// second key is genuinely a second key.
     function test_emergencyKeyIsImmutableAndUnappointable() public {
         vm.startPrank(owner);
@@ -1044,13 +1328,13 @@ contract KaleidoscopeNAVFeedTest is Test {
 
     function test_constructor_rejectsZeroGuardian() public {
         vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, address(0)));
-        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", address(0));
+        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", address(0), governor);
     }
 
     /// The 1-of-1 collapse, blocked at birth rather than only at transfer.
     function test_constructor_rejectsGuardianEqualToOwner() public {
         vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, owner));
-        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", owner);
+        new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", owner, governor);
     }
 
     /// The third constructor case IS testable: the feed's own address is a pure function
@@ -1059,13 +1343,13 @@ contract KaleidoscopeNAVFeedTest is Test {
         // Control first — prove the prediction is exact, otherwise the assertion below
         // would pass for any address that merely happens not to be a valid guardian.
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
-        KaleidoscopeNAVFeed control = new KaleidoscopeNAVFeed(owner, "control", guardian);
+        KaleidoscopeNAVFeed control = new KaleidoscopeNAVFeed(owner, "control", guardian, governor);
         assertEq(address(control), predicted, "the CREATE address is predictable");
 
         // A reverted CREATE still consumes the deployer's nonce, so re-predict.
         address self = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidEmergencyUpdater.selector, self));
-        new KaleidoscopeNAVFeed(owner, "self-guardian", self);
+        new KaleidoscopeNAVFeed(owner, "self-guardian", self, governor);
     }
 
     /// The signature is recovered against `owner()` AT EXECUTION TIME, not against a
@@ -1251,26 +1535,22 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.stalenessSeconds(), 0);
     }
 
-    /// LOAD-BEARING. This pins the entire security argument for FIND-003 in one place:
-    /// the emergency band is a STRICT SUBSET of the normal one, so the guardian pair buys
-    /// LATENCY, not REACH. Every price the two keys can reach instantly, the owner key
-    /// could already reach alone by chaining +/-10% hourly pushes
-    /// (test_chainedUpdates_escapeTheBand shows the mechanism); worst case $0.10 -> $2.00
-    /// is 32 pushes. That is what separates this path from the unbounded one deleted as
-    /// D-19.
+    /// LOAD-BEARING. This pins the security argument for FIND-003 in one place: both paths
+    /// share ONE range, so every price the feed can publish is one emergency correction
+    /// away (no gap left to ramp through at 10%/h), and the guardian pair still buys
+    /// LATENCY, not REACH — the owner key alone reaches the same range by chaining +/-10%
+    /// hourly pushes (test_chainedUpdates_escapeTheBand); worst case $0.10 -> $2.00 is 32
+    /// pushes, and $0.10 -> $5.00 (the widest range the timelock can set) is 42. That is
+    /// what separates this path from the unbounded one deleted as D-19.
     ///
-    /// The shipped values are asserted alongside the inequality on purpose. The inequality
-    /// alone would still hold if someone widened BOTH bands together, which would silently
-    /// grow the reach of the emergency path while this test kept passing. Retuning one
-    /// bound must break this test loudly and force the argument to be re-made.
-    function test_emergencyRangeIsStrictSubsetOfNormalRange() public view {
-        assertEq(feed.MIN_ANSWER(), 1e7, "MIN_ANSWER = $0.10");
-        assertEq(feed.MAX_ANSWER(), 5e8, "MAX_ANSWER = $5.00");
-        assertEq(feed.EMERGENCY_MIN_ANSWER(), 5e7, "EMERGENCY_MIN_ANSWER = $0.50");
-        assertEq(feed.EMERGENCY_MAX_ANSWER(), 2e8, "EMERGENCY_MAX_ANSWER = $2.00");
-
-        assertLt(feed.MIN_ANSWER(), feed.EMERGENCY_MIN_ANSWER(), "the emergency floor must sit ABOVE the normal one");
-        assertLt(feed.EMERGENCY_MAX_ANSWER(), feed.MAX_ANSWER(), "the emergency ceiling must sit BELOW the normal one");
+    /// The shipped values are asserted on purpose: widening the range grows the one-step
+    /// reach of the key pair, so retuning it — or the absolute bounds that cap every range
+    /// the timelock can set — must break this test and force the argument to be re-made.
+    function test_emergencyPathSharesTheRoutineRange() public view {
+        assertEq(feed.minAnswer(), 1e7, "minAnswer = $0.10");
+        assertEq(feed.maxAnswer(), 2e8, "maxAnswer = $2.00");
+        assertEq(feed.ABSOLUTE_MIN_ANSWER(), 1e7, "ABSOLUTE_MIN_ANSWER = $0.10");
+        assertEq(feed.ABSOLUTE_MAX_ANSWER(), 5e8, "ABSOLUTE_MAX_ANSWER = $5.00");
 
         // And the rate limit. Parity with MIN_UPDATE_INTERVAL is the claim: the emergency
         // path buys reach-within-band and freedom from intermediate prices, but NOT
@@ -1283,8 +1563,8 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// Both emergency bounds are inclusive, matching the normal path's
     /// (test_updateAnswer_rangeBoundariesAreInclusive).
     function test_emergency_bandBoundariesAreInclusive() public {
-        int256 floor_ = int256(feed.EMERGENCY_MIN_ANSWER());
-        int256 ceiling = int256(feed.EMERGENCY_MAX_ANSWER());
+        int256 floor_ = int256(uint256(feed.minAnswer()));
+        int256 ceiling = int256(uint256(feed.maxAnswer()));
 
         vm.warp(T0);
         _seedPrice();
@@ -1292,7 +1572,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         bytes memory sigLo = _ownerSig(floor_, FAR_FUTURE);
         vm.prank(guardian);
         feed.emergencyUpdateAnswer(floor_, FAR_FUTURE, sigLo);
-        assertEq(feed.latestAnswer(), floor_, "$0.50 exactly is accepted");
+        assertEq(feed.latestAnswer(), floor_, "$0.10 exactly is accepted");
 
         vm.warp(T0 + feed.EMERGENCY_COOLDOWN());
         bytes memory sigHi = _ownerSig(ceiling, FAR_FUTURE);
@@ -1301,11 +1581,9 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.latestAnswer(), ceiling, "$2.00 exactly is accepted");
     }
 
-    /// One unit below the floor. $0.4999... is a perfectly legal answer for the NORMAL
-    /// path — that is exactly the point of a narrower emergency band.
+    /// One unit below the floor — the same floor `updateAnswer` enforces.
     function test_emergency_belowTheBandReverts() public {
-        int256 tooLow = int256(feed.EMERGENCY_MIN_ANSWER()) - 1;
-        assertGt(tooLow, int256(feed.MIN_ANSWER()), "the rejected value is legal for updateAnswer");
+        int256 tooLow = int256(uint256(feed.minAnswer())) - 1;
 
         vm.warp(T0);
         _seedPrice();
@@ -1313,29 +1591,28 @@ contract KaleidoscopeNAVFeedTest is Test {
         // A fully valid signature, so the range guard is the only thing that can fire.
         bytes memory sig = _ownerSig(tooLow, FAR_FUTURE);
         vm.prank(guardian);
-        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencyAnswerOutOfRange.selector, tooLow));
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, tooLow));
         feed.emergencyUpdateAnswer(tooLow, FAR_FUTURE, sig);
         assertEq(feed.latestAnswer(), ANSWER, "nothing moved");
         assertEq(feed.emergencyNonce(), 0, "and nothing was consumed");
     }
 
     function test_emergency_aboveTheBandReverts() public {
-        int256 tooHigh = int256(feed.EMERGENCY_MAX_ANSWER()) + 1;
-        assertLt(tooHigh, int256(feed.MAX_ANSWER()), "the rejected value is legal for updateAnswer");
+        int256 tooHigh = int256(uint256(feed.maxAnswer())) + 1;
 
         vm.warp(T0);
         _seedPrice();
 
         bytes memory sig = _ownerSig(tooHigh, FAR_FUTURE);
         vm.prank(guardian);
-        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.EmergencyAnswerOutOfRange.selector, tooHigh));
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, tooHigh));
         feed.emergencyUpdateAnswer(tooHigh, FAR_FUTURE, sig);
         assertEq(feed.latestAnswer(), ANSWER, "nothing moved");
     }
 
     /// A correction, never an initialisation. The first price must come through
-    /// `updateAnswer`, so it is subject to the wider band and leaves a normal trail —
-    /// otherwise the guardian pair could seed the feed inside a band nobody audited.
+    /// `updateAnswer`, so it leaves a normal trail — otherwise the guardian pair could
+    /// seed the feed with a price the owner never pushed.
     function test_emergency_beforeAnyPriceReverts() public {
         vm.warp(T0);
 
@@ -1353,9 +1630,127 @@ contract KaleidoscopeNAVFeedTest is Test {
         assertEq(feed.latestAnswer(), EMERGENCY_ANSWER);
     }
 
+    // ── Halborn TEST-55 (FIND-003): a market gap beyond the step limit ────────
+    //
+    // TEST-55 (Fail) expects the feed to "either reflect a market move larger than its step
+    // limit or stop presenting the clamped price as current". A gap outside the old $0.50-$2.00
+    // emergency band could only be ramped at 10%/h, and swaps settled against every
+    // known-wrong price on the way. Both write paths now share ONE range, so a gap anywhere
+    // inside it is published in one transaction, and a true price outside it is refused by
+    // both paths — never clamped into range and stamped as current.
+
+    int256 constant TEST55_NAV = 100_000_000; // $1.00, the NAV standard
+    /// A short-lived owner signature, per the operational rule on emergencyUpdateAnswer.
+    uint256 constant TEST55_DEADLINE = T0 + ONE_HOUR + 10 minutes;
+
+    /// TEST-55 itself, and the reason Halborn reopened FIND-003: $1.00 -> $0.30, a 70% gap.
+    /// $0.30 is under the old $0.50 emergency floor, so the old 2-of-2 refused it and the
+    /// only route down was the 10%/h ramp, publishing known-wrong prices on the way. It is
+    /// above the shared $0.10 floor, so the 2-of-2 now publishes the true price in one
+    /// step. Keep the target under $0.50: a gap inside the old $0.50-$2.00
+    /// band passes on the reopened code too, and would pin nothing.
+    function test_TEST55_marketGapBeyondStepLimit_isPublishedInOneStep() public {
+        int256 gapped = 30_000_000; // $0.30, under the old $0.50 emergency floor
+        vm.warp(T0);
+        vm.prank(owner);
+        feed.updateAnswer(TEST55_NAV);
+
+        // The routine path refuses the gap a full interval later, so the step limit — not
+        // the clock — is what stops it.
+        vm.warp(T0 + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, gapped, TEST55_NAV));
+        feed.updateAnswer(gapped);
+
+        // No ramp is forced: guardian submits, owner co-signs, one transaction.
+        bytes memory sig = _ownerSig(gapped, TEST55_DEADLINE);
+        vm.expectEmit(true, true, false, true, address(feed));
+        emit AnswerUpdated(gapped, 2, T0 + ONE_HOUR);
+        vm.expectEmit(true, true, false, true, address(feed));
+        emit EmergencyAnswerUpdated(gapped, 2, TEST55_NAV, 0);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(gapped, TEST55_DEADLINE, sig);
+
+        (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+            feed.latestRoundData();
+        assertEq(answer, gapped, "the feed presents the true $0.30");
+        assertEq(roundId, 2, "the very next round: no intermediate ramp price was ever published");
+        assertEq(updatedAt, T0 + ONE_HOUR, "stamped fresh, at the correction itself");
+        assertEq(startedAt, updatedAt);
+        assertEq(answeredInRound, roundId);
+        assertEq(feed.stalenessSeconds(), 0);
+        assertTrue(feed.isFresh());
+    }
+
+    /// The upward sibling: $1.00 -> $1.90, a 90% gap (a seven-push ramp), in one step.
+    /// Old code passes this too ($1.90 was inside its $0.50-$2.00 band): the down-gap test
+    /// above is what distinguishes old from new.
+    function test_TEST55_upwardGapBeyondStepLimit_isPublishedInOneStep() public {
+        int256 gapped = 190_000_000; // $1.90
+        vm.warp(T0);
+        vm.prank(owner);
+        feed.updateAnswer(TEST55_NAV);
+
+        vm.warp(T0 + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, gapped, TEST55_NAV));
+        feed.updateAnswer(gapped);
+
+        bytes memory sig = _ownerSig(gapped, TEST55_DEADLINE);
+        vm.expectEmit(true, true, false, true, address(feed));
+        emit AnswerUpdated(gapped, 2, T0 + ONE_HOUR);
+        vm.expectEmit(true, true, false, true, address(feed));
+        emit EmergencyAnswerUpdated(gapped, 2, TEST55_NAV, 0);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(gapped, TEST55_DEADLINE, sig);
+
+        (uint80 roundId, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(answer, gapped, "the feed presents the true $1.90");
+        assertEq(roundId, 2, "in one round");
+        assertEq(updatedAt, T0 + ONE_HOUR, "stamped fresh");
+        assertTrue(feed.isFresh());
+    }
+
+    /// A true price OUTSIDE the range: $1.00 -> $0.05. Both write paths refuse it by name.
+    /// Neither clamps it to the $0.10 floor, and nothing is written — no round, no fresh
+    /// timestamp — so the feed never re-stamps a wrong price as current: the last answer
+    /// keeps its own `updatedAt` and ages out for every consumer that age-checks (isFresh,
+    /// GyldAtomicSwap's StaleNav). Until then it is still served, as Chainlink serves a last
+    /// answer, so ops pause the bond token. The timelock cannot admit $0.05 either
+    /// (test_setAnswerRange_cannotSlideTheFloorBelowTenCents).
+    function test_TEST55_outOfRangeTruePrice_isRefusedByBothPaths() public {
+        int256 trueNav = 5_000_000; // $0.05, under the $0.10 floor
+        vm.warp(T0);
+        vm.prank(owner);
+        feed.updateAnswer(TEST55_NAV);
+
+        vm.warp(T0 + ONE_HOUR);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, trueNav));
+        feed.updateAnswer(trueNav);
+
+        // A fully valid 2-of-2 — guardian caller, owner signature, live deadline, no
+        // cooldown running — so the range is the only guard that can fire.
+        bytes memory sig = _ownerSig(trueNav, TEST55_DEADLINE);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, trueNav));
+        feed.emergencyUpdateAnswer(trueNav, TEST55_DEADLINE, sig);
+
+        (uint80 roundId, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(roundId, 1, "no round was written");
+        assertEq(answer, TEST55_NAV, "nothing was clamped to the floor");
+        assertEq(updatedAt, T0, "and the last price was not re-stamped as current");
+        assertEq(feed.emergencyNonce(), 0, "the signature was not consumed");
+        assertEq(feed.stalenessSeconds(), ONE_HOUR, "it keeps ageing from its own timestamp");
+
+        // Past the freshness window it stops reading as current.
+        vm.warp(T0 + feed.DEFAULT_STALENESS_THRESHOLD() + 1);
+        assertFalse(feed.isFresh(), "the unrefreshed price ages out");
+    }
+
     // ── Emergency path — cooldown and resulting state ─────────────────────────
 
-    /// Without the cooldown the two keys would hold a $0.50 <-> $2.00 oscillation
+    /// Without the cooldown the two keys would hold a $0.10 <-> $2.00 oscillation
     /// primitive every block. With it they hold one arbitrary in-band jump per hour.
     function test_emergency_secondCorrectionWithinCooldownReverts() public {
         vm.warp(T0);
@@ -1545,9 +1940,9 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// liquidated against during that hour, pause the bond token; do not weaken the feed.
     ///
     /// This mechanism is also what bounds the emergency path FIND-003 later reinstated.
-    /// Because chaining reaches any price in [MIN_ANSWER, MAX_ANSWER] given enough hours,
-    /// and the emergency band is a strict subset of that range
-    /// (test_emergencyRangeIsStrictSubsetOfNormalRange), the guardian pair can reach no
+    /// Because chaining reaches any price in [minAnswer, maxAnswer] given enough hours,
+    /// and the emergency path is bound by that same range
+    /// (test_emergencyPathSharesTheRoutineRange), the guardian pair can reach no
     /// price the owner key could not already reach alone. It buys latency, not reach.
     function test_chainedUpdates_escapeTheBand() public {
         int256 correctPrice = 95_000_000; // $0.95
@@ -1707,7 +2102,7 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// detail. oldSeconds = 0 is a sentinel the setter can never produce.
     function test_constructor_emitsInitialStalenessThreshold() public {
         vm.recordLogs();
-        KaleidoscopeNAVFeed fresh = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian);
+        KaleidoscopeNAVFeed fresh = new KaleidoscopeNAVFeed(owner, "TLT / USD NAV", guardian, governor);
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bool found;

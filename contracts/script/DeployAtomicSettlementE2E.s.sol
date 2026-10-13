@@ -45,6 +45,9 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   withdrawalWallet       = account[5]  — a FIXED destination distinct from the
 ///                                           treasurer, so the withdraw proof shows
 ///                                           funds landing at the admin-fixed wallet.
+///   factory owner          = account[6]  — signs deployToken, so it is the feed's
+///                                           rangeGovernor: must differ from the NAV
+///                                           feed owner (account[0]).
 ///
 /// ── Run (start anvil --chain-id 31337 first) ────────────────────────────────
 ///   forge script contracts/script/DeployAtomicSettlementE2E.s.sol \
@@ -59,6 +62,8 @@ contract DeployAtomicSettlementE2E is Script {
     address constant BOB = 0x90F79bf6EB2c4f870365E785982E1f101E93b906; // acct[3] (not allowlisted)
     address constant OPERATOR = 0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65; // acct[4]
     address constant WITHDRAWAL_WALLET = 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc; // acct[5]
+    uint256 immutable FACTORY_OWNER_PK =
+        vm.deriveKey("test test test test test test test test test test test junk", 6); // acct[6]
 
     // $1.00 per token, 8dp — the product's NAV-per-token standard, and the mid the Rust
     // market-data fixture quotes against. 1e18 bond token <-> 1e6 USDC.
@@ -94,13 +99,15 @@ contract DeployAtomicSettlementE2E is Script {
         // against this stack instead of reverting for want of a holder.
         issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), OPERATOR);
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), vm.addr(FACTORY_OWNER_PK));
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
-        // CAT-style series — deployer is factory owner so deployToken is direct.
+        // CAT-style series — signed by the factory owner (acct[6]); see the role model.
         // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin — validate first.
         DeployGuards.requireValidIsin("US14913UBF66");
         DeployGuards.requireIsinVacant(address(factory), "US14913UBF66");
+        vm.stopBroadcast();
+        vm.broadcast(FACTORY_OWNER_PK);
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
@@ -110,6 +117,7 @@ contract DeployAtomicSettlementE2E is Script {
             address(issuanceMgr),
             deployer // NAV feed owner — the broadcaster, so it can push NAV below
         );
+        vm.startBroadcast();
         GyldBondToken token = GyldBondToken(token_);
         KaleidoscopeNAVFeed navFeed = KaleidoscopeNAVFeed(navFeed_);
 

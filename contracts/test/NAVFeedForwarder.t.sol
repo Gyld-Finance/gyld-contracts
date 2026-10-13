@@ -25,8 +25,8 @@ contract NAVFeedForwarderTest is Test {
     int256 constant ANSWER_V2 = 99_000_000; // $0.9900  (new oracle, within 10% of V1)
 
     function setUp() public {
-        feedV1    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV", guardian);
-        feedV2    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV v2", guardian);
+        feedV1    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV", guardian, forwarderOwner);
+        feedV2    = new KaleidoscopeNAVFeed(feedOwner, "TLT / USD NAV v2", guardian, forwarderOwner);
         forwarder = new NAVFeedForwarder(address(feedV1), forwarderOwner);
 
         vm.prank(feedOwner);

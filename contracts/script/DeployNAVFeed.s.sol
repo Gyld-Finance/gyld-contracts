@@ -32,6 +32,8 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                        a TimelockController — so that repointing the oracle every DeFi
 ///                        market reads from carries a mandatory delay. An EOA here means
 ///                        one key can silently swap the price source under Morpho/Aave.
+///                        Also the feed's `rangeGovernor`: the only address that may move
+///                        its answer range ($0.10-$2.00 default) within $0.10-$5.00.
 ///
 /// ── Usage — Anvil (local) ──────────────────────────────────────────────────
 ///   anvil &
@@ -92,6 +94,14 @@ contract DeployNAVFeed is Script {
         );
         DeployGuards.requireDistinct(operator, navGuardian, "OPERATOR_ADDRESS", "NAV_GUARDIAN");
 
+        // The forwarder owner is also the feed's range governor. On a dev chain it falls back
+        // to the operator, which the feed refuses as governor; use an address with NO known
+        // key instead (a hash, not `vm.addr` of one), so a dev feed keeps the default range.
+        address rangeGovernor = forwarderOwner;
+        if (DeployGuards.isDevChain() && rangeGovernor == operator) {
+            rangeGovernor = address(uint160(uint256(keccak256("DeployNAVFeed:dev-range-governor"))));
+        }
+
         vm.startBroadcast();
 
         // 1. Deploy the NAV feed (operator pushes prices here). The salt carries the feed
@@ -100,10 +110,10 @@ contract DeployNAVFeed is Script {
             salt: DeployGuards.vacantSalt(
                 string.concat("DeployNAVFeed:KaleidoscopeNAVFeed:", feedDescription),
                 abi.encodePacked(
-                    type(KaleidoscopeNAVFeed).creationCode, abi.encode(operator, feedDescription, navGuardian)
+                    type(KaleidoscopeNAVFeed).creationCode, abi.encode(operator, feedDescription, navGuardian, rangeGovernor)
                 )
             )
-        }(operator, feedDescription, navGuardian);
+        }(operator, feedDescription, navGuardian, rangeGovernor);
 
         // 2. Deploy the forwarder pointing at the NAV feed
         //    DeFi protocols always integrate this address — never the feed directly

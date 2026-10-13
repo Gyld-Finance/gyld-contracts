@@ -31,16 +31,17 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///      below is sized for it. A $95 instrument needs its own feed (audit FIND-003).
 ///
 ///      Safety constraints:
-///        - MIN_ANSWER / MAX_ANSWER: $0.10-$5.00, on BOTH paths and EVERY push including
+///        - minAnswer / maxAnswer: $0.10-$2.00, on BOTH paths and EVERY push including
 ///          the first. Below 10 the deviation guard can never pass again and the feed is
-///          permanently stuck; far above, its arithmetic overflows. See MIN_ANSWER.
+///          permanently stuck; far above, its arithmetic overflows. See ABSOLUTE_MIN_ANSWER.
+///          Default range; only `rangeGovernor` may move it, within $0.10-$5.00.
 ///        - MAX_PRICE_DEVIATION_BPS: price cannot move more than 10% per update
 ///        - MIN_UPDATE_INTERVAL:     updates must be at least 1 hour apart
 ///          Both bind `updateAnswer` unconditionally; no key skips them. A larger
 ///          correction is reached by chaining updates (the band is relative to the
 ///          LAST price, so it moves with each push); pause the bond token meanwhile
 ///          if a wrong price must not be liquidated against. See ARCHITECTURE §11.5.
-///        - EMERGENCY_MIN_ANSWER / EMERGENCY_MAX_ANSWER: $0.50-$2.00, the band the 2-of-2
+///        - The same minAnswer / maxAnswer range is the band the 2-of-2
 ///          `emergencyUpdateAnswer` may land in; it skips both guards above (FIND-003).
 ///        - stalenessThreshold:      threshold for the isFresh() monitoring view;
 ///                                   reads do NOT revert on stale price (Chainlink/Ondo model)
@@ -119,12 +120,12 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     /// skips the deviation check entirely (there is no `last` to compare against), a
     /// placeholder first answer of 1 would brick the feed permanently — it is not
     /// upgradeable, has no pause or reset, and `_updatedAt` never returns to zero.
-    uint256 public constant MIN_ANSWER = 1e7;
+    uint256 public constant ABSOLUTE_MIN_ANSWER = 1e7;
 
     /// Absolute ceiling for any published answer. 5e8 at 8 decimals = $5.00 per token,
     /// retuned from $10bn by audit FIND-003 (this feed serves the $1.00 NAV standard).
     ///
-    /// The mirror of MIN_ANSWER: above roughly int256.max / BPS_DENOMINATOR (~5.8e72) the
+    /// The mirror of ABSOLUTE_MIN_ANSWER: above roughly int256.max / BPS_DENOMINATOR (~5.8e72) the
     /// deviation check's own arithmetic overflows and every later push reverts with a
     /// panic instead of a named error. This ceiling sits ~64 orders of magnitude below
     /// that, so the multiplication cannot overflow for any accepted answer.
@@ -133,26 +134,23 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     /// overflow at the top while making the bottom strictly worse, because
     /// `last / BPS_DENOMINATOR` truncates to zero for any realistic price and would then
     /// reject every push (audit FIND-020).
-    uint256 public constant MAX_ANSWER = 5e8;
+    uint256 public constant ABSOLUTE_MAX_ANSWER = 5e8;
+
+    /// The answer range both write paths enforce: $0.10-$2.00 at deploy (audit FIND-003).
+    /// Changed only by `rangeGovernor`, within ABSOLUTE_MIN_ANSWER..ABSOLUTE_MAX_ANSWER.
+    uint128 public minAnswer = 1e7;
+    uint128 public maxAnswer = 2e8;
+
+    /// @notice The only address that may change the answer range: the timelock. `immutable`,
+    ///         no setter, and never the owner (KMS) key — that would re-create D-7.
+    address public immutable rangeGovernor;
 
     // ── Emergency correction path (audit FIND-003) ────────────────────────────
-
-    /// Absolute floor for an EMERGENCY answer. 5e7 at 8 decimals = $0.50 per token.
-    uint256 public constant EMERGENCY_MIN_ANSWER = 5e7;
-
-    /// Absolute ceiling for an EMERGENCY answer. 2e8 at 8 decimals = $2.00 per token.
-    /// This band is a STRICT SUBSET of [MIN_ANSWER, MAX_ANSWER] — the relation is the
-    /// security argument, and both are `constant` so it is checkable from source. The
-    /// emergency path skips the interval and deviation guards but reaches no price
-    /// chaining already reaches: it buys latency, not reach (audit FIND-003, D-29).
-    /// The one thing the pair does gain is arriving without the intermediate prices, so
-    /// without the liquidations each would have fired — hence two keys, not one.
-    uint256 public constant EMERGENCY_MAX_ANSWER = 2e8;
 
     /// Minimum time between consecutive emergency corrections. Deliberately EQUAL to
     /// MIN_UPDATE_INTERVAL, so the invariant is uniform: no path writes this feed more
     /// than once an hour.
-    /// @dev Without a cooldown the two keys hold a $0.50 <-> $2.00 oscillation primitive
+    /// @dev Without a cooldown the two keys hold a minAnswer <-> maxAnswer oscillation primitive
     ///      every block. Parity rather than something longer, because a longer lock rate-
     ///      limits OPERATIONS, not an attacker: whoever holds both keys also holds the
     ///      owner key, which already writes hourly. A cascading credit event can need a
@@ -195,12 +193,17 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     error InvalidStalenessThreshold(uint256 submitted);
     // audit FIND-003 — the emergency correction path.
     error NotEmergencyUpdater(address caller);
-    error EmergencyAnswerOutOfRange(int256 answer);
     error EmergencySignatureExpired(uint256 deadline);
     error EmergencySignerNotOwner();
     error EmergencyCooldownActive(uint256 nextAllowedAt);
     error InvalidEmergencyUpdater(address candidate);
     error OwnerCannotBeEmergencyUpdater();
+    // Answer-range governance (Halborn, raised on the FIND-003 remediation).
+    error NotRangeGovernor(address caller);
+    error InvalidRangeGovernor(address candidate);
+    error OwnerCannotBeRangeGovernor();
+    error InvalidAnswerRange(uint256 minAnswer, uint256 maxAnswer);
+    error AnswerOutsideNewRange(int256 answer);
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -213,13 +216,17 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     /// Emitted IN ADDITION TO AnswerUpdated on an emergency correction, never instead of it.
     event EmergencyAnswerUpdated(int256 indexed answer, uint256 indexed roundId, int256 previousAnswer, uint256 nonce);
 
+    /// Emitted at construction (the defaults) and on every `setAnswerRange`.
+    event AnswerRangeUpdated(uint256 minAnswer, uint256 maxAnswer);
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     /// @param initialOwner  Address that may call updateAnswer (KMS signer or Safe).
     /// @param desc          Human-readable description, e.g. "TLT / USD NAV".
     /// @param guardian      The ops multisig: the ONLY address that may call
     ///                      emergencyUpdateAnswer, and only with the owner's signature.
-    constructor(address initialOwner, string memory desc, address guardian)
+    /// @param governor      The timelock: the ONLY address that may change the answer range.
+    constructor(address initialOwner, string memory desc, address guardian, address governor)
         Ownable(initialOwner)
         EIP712("KaleidoscopeNAVFeed", "1")
     {
@@ -228,6 +235,12 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
             revert InvalidEmergencyUpdater(guardian);
         }
         emergencyUpdater = guardian;
+        // governor == owner would let the KMS key widen its own reach — D-7 again.
+        if (governor == address(0) || governor == initialOwner || governor == guardian || governor == address(this)) {
+            revert InvalidRangeGovernor(governor);
+        }
+        rangeGovernor = governor;
+        emit AnswerRangeUpdated(minAnswer, maxAnswer);
         _description = desc;
         stalenessThreshold = DEFAULT_STALENESS_THRESHOLD;
         // oldSeconds = 0 is a "no previous value" sentinel the setter can never emit
@@ -257,6 +270,7 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     ///         calls it before `emergencyUpdater` is initialised, which does not compile.
     function transferOwnership(address newOwner) public virtual override {
         if (newOwner == emergencyUpdater) revert OwnerCannotBeEmergencyUpdater();
+        if (newOwner == rangeGovernor) revert OwnerCannotBeRangeGovernor();
         super.transferOwnership(newOwner);
     }
 
@@ -267,13 +281,13 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     ///
     /// Reverts if:
     ///   - caller is not the owner
-    ///   - answer is outside MIN_ANSWER..MAX_ANSWER, first push included
+    ///   - answer is outside minAnswer..maxAnswer, first push included
     ///   - less than MIN_UPDATE_INTERVAL has elapsed since the last update
     ///   - price deviates more than MAX_PRICE_DEVIATION_BPS from the previous price
     function updateAnswer(int256 answer) external onlyOwner {
         // Applies to EVERY push, the first included — that is the point (FIND-020).
-        // Also subsumes the old positivity check: a negative answer is below MIN_ANSWER.
-        if (answer < int256(MIN_ANSWER) || answer > int256(MAX_ANSWER)) {
+        // Also subsumes the old positivity check: a negative answer is below minAnswer.
+        if (answer < int256(uint256(minAnswer)) || answer > int256(uint256(maxAnswer))) {
             revert AnswerOutOfRange(answer);
         }
 
@@ -309,7 +323,7 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
 
     /// @notice Correct the NAV in ONE transaction, skipping the interval and deviation
     ///         guards, when the true price has gapped out of reach of a chained walk-back.
-    /// @param  answer    The true NAV, 8dp. Must land in [EMERGENCY_MIN, EMERGENCY_MAX].
+    /// @param  answer    The true NAV, 8dp. Must land in [minAnswer, maxAnswer].
     /// @param  deadline  Unix time after which the owner's signature is void.
     /// @param  sig       Owner's EIP-712 signature over (answer, emergencyNonce, deadline).
     /// @dev    2-of-2 (audit FIND-003): the guardian is the only permitted CALLER, and the
@@ -327,8 +341,8 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
         if (lastEmergencyAt != 0 && block.timestamp < lastEmergencyAt + EMERGENCY_COOLDOWN) {
             revert EmergencyCooldownActive(lastEmergencyAt + EMERGENCY_COOLDOWN);
         }
-        if (answer < int256(EMERGENCY_MIN_ANSWER) || answer > int256(EMERGENCY_MAX_ANSWER)) {
-            revert EmergencyAnswerOutOfRange(answer);
+        if (answer < int256(uint256(minAnswer)) || answer > int256(uint256(maxAnswer))) {
+            revert AnswerOutOfRange(answer);
         }
 
         address owner_ = owner();
@@ -350,6 +364,28 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
         _updatedAt = block.timestamp;
         emit AnswerUpdated(answer, _roundId, block.timestamp);
         emit EmergencyAnswerUpdated(answer, _roundId, previous, emergencyNonce - 1);
+    }
+
+    // ── Answer range (Halborn, raised on the FIND-003 remediation) ─────────────
+
+    /// @notice Change the answer range. `rangeGovernor` (the timelock) only.
+    /// @dev    For a series whose true NAV outgrows the $0.10-$2.00 default (accretion), or
+    ///         to narrow the range. Requires ABSOLUTE_MIN_ANSWER <= newMin < newMax <=
+    ///         ABSOLUTE_MAX_ANSWER — never below $0.10, never above $5.00 — and the current
+    ///         answer inside the new range, so the feed is never stranded.
+    function setAnswerRange(uint256 newMin, uint256 newMax) external {
+        if (msg.sender != rangeGovernor) revert NotRangeGovernor(msg.sender);
+        if (newMin < ABSOLUTE_MIN_ANSWER || newMax > ABSOLUTE_MAX_ANSWER || newMin >= newMax) {
+            revert InvalidAnswerRange(newMin, newMax);
+        }
+        // Casts are safe: both are bounded by ABSOLUTE_MAX_ANSWER above.
+        int256 last = _latestAnswer;
+        if (_roundId != 0 && (last < int256(newMin) || last > int256(newMax))) {
+            revert AnswerOutsideNewRange(last);
+        }
+        minAnswer = uint128(newMin);
+        maxAnswer = uint128(newMax);
+        emit AnswerRangeUpdated(newMin, newMax);
     }
 
     // ── AggregatorV3Interface ─────────────────────────────────────────────────

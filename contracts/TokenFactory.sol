@@ -76,6 +76,9 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
     error ZeroAddress();
     /// audit FIND-003 — navFeedOwner (KMS signer) must differ from operator (NAV guardian).
     error NavFeedOwnerIsOperator();
+    /// The factory owner becomes the feed's `rangeGovernor`, which must be a different key
+    /// from the feed owner and the guardian — else the KMS key could widen its own range.
+    error FactoryOwnerHoldsFeedRole(address account);
     error EmptyIsin();
     /// audit FIND-013 — the ISIN is not 12 uppercase alphanumerics.
     error MalformedIsin(string isin);
@@ -211,6 +214,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         if (navFeedOwner == address(0)    || navFeedOwner == address(this))    revert ZeroAddress();
         // The feed enforces this too; failing here names the variable to fix.
         if (navFeedOwner == operator)      revert NavFeedOwnerIsOperator();
+        if (navFeedOwner == owner() || operator == owner()) revert FactoryOwnerHoldsFeedRole(owner());
         _requireCanonicalIsin(isin);
 
         // A maturity already in the past has no legitimate use and signals a bad payload
@@ -261,7 +265,7 @@ contract TokenFactory is Ownable2Step, ReentrancyGuard {
         // PAUSER_ROLE. Deliberately not the 48 h timelock: a correction that waits two
         // days is not a correction. See ARCHITECTURE D-29.
         navFeed =
-            address(new KaleidoscopeNAVFeed(navFeedOwner, string(abi.encodePacked(symbol, " / USD NAV")), operator));
+            address(new KaleidoscopeNAVFeed(navFeedOwner, string(abi.encodePacked(symbol, " / USD NAV")), operator, owner()));
 
         // Forwarder is the stable address for DeFi integrations (Morpho Blue, Aave).
         // Owner = factory.owner() (TimelockController in prod) so oracle provider swaps

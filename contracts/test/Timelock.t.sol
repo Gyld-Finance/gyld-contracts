@@ -324,7 +324,7 @@ contract TimelockTest is Test {
         // convenience, so one cached across a vm.warp silently takes the WARPED value:
         // `uint256 t0 = block.timestamp` here read 172801 rather than 1, pushing readyAt
         // a full window late and making the "one second early" execute succeed. Same
-        // hazard already recorded at KaleidoscopeNAVFeed.t.sol:338 and
+        // hazard already recorded at KaleidoscopeNAVFeed.t.sol:622 and
         // AtomicSettlementDeploy.t.sol:428. Every boundary below is a timestamp
         // comparison, so that failure mode is fail-OPEN and must not be reintroduced.
         vm.warp(T0);
