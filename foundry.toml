@@ -13,6 +13,10 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
+[rpc_endpoints]
+# Katana testnet "Bokuto" (737373, GLD-738). `--rpc-url katana_bokuto`.
+katana_bokuto = "https://rpc-bokuto.katanarpc.com"
+
 [etherscan]
 sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
 # BscScan is served by the Etherscan V2 unified API, so the SAME ETHERSCAN_API_KEY covers
@@ -23,6 +27,8 @@ sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-s
 # `forge verify-contract` works on a free key. Use the HYPHENATED table key: `--chain
 # bsc_testnet` is rejected by the CLI, `--chain bsc-testnet` is not.
 bsc-testnet = { key = "${ETHERSCAN_API_KEY}", chain = 97 }
+# Katana testnet "Bokuto" (GLD-738): Etherscan V2 (katanascan), same ETHERSCAN_API_KEY.
+katana-bokuto = { key = "${ETHERSCAN_API_KEY}", chain = 737373, url = "https://api.etherscan.io/v2/api?chainid=737373" }
 
 [fuzz]
 runs = 10000

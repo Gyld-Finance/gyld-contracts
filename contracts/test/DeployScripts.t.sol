@@ -41,6 +41,11 @@ contract GuardsHarness {
         return DeployGuards.saltFor(name);
     }
 
+    /// External for the same CHAINID reason as {isDevChain}: it short-circuits on it.
+    function requireProdSafe(string memory what) external view {
+        DeployGuards.requireProdSafe(what);
+    }
+
     /// The guard is `internal view` on a library, so a test can only reach it through a
     /// wrapper — and it has to be an EXTERNAL one for the same CHAINID reason as above:
     /// {DeployGuards.requireSanctionsOracleAnswers} short-circuits on `isDevChain()`.
@@ -109,6 +114,21 @@ contract DeployGuardsTest is ScriptRevertAsserts {
                 string.concat("chainId ", vm.toString(production[i]), " must be treated as production")
             );
         }
+    }
+
+    /// GLD-738: Katana's TESTNET "Bokuto" (737373) is a dev chain; Katana MAINNET (747474)
+    /// must stay on the production path, and the refusal must name the new dev chain.
+    function test_isDevChain_admitsKatanaBokutoOnly_notKatanaMainnet() public {
+        assertTrue(_isDev(737373), "Katana Bokuto (737373) must be a dev chain");
+        harness.requireProdSafe("a dev action"); // must not revert on Bokuto
+
+        assertFalse(_isDev(747474), "Katana mainnet (747474) must be treated as production");
+        (bool ok, bytes memory ret) =
+            address(harness).staticcall(abi.encodeWithSelector(GuardsHarness.requireProdSafe.selector, "a dev action"));
+        assertFalse(ok, "requireProdSafe must revert on Katana mainnet");
+        string memory reason = _revertReason(ret);
+        assertTrue(_contains(reason, "NOT production-safe on chainId 747474"), reason);
+        assertTrue(_contains(reason, "737373 Katana Bokuto"), reason);
     }
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
@@ -1296,5 +1316,16 @@ contract DeployMockUSDCTest is ScriptRevertAsserts {
         DeployMockUSDC script = new DeployMockUSDC();
         script.run();
         assertGt(address(script.usdc()).code.length, 0, "no MockUSDC deployed on Sepolia");
+    }
+
+    /// GLD-738: the mock deploys on Katana Bokuto (737373) and is refused on Katana mainnet (747474).
+    function test_run_deploysOnKatanaBokuto_refusedOnKatanaMainnet() public {
+        vm.chainId(737373);
+        DeployMockUSDC script = new DeployMockUSDC();
+        script.run();
+        assertGt(address(script.usdc()).code.length, 0, "no MockUSDC deployed on Katana Bokuto");
+
+        vm.chainId(747474);
+        _expectRunRevert(address(new DeployMockUSDC()), "is dev-only and is NOT production-safe on chainId 747474");
     }
 }
