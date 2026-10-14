@@ -24,7 +24,8 @@ interface ITimelockLike {
 ///  1. **Denylist chain guards.** Every "mainnet protection" check in the scripts was
 ///     `require(block.chainid != 1, ...)`. A production L2 (chain 8453), Arbitrum, Optimism, Polygon and
 ///     every future L2 sail straight through it. {isDevChain} inverts this into an
-///     ALLOWLIST: only Anvil (31337) and Sepolia (11155111) are development chains, and
+///     ALLOWLIST: only Anvil (31337), Sepolia (11155111) and BSC testnet (97, GLD-713)
+///     are development chains, and
 ///     an unrecognised chain defaults to "production". A new chain now fails closed.
 ///
 ///  2. **Silent fallbacks.** Privileged addresses fell back to the deployer EOA and the
@@ -46,6 +47,9 @@ library DeployGuards {
     uint256 internal constant ANVIL_CHAIN_ID = 31337;
     /// The single supported public testnet (docs/ARCHITECTURE.md).
     uint256 internal constant SEPOLIA_CHAIN_ID = 11155111;
+    /// BNB Smart Chain TESTNET (GLD-713). Only the testnet: BSC mainnet (56) and every
+    /// other BNB-family chain (opBNB 204, …) stay on the production path by omission.
+    uint256 internal constant BSC_TESTNET_CHAIN_ID = 97;
 
     /// Minimum TimelockController delay on any production chain.
     uint256 internal constant MIN_PROD_TIMELOCK_DELAY = 48 hours;
@@ -116,12 +120,13 @@ library DeployGuards {
 
     // ── Chain classification ──────────────────────────────────────────────────
 
-    /// @notice True ONLY for the two chains where deployer-held roles, zero delays and
+    /// @notice True ONLY for the chains where deployer-held roles, zero delays and
     ///         mock contracts are acceptable.
     /// @dev    ALLOWLIST, deliberately. Anything not named here — including chains that
     ///         do not exist yet — is treated as production and gets the strict path.
     function isDevChain() internal view returns (bool) {
-        return block.chainid == ANVIL_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID;
+        return block.chainid == ANVIL_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID
+            || block.chainid == BSC_TESTNET_CHAIN_ID;
     }
 
     /// @notice Reverts unless the current chain is a development chain.
@@ -134,7 +139,7 @@ library DeployGuards {
                 what,
                 " is dev-only and is NOT production-safe on chainId ",
                 vm.toString(block.chainid),
-                " (dev chains: 31337 Anvil, 11155111 Sepolia)"
+                " (dev chains: 31337 Anvil, 11155111 Sepolia, 97 BSC testnet)"
             )
         );
     }

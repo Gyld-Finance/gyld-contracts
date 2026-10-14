@@ -16,11 +16,11 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 /// Compliance: each token reads from the configured on-chain sanctions oracle (read-only).
 /// On every production EVM chain that is the platform-operated SanctionsOracleMirror,
 /// passed in via the SANCTIONS_LIST env var (GYL-1051). On a dev chain (Anvil 31337 /
-/// Sepolia 11155111) a MockSanctionsList is deployed instead so the gateway
+/// Sepolia 11155111 / BSC testnet 97) a MockSanctionsList is deployed instead so the gateway
 /// `mock_sanction_address` endpoint can flip addresses without a live oracle.
 ///
 /// ── Dev vs production (GYL-1135) ──────────────────────────────────────────────
-/// Development chains are an ALLOWLIST: 31337 and 11155111 only (see
+/// Development chains are an ALLOWLIST: 31337, 11155111 and 97 only (see
 /// {DeployGuards.isDevChain}). Everything else — Ethereum, Arbitrum, every L2, and every
 /// chain that does not exist yet — takes the production path, where:
 ///   * every privileged env var below is REQUIRED and must not be the deployer EOA;

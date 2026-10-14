@@ -7,6 +7,7 @@ import {GyldAtomicSwap} from "../GyldAtomicSwap.sol";
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {MockSanctionsList} from "./MockSanctionsList.sol";
 import {MockUSDC} from "./MockUSDC.sol";
+import {GyldTestUSD} from "./GyldTestUSD.sol";
 import {MockUSDCPermit} from "./MockUSDCPermit.sol";
 import {MockNavForwarder} from "./MockNavForwarder.sol";
 import {MockReentrantToken, ISwapReentryTarget} from "./MockReentrantToken.sol";
@@ -1717,15 +1718,18 @@ contract GyldAtomicSwapSpecTest is Test {
         swap.registerSeries(address(usdc), address(navFeed));
     }
 
-    /// The same probe guards the cash token at initialize: a non-6dp cash token would
-    /// silently vacuum the NAV band. The 18dp bond token stands in as the bad cash leg.
+    /// The same probe guards the cash token at initialize. Since GLD-713 the band
+    /// divisor scales as 10**(26-d) and exactly 6dp or 18dp cash is accepted; anything
+    /// else reverts. Name kept from the 6dp-only era; a
+    /// 24dp stablecoin stands in as the bad cash leg.
     function test_initialize_non6dpCashToken_reverts() public {
         GyldAtomicSwap impl = new GyldAtomicSwap();
-        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(token), uint8(18)));
+        GyldTestUSD bad = new GyldTestUSD(24, address(this));
+        vm.expectRevert(abi.encodeWithSelector(GyldAtomicSwap.InvalidTokenDecimals.selector, address(bad), uint8(24)));
         new ERC1967Proxy(
             address(impl),
             abi.encodeCall(
-                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(token), MAX_BPS, MAX_NAV_AGE)
+                GyldAtomicSwap.initialize, (admin, pauser, signer, treasurer, address(bad), MAX_BPS, MAX_NAV_AGE)
             )
         );
     }

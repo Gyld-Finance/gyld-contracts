@@ -66,7 +66,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///   EVM_ISSUANCE_MANAGER   IssuanceManager proxy from DeployDevNet.
 ///
 /// Required on PRODUCTION chains; each falls back to the deployer on a dev chain
-/// (Anvil 31337 / Sepolia 11155111) ONLY, and on production none of them may BE the
+/// (Anvil 31337 / Sepolia 11155111 / BSC testnet 97) ONLY, and on production none of them may BE the
 /// deployer EOA (GYL-1135):
 ///   TIMELOCK_ADDRESS       TimelockController that receives DEFAULT_ADMIN. Previously an
 ///                          unset value silently SKIPPED the handover and left the
