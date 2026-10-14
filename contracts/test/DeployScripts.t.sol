@@ -14,6 +14,7 @@ import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
 import {DeployNAVFeed} from "../script/DeployNAVFeed.s.sol";
 import {DeployMockSanctionsList} from "../script/DeployMockSanctionsList.s.sol";
 import {DeployMockUSDC} from "../script/DeployMockUSDC.s.sol";
+import {DeployMockStablecoin} from "../script/DeployMockStablecoin.s.sol";
 
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
@@ -25,6 +26,7 @@ import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
 // quietly stops griefing makes its test vacuous instead of failing it.
 import {GasGriefingOracle} from "./SanctionsOracleMirror.t.sol";
 import {MockUSDC} from "./MockUSDC.sol";
+import {GyldTestUSD} from "./GyldTestUSD.sol";
 
 /// @dev External wrapper around the library.
 ///
@@ -99,6 +101,7 @@ contract DeployGuardsTest is ScriptRevertAsserts {
     function test_isDevChain_isAnAllowlist_notADenylist() public {
         assertTrue(_isDev(31337), "Anvil must be a dev chain");
         assertTrue(_isDev(11155111), "Sepolia must be a dev chain");
+        assertTrue(_isDev(97), "BSC testnet must be a dev chain (GLD-713)");
 
         // The old `chainid != 1` denylist classified every one of these as "not mainnet".
         uint256[7] memory production =
@@ -109,6 +112,16 @@ contract DeployGuardsTest is ScriptRevertAsserts {
                 string.concat("chainId ", vm.toString(production[i]), " must be treated as production")
             );
         }
+    }
+
+    /// Catches (GLD-713): admitting BSC testnet (97) by widening the guard to the whole BNB
+    /// family. Only the testnet is dev; BSC mainnet (56) and opBNB (204) must stay on the
+    /// strict production path — and so must the opBNB testnet (5611), a near-miss id.
+    function test_isDevChain_admitsBscTestnetOnly_notBscMainnet() public {
+        assertTrue(_isDev(97), "BSC testnet (97) must be a dev chain");
+        assertFalse(_isDev(56), "BSC mainnet (56) must be treated as production");
+        assertFalse(_isDev(204), "opBNB mainnet (204) must be treated as production");
+        assertFalse(_isDev(5611), "opBNB testnet (5611) is not on the allowlist");
     }
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
@@ -1187,7 +1200,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 /// Safe to split into parallel test functions: this script reads no environment variables,
 /// so unlike {DeployScriptsTest} there is no process-global state to race on.
 contract DeployMockSanctionsListTest is ScriptRevertAsserts {
-    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia/BSC testnet is refused —
     /// including chains that do not exist yet (999_999_999 stands in for one).
     function test_run_refusedOnEveryProductionChain() public {
         uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
@@ -1204,8 +1217,8 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
         }
     }
 
-    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil and Ethereum
-    /// Sepolia are. A near-miss chain id must not slip through.
+    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil, Ethereum
+    /// Sepolia and BSC testnet are. A near-miss chain id must not slip through.
     function test_run_refusedOnAnUnlistedTestnet() public {
         vm.chainId(84532);
         _expectRunRevert(address(new DeployMockSanctionsList()), "is dev-only and is NOT production-safe on chainId 84532");
@@ -1253,7 +1266,7 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
 /// Safe to split into parallel test functions: this script reads no environment variables,
 /// so unlike {DeployScriptsTest} there is no process-global state to race on.
 contract DeployMockUSDCTest is ScriptRevertAsserts {
-    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia/BSC testnet is refused —
     /// including chains that do not exist yet (999_999_999 stands in for one).
     function test_run_refusedOnEveryProductionChain() public {
         uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
@@ -1296,5 +1309,73 @@ contract DeployMockUSDCTest is ScriptRevertAsserts {
         DeployMockUSDC script = new DeployMockUSDC();
         script.run();
         assertGt(address(script.usdc()).code.length, 0, "no MockUSDC deployed on Sepolia");
+    }
+}
+
+/// @title DeployMockStablecoinTest
+/// @notice GLD-713: the 18dp "Gyld Test USD" cash token for BSC testnet (97).
+///
+/// Every env-reading assertion lives in ONE test function: `vm.setEnv` mutates
+/// process-global state shared by every thread (see {DeployScriptsTest}), so a default
+/// check split from an override check would race. The chain-guard tests read no env —
+/// the guard fires before any `vm.env*` call — so they stay separate.
+contract DeployMockStablecoinTest is ScriptRevertAsserts {
+    string constant GUARD = "deploying the Gyld Test USD (gUSD) mock stablecoin is dev-only";
+
+    /// Catches: a public-chain-deployable test stablecoin escaping onto a production chain
+    /// — BSC mainnet (56) and opBNB (204) above all, the chains this token imitates.
+    function test_run_refusedOnEveryProductionChain() public {
+        uint256[6] memory production = [uint256(56), 204, 1, 8453, 5611, 999_999_999];
+        for (uint256 i = 0; i < production.length; i++) {
+            vm.chainId(production[i]);
+            _expectRunRevert(
+                address(new DeployMockStablecoin()),
+                string.concat(GUARD, " and is NOT production-safe on chainId ", vm.toString(production[i]))
+            );
+        }
+    }
+
+    /// Defaults (18dp, 1,000,000 gUSD to the broadcaster, broadcaster is minter) on BSC
+    /// testnet, then the MOCK_STABLE_DECIMALS override and its 6-or-18 rule.
+    function test_run_onBscTestnet_defaultsTo18dp_andHonoursTheDecimalsOverride() public {
+        vm.chainId(97);
+        vm.setEnv("MOCK_STABLE_DECIMALS", "");
+        vm.setEnv("MOCK_STABLE_MINT_TO", "");
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "");
+
+        DeployMockStablecoin script = new DeployMockStablecoin();
+        script.run();
+        GyldTestUSD gusd = script.stable();
+        address deployer = DeployGuards.broadcaster();
+        assertEq(gusd.decimals(), 18, "default must be 18dp (BNB-chain stablecoin shape)");
+        assertEq(gusd.symbol(), "gUSD");
+        assertEq(gusd.name(), "Gyld Test USD");
+        assertEq(gusd.minter(), deployer, "broadcaster must be the minter");
+        assertEq(gusd.balanceOf(deployer), 1_000_000e18, "initial supply not minted to broadcaster");
+
+        // Minting is gated: a public-chain test token must not be a free faucet.
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(abi.encodeWithSelector(GyldTestUSD.NotMinter.selector, address(0xBEEF)));
+        gusd.mint(address(0xBEEF), 1);
+
+        vm.setEnv("MOCK_STABLE_DECIMALS", "6");
+        vm.setEnv("MOCK_STABLE_MINT_TO", vm.toString(address(0xA11CE)));
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "5");
+        script = new DeployMockStablecoin();
+        script.run();
+        assertEq(script.stable().decimals(), 6, "MOCK_STABLE_DECIMALS override ignored");
+        assertEq(script.stable().balanceOf(address(0xA11CE)), 5e6, "MINT_TO / MINT_AMOUNT ignored");
+
+        // Not one of the swap's accepted cash decimals (6 or 18): refused before broadcast.
+        vm.setEnv("MOCK_STABLE_DECIMALS", "19");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=19 is not 6 or 18");
+        vm.setEnv("MOCK_STABLE_DECIMALS", "5");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=5 is not 6 or 18");
+        vm.setEnv("MOCK_STABLE_DECIMALS", "12");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=12 is not 6 or 18");
+
+        vm.setEnv("MOCK_STABLE_DECIMALS", "");
+        vm.setEnv("MOCK_STABLE_MINT_TO", "");
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "");
     }
 }
