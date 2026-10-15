@@ -13,7 +13,7 @@ Ethereum mainnet is chain 1, so the check passed on a production L2 (8453) — a
 Arbitrum, Optimism, Polygon and every other L2 — and the dev-only fallbacks
 (deployer-as-admin, delay = 0, mock sanctions oracle) ran on a production
 chain. The fix is `DeployGuards.isDevChain()`: an ALLOWLIST where only Anvil
-(31337), Sepolia (11155111) and BSC testnet (97, GLD-713) count as development chains and every
+(31337) and Sepolia (11155111) count as development chains and every
 unrecognised chain fails closed as production.
 
 This check fails CI if any `block.chainid != ...` comparison appears in
@@ -174,7 +174,7 @@ def main() -> int:
             "\nALLOWLISTS that fail closed on chains they do not recognise."
             "\n"
             "\nUse instead (contracts/script/lib/DeployGuards.sol):"
-            "\n  - DeployGuards.isDevChain()        -- true only on Anvil / Sepolia / BSC testnet"
+            "\n  - DeployGuards.isDevChain()        -- true only on Anvil / Sepolia"
             "\n  - DeployGuards.requireProdSafe(..) -- revert unless on a dev chain"
             "\n  - require(block.chainid == <id>)   -- pin a script to one chain"
         )

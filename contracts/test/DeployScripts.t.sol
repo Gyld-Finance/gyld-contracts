@@ -43,6 +43,14 @@ contract GuardsHarness {
         return DeployGuards.saltFor(name);
     }
 
+    function saltFor(string memory name, string memory tag) external view returns (bytes32) {
+        return DeployGuards.saltFor(name, tag);
+    }
+
+    function requireProdMinDelay(uint256 delay) external view {
+        DeployGuards.requireProdMinDelay(delay);
+    }
+
     /// The guard is `internal view` on a library, so a test can only reach it through a
     /// wrapper — and it has to be an EXTERNAL one for the same CHAINID reason as above:
     /// {DeployGuards.requireSanctionsOracleAnswers} short-circuits on `isDevChain()`.
@@ -101,7 +109,6 @@ contract DeployGuardsTest is ScriptRevertAsserts {
     function test_isDevChain_isAnAllowlist_notADenylist() public {
         assertTrue(_isDev(31337), "Anvil must be a dev chain");
         assertTrue(_isDev(11155111), "Sepolia must be a dev chain");
-        assertTrue(_isDev(97), "BSC testnet must be a dev chain (GLD-713)");
 
         // The old `chainid != 1` denylist classified every one of these as "not mainnet".
         uint256[7] memory production =
@@ -114,14 +121,47 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         }
     }
 
-    /// Catches (GLD-713): admitting BSC testnet (97) by widening the guard to the whole BNB
-    /// family. Only the testnet is dev; BSC mainnet (56) and opBNB (204) must stay on the
-    /// strict production path — and so must the opBNB testnet (5611), a near-miss id.
-    function test_isDevChain_admitsBscTestnetOnly_notBscMainnet() public {
-        assertTrue(_isDev(97), "BSC testnet (97) must be a dev chain");
+    /// Catches (GLD-807): BSC testnet (97) slipping back onto the dev allowlist, where every
+    /// production guard is a no-op. It runs the production path, as do BSC mainnet (56),
+    /// opBNB (204) and the opBNB testnet (5611).
+    function test_isDevChain_bscFamilyIsProduction() public {
+        assertFalse(_isDev(97), "BSC testnet (97) must take the production path (GLD-807)");
         assertFalse(_isDev(56), "BSC mainnet (56) must be treated as production");
         assertFalse(_isDev(204), "opBNB mainnet (204) must be treated as production");
         assertFalse(_isDev(5611), "opBNB testnet (5611) is not on the allowlist");
+    }
+
+    /// Catches (GLD-807): the 5-minute testnet floor leaking to another chain, or BSC
+    /// testnet accepting a delay below it.
+    function test_requireProdMinDelay_isFiveMinutesOnBscTestnetOnly() public {
+        vm.chainId(97);
+        harness.requireProdMinDelay(300);
+        vm.expectRevert(
+            bytes("DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s (5min) minimum on production chainId 97")
+        );
+        harness.requireProdMinDelay(299);
+
+        vm.chainId(8453);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 8453"
+            )
+        );
+        harness.requireProdMinDelay(300);
+        harness.requireProdMinDelay(48 hours);
+    }
+
+    /// Catches (GLD-807): DEPLOY_SALT_TAG moving the addresses of existing stacks (an empty
+    /// tag must reproduce the pre-tag salt) or failing to move a fresh one.
+    function test_saltFor_tagIsOptional_andScopesAFreshStack() public {
+        vm.chainId(97);
+        string memory name = "DeployDevNet:GyldBondToken.impl";
+        assertEq(
+            harness.saltFor(name, ""),
+            keccak256(abi.encodePacked("gyld.v1", name, uint256(97))),
+            "empty tag moved a salt"
+        );
+        assertTrue(harness.saltFor(name, "kms1") != harness.saltFor(name, ""), "tag did not change the salt");
     }
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
@@ -1200,7 +1240,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
 /// Safe to split into parallel test functions: this script reads no environment variables,
 /// so unlike {DeployScriptsTest} there is no process-global state to race on.
 contract DeployMockSanctionsListTest is ScriptRevertAsserts {
-    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia/BSC testnet is refused —
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
     /// including chains that do not exist yet (999_999_999 stands in for one).
     function test_run_refusedOnEveryProductionChain() public {
         uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
@@ -1217,8 +1257,8 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
         }
     }
 
-    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil, Ethereum
-    /// Sepolia and BSC testnet are. A near-miss chain id must not slip through.
+    /// Chain 84532 (an L2 testnet) is NOT on the dev allowlist — only Anvil and Ethereum
+    /// Sepolia are. A near-miss chain id must not slip through.
     function test_run_refusedOnAnUnlistedTestnet() public {
         vm.chainId(84532);
         _expectRunRevert(address(new DeployMockSanctionsList()), "is dev-only and is NOT production-safe on chainId 84532");
@@ -1266,7 +1306,7 @@ contract DeployMockSanctionsListTest is ScriptRevertAsserts {
 /// Safe to split into parallel test functions: this script reads no environment variables,
 /// so unlike {DeployScriptsTest} there is no process-global state to race on.
 contract DeployMockUSDCTest is ScriptRevertAsserts {
-    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia/BSC testnet is refused —
+    /// The guard is an ALLOWLIST, so every chain that is not Anvil/Sepolia is refused —
     /// including chains that do not exist yet (999_999_999 stands in for one).
     function test_run_refusedOnEveryProductionChain() public {
         uint256[7] memory production = [uint256(1), 8453, 56, 42161, 10, 137, 999_999_999];
@@ -1325,7 +1365,7 @@ contract DeployMockStablecoinTest is ScriptRevertAsserts {
     /// Catches: a public-chain-deployable test stablecoin escaping onto a production chain
     /// — BSC mainnet (56) and opBNB (204) above all, the chains this token imitates.
     function test_run_refusedOnEveryProductionChain() public {
-        uint256[6] memory production = [uint256(56), 204, 1, 8453, 5611, 999_999_999];
+        uint256[7] memory production = [uint256(56), 97, 204, 1, 8453, 5611, 999_999_999];
         for (uint256 i = 0; i < production.length; i++) {
             vm.chainId(production[i]);
             _expectRunRevert(
@@ -1335,10 +1375,10 @@ contract DeployMockStablecoinTest is ScriptRevertAsserts {
         }
     }
 
-    /// Defaults (18dp, 1,000,000 gUSD to the broadcaster, broadcaster is minter) on BSC
-    /// testnet, then the MOCK_STABLE_DECIMALS override and its 6-or-18 rule.
-    function test_run_onBscTestnet_defaultsTo18dp_andHonoursTheDecimalsOverride() public {
-        vm.chainId(97);
+    /// Defaults (18dp, 1,000,000 gUSD to the broadcaster, broadcaster is minter) on
+    /// Sepolia, then the MOCK_STABLE_DECIMALS override and its 6-or-18 rule.
+    function test_run_onSepolia_defaultsTo18dp_andHonoursTheDecimalsOverride() public {
+        vm.chainId(11155111);
         vm.setEnv("MOCK_STABLE_DECIMALS", "");
         vm.setEnv("MOCK_STABLE_MINT_TO", "");
         vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "");
