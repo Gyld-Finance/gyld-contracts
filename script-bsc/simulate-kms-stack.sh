@@ -14,8 +14,9 @@ WORK="$(mktemp -d)"
 export FOUNDRY_BROADCAST="$WORK/broadcast" # the fork is chain 97 too: keep its journal out of broadcast/
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-script-bsc/check-kms-addresses.sh >/dev/null || die "step 0: KMS address check failed"
-echo "==> step 0 ok: 14 KMS keys derive their addresses"
+out="$(script-bsc/check-kms-addresses.sh 2>/dev/null)" || die "step 0: KMS check failed"
+eval "$out"
+echo "==> step 0 ok: 14 KMS keys derive their addresses; governance proof signed by KMS"
 forge build script-bsc/BscKmsStack.s.sol >/dev/null # before forking: a pruning RPC drops old state
 anvil --fork-url "${FORK_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}" --chain-id 97 --port "$PORT" --silent &
 ANVIL=$!
@@ -32,6 +33,10 @@ run() { # <sig> <sender>: broadcast to the fork, then export the @@ KEY=VALUE li
     --with-gas-price 0.1gwei >"$WORK/$1.log" 2>&1 || { tail -40 "$WORK/$1.log"; die "$1 failed"; }
   while read -r kv; do export "${kv?}"; done < <(sed -n 's/^ *@@ //p' "$WORK/$1.log")
 }
+KMS_GOVERNANCE=0x00000000000000000000000000000000DeaDBeef forge script $SOL --sig 'runA()' --sender "$KMS_DEPLOYER" --rpc-url "$RPC" \
+  >"$WORK/badgov.log" 2>&1 && die "runA accepted a KMS_GOVERNANCE the proof does not cover"
+grep -q GovernanceProofInvalid "$WORK/badgov.log" || { tail -20 "$WORK/badgov.log"; die "runA: wrong failure"; }
+echo "==> runA refuses a governance address the KMS proof does not cover"
 run 'runA()' "$KMS_DEPLOYER"
 run 'runB()' "$KMS_GOVERNANCE"
 if forge script $SOL --sig 'runC()' --sender "$KMS_DEPLOYER" --rpc-url "$RPC" >"$WORK/early.log" 2>&1; then
@@ -41,6 +46,15 @@ grep -q "Phase 2 executable in" "$WORK/early.log" || { tail -20 "$WORK/early.log
 cast rpc evm_increaseTime 300 --rpc-url "$RPC" >/dev/null
 cast rpc evm_mine --rpc-url "$RPC" >/dev/null
 run 'runC()' "$KMS_DEPLOYER"
+SIGNERS="$KMS_DEPLOYER $KMS_GOVERNANCE $KMS_NAV_FEED_OWNER $KMS_WHITELIST_ADMIN $KMS_SUBSCRIBER"
+nonces() { for a in $SIGNERS; do cast nonce "$a" --rpc-url "$RPC"; done | paste -sd+ - | bc; }
+n0="$(nonces)"
+J="$FOUNDRY_BROADCAST/BscKmsStack.s.sol/97"
+mkdir "$WORK/keep" && mv "$J"/runC*-latest.json "$WORK/keep/" # the gas tally reads the first run C
+run 'runC()' "$KMS_DEPLOYER" # re-run: every step is done, so it must send nothing
+[ "$(nonces)" = "$n0" ] || die "runC re-run sent transactions"
+rm -f "$J"/runC*-latest.json && mv "$WORK/keep"/* "$J/"
+echo "==> runC re-run: 0 tx"
 forge script $SOL --sig 'verify()' --rpc-url "$RPC" >"$WORK/verify.log" 2>&1 || { tail -40 "$WORK/verify.log"; die "verify failed"; }
 grep -E '\[ok\]|CHECKS PASSED' "$WORK/verify.log"
 

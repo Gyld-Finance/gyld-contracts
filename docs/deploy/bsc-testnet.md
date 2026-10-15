@@ -50,7 +50,7 @@ export DEPLOY_SALT_TAG=kms1          # fresh CREATE2 addresses; v1 used the same
 export NAV_ANSWER_8DP=100000000       # $1.00 — must sit inside the feeds' $0.10–$2.00 range
 export SANCTIONS_PROBE_FLAGGED=0x098B716B8Aaf21512996dC57EB0615e2383E2f96  # re-check: on the CURRENT SDN list
 F="script-bsc/BscKmsStack.s.sol:BscKmsStack"
-OPTS="--rpc-url $RPC --aws --slow --legacy --with-gas-price 0.1gwei"
+OPTS="--rpc-url $RPC --aws --slow --legacy --with-gas-price 0.1gwei"   # no --broadcast: dry run
 ```
 
 The probe must be flagged **today** — check it against Chainalysis on Ethereum
@@ -60,35 +60,45 @@ timelock (`rangeGovernor`) can move it later, within $0.10–$5.00.
 
 ## Run it
 
-Rehearse first: `script-bsc/simulate-kms-stack.sh` (must end `SIMULATION GREEN`). Then run
-each step **without** `--broadcast` (a dry run), read it, and repeat it with `--broadcast`.
-`AWS_KMS_KEY_IDS` lists the keys that sign in that step. A step interrupted mid-broadcast is
-finished with the same command plus `--resume`.
+Rehearse first: `script-bsc/simulate-kms-stack.sh` (must end `SIMULATION GREEN`). Each
+on-chain step below is shown as its **dry run** (no `--broadcast`); read the output, then
+run the same command again with `--broadcast` appended. `AWS_KMS_KEY_IDS` lists the keys
+that sign in that step.
 
 ```bash
-# Step 0 — no transaction: every key id derives its address
-script-bsc/check-kms-addresses.sh
+# Step 0 — no transaction: every key id derives its address, and the governance key signs
+# chain 97 + all 14 addresses + DEPLOY_SALT_TAG. runA refuses to deploy without that proof.
+out=$(script-bsc/check-kms-addresses.sh) || exit 1; eval "$out"   # exports KMS_GOVERNANCE_SIG
 
 # Run A — deployer + sanctions owner: mirror, SDN seed, DeployDevNet (delay 300 s)
-AWS_KMS_KEY_IDS=$KMS_DEPLOYER_KEY_ID,$KMS_SANCTIONS_OWNER_KEY_ID \
-  forge script $F --sig 'runA()' --sender $KMS_DEPLOYER $OPTS --broadcast
+A="forge script $F --sig runA() --sender $KMS_DEPLOYER $OPTS"
+AWS_KMS_KEY_IDS=$KMS_DEPLOYER_KEY_ID,$KMS_SANCTIONS_OWNER_KEY_ID $A               # dry run
+AWS_KMS_KEY_IDS=$KMS_DEPLOYER_KEY_ID,$KMS_SANCTIONS_OWNER_KEY_ID $A --broadcast   # send
 export EVM_FACTORY_ADDRESS=<@@ line> EVM_ISSUANCE_MANAGER=<@@ line>
 
 # Run B — governance schedules one batch: factory acceptOwnership + CAT / C / KO deployToken
-AWS_KMS_KEY_IDS=$KMS_GOVERNANCE_KEY_ID \
-  forge script $F --sig 'runB()' --sender $KMS_GOVERNANCE $OPTS --broadcast
+B="forge script $F --sig runB() --sender $KMS_GOVERNANCE $OPTS"
+AWS_KMS_KEY_IDS=$KMS_GOVERNANCE_KEY_ID $B               # dry run
+AWS_KMS_KEY_IDS=$KMS_GOVERNANCE_KEY_ID $B --broadcast   # send
 
-# Wait >= 300 s. Run C fails fast with the remaining seconds if run early.
+# Wait >= 300 s (run C fails fast with the remaining seconds if run early).
 # Run C — governance executes, NAV owner pushes NAV, deployer DeployAtomicSettlement (USDT,
 # no takers, admin -> timelock), whitelist admin whitelists the swap, subscriber mints
 # 1,000 tokens of inventory per series into it.
-AWS_KMS_KEY_IDS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID,$KMS_SUBSCRIBER_KEY_ID \
-  forge script $F --sig 'runC()' --sender $KMS_DEPLOYER $OPTS --broadcast
+C="forge script $F --sig runC() --sender $KMS_DEPLOYER $OPTS"
+KEYS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID,$KMS_SUBSCRIBER_KEY_ID
+AWS_KMS_KEY_IDS=$KEYS $C               # dry run
+AWS_KMS_KEY_IDS=$KEYS $C --broadcast   # send
 export EVM_ATOMIC_SWAP_ADDRESS=<@@ line>
 
 # Verify — read-only; reverts on the first drift
 forge script $F --sig 'verify()' --rpc-url $RPC
 ```
+
+Interrupted mid-broadcast? Run C skips every step already on chain (Phase 2 executed, NAV
+priced, swap at its CREATE2 address, swap whitelisted, inventory minted), so re-running it
+finishes the job; a re-run of a finished C sends nothing. For A or B, finish with the same
+command plus `--resume`.
 
 `verify` asserts: timelock `minDelay == 300`, governance sole proposer/canceller, executors
 open, deployer holds no role on the timelock, IssuanceManager, mirror, swap or tokens;

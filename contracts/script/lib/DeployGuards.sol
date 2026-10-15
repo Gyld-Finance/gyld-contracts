@@ -574,11 +574,14 @@ library DeployGuards {
     ///         two chains. The optional `DEPLOY_SALT_TAG` env var gives a fresh stack on a
     ///         chain that already has one (GLD-807); unset or empty, addresses are unchanged.
     function saltFor(string memory name) internal view returns (bytes32) {
-        string memory tag;
+        return saltFor(name, saltTag());
+    }
+
+    /// @notice `DEPLOY_SALT_TAG`, or "" when unset or empty.
+    function saltTag() internal view returns (string memory tag) {
         try vm.envString("DEPLOY_SALT_TAG") returns (string memory t) {
             tag = t;
         } catch {}
-        return saltFor(name, tag);
     }
 
     function saltFor(string memory name, string memory tag) internal view returns (bytes32) {

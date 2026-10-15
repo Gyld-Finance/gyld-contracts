@@ -13,6 +13,9 @@ import {KaleidoscopeNAVFeed} from "../contracts/KaleidoscopeNAVFeed.sol";
 import {NAVFeedForwarder} from "../contracts/NAVFeedForwarder.sol";
 import {GyldAtomicSwap} from "../contracts/GyldAtomicSwap.sol";
 import {SanctionsOracleMirror} from "../contracts/SanctionsOracleMirror.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @title BscKmsStack
 /// @notice Fresh BSC testnet (97) stack, every role its own AWS KMS key, production guards on
@@ -23,11 +26,12 @@ import {SanctionsOracleMirror} from "../contracts/SanctionsOracleMirror.sol";
 ///                                    with a live SDN probe, then DeployDevNet (delay 300 s)
 ///   runB()   --sender KMS_GOVERNANCE schedules ONE batch: factory accept + CAT/C/KO deployToken
 ///   runC()   --sender KMS_DEPLOYER   after the delay: governance executes, NAV owner pushes,
-///                                    DeployAtomicSettlement (USDT), whitelist + inventory
+///                                    DeployAtomicSettlement (USDT), whitelist + inventory.
+///                                    Every step skips what is done: re-run to finish a partial C
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
-/// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP,
-/// DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
+/// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), KMS_GOVERNANCE_SIG (from
+/// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC).
 contract BscKmsStack is Script {
     uint256 internal constant BSC_TESTNET = 97;
@@ -40,6 +44,10 @@ contract BscKmsStack is Script {
     uint256 internal constant INVENTORY_PER_SERIES = 1_000e18;
     bytes32 internal constant PHASE2_SALT = keccak256("GLD-807.phase2");
     uint256 internal constant N_SERIES = 3;
+    /// Step 0's proof that KMS_GOVERNANCE is a key we control (same tag as the rotation, PR #25).
+    bytes32 internal constant PROOF_TAG = keccak256("GLD-807.kms-governance-proof");
+
+    error GovernanceProofInvalid(address recovered);
 
     struct Roles {
         address deployer;
@@ -73,6 +81,7 @@ contract BscKmsStack is Script {
     function runA() external {
         Roles memory r = _roles();
         _requireSender(r.deployer);
+        _requireGovernanceProof(r);
         address probe = vm.envAddress("SANCTIONS_PROBE_FLAGGED");
 
         bytes memory init = abi.encodePacked(
@@ -137,49 +146,58 @@ contract BscKmsStack is Script {
         int256 nav = int256(vm.envUint("NAV_ANSWER_8DP"));
         TokenFactory f = _factory();
         IssuanceManager im = IssuanceManager(vm.envAddress("EVM_ISSUANCE_MANAGER"));
-        TimelockController tl = TimelockController(payable(f.pendingOwner()));
+        address pending = f.pendingOwner(); // zero once Phase 2 has executed
+        TimelockController tl = TimelockController(payable(pending != address(0) ? pending : f.owner()));
         (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _phase2(f, r);
         bytes32 id = tl.hashOperationBatch(targets, values, payloads, bytes32(0), PHASE2_SALT);
-        if (!tl.isOperationReady(id)) {
-            uint256 at = tl.getTimestamp(id);
-            require(at > 1, "BscKmsStack: Phase 2 is not scheduled (run B) or already executed");
-            revert(string.concat("BscKmsStack: Phase 2 executable in ", vm.toString(at - block.timestamp), " s"));
+        if (!tl.isOperationDone(id)) {
+            if (!tl.isOperationReady(id)) {
+                uint256 at = tl.getTimestamp(id);
+                require(at != 0, "BscKmsStack: Phase 2 is not scheduled (run B)");
+                revert(string.concat("BscKmsStack: Phase 2 executable in ", vm.toString(at - block.timestamp), " s"));
+            }
+            vm.broadcast(r.governance);
+            tl.executeBatch(targets, values, payloads, bytes32(0), PHASE2_SALT);
         }
-        vm.broadcast(r.governance);
-        tl.executeBatch(targets, values, payloads, bytes32(0), PHASE2_SALT);
 
         address[N_SERIES] memory tokens;
         string memory series;
         vm.startBroadcast(r.navOwner); // first NAV push: registerSeries refuses an unpriced feed
         for (uint256 i; i < N_SERIES; ++i) {
             tokens[i] = f.tokenByIsin(_bond(i).isin);
-            KaleidoscopeNAVFeed(f.navFeedOf(tokens[i])).updateAnswer(nav);
+            KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(f.navFeedOf(tokens[i]));
+            if (!_priced(feed)) feed.updateAnswer(nav);
             series = string.concat(series, i == 0 ? "" : ",", vm.toString(tokens[i]));
         }
         vm.stopBroadcast();
 
-        _setEnv("USDC_ADDRESS", USDT);
-        _setEnv("EVM_ISSUANCE_MANAGER", address(im));
-        _setEnv("EVM_FACTORY_ADDRESS", address(f));
-        _setEnv("TIMELOCK_ADDRESS", address(tl));
-        _setEnv("OPS_MULTISIG", r.ops);
-        _setEnv("TREASURER_ADDRESS", r.treasurer);
-        _setEnv("QUOTE_SIGNER", r.quoteSigner);
-        _setEnv("ALLOWLIST_ADMIN", r.allowlistAdmin);
-        _setEnv("WITHDRAWAL_WALLET", r.withdrawalWallet);
-        vm.setEnv("SERIES_TOKENS", series);
-        vm.setEnv("ALLOWED_TAKERS", "");
-        vm.setEnv("MAX_QUOTE_DEVIATION_BPS", vm.toString(MAX_QUOTE_DEVIATION_BPS));
-        vm.setEnv("MAX_NAV_AGE_SECS", vm.toString(MAX_NAV_AGE_SECS));
-        DeployAtomicSettlement d = new DeployAtomicSettlement();
-        d.run(); // broadcasts as --sender (the deployer); admin ends at the timelock
-        address swap = address(d.swap());
+        address swap = _predictSwap(r);
+        if (swap.code.length == 0) {
+            _setEnv("USDC_ADDRESS", USDT);
+            _setEnv("EVM_ISSUANCE_MANAGER", address(im));
+            _setEnv("EVM_FACTORY_ADDRESS", address(f));
+            _setEnv("TIMELOCK_ADDRESS", address(tl));
+            _setEnv("OPS_MULTISIG", r.ops);
+            _setEnv("TREASURER_ADDRESS", r.treasurer);
+            _setEnv("QUOTE_SIGNER", r.quoteSigner);
+            _setEnv("ALLOWLIST_ADMIN", r.allowlistAdmin);
+            _setEnv("WITHDRAWAL_WALLET", r.withdrawalWallet);
+            vm.setEnv("SERIES_TOKENS", series);
+            vm.setEnv("ALLOWED_TAKERS", "");
+            vm.setEnv("MAX_QUOTE_DEVIATION_BPS", vm.toString(MAX_QUOTE_DEVIATION_BPS));
+            vm.setEnv("MAX_NAV_AGE_SECS", vm.toString(MAX_NAV_AGE_SECS));
+            DeployAtomicSettlement d = new DeployAtomicSettlement();
+            d.run(); // broadcasts as --sender (the deployer); admin ends at the timelock
+            require(address(d.swap()) == swap, "BscKmsStack: swap landed off its predicted address");
+        }
 
-        vm.broadcast(r.whitelistAdmin); // the deployer holds no WHITELIST_ADMIN_ROLE
-        im.addToWhitelist(swap);
+        if (!im.whitelisted(swap)) {
+            vm.broadcast(r.whitelistAdmin); // the deployer holds no WHITELIST_ADMIN_ROLE
+            im.addToWhitelist(swap);
+        }
         vm.startBroadcast(r.subscriber);
         for (uint256 i; i < N_SERIES; ++i) {
-            im.subscribe(tokens[i], swap, INVENTORY_PER_SERIES);
+            if (GyldBondToken(tokens[i]).balanceOf(swap) == 0) im.subscribe(tokens[i], swap, INVENTORY_PER_SERIES);
         }
         vm.stopBroadcast();
 
@@ -326,6 +344,69 @@ contract BscKmsStack is Script {
         }
     }
 
+    /// The swap proxy's CREATE2 address, derived exactly as DeployAtomicSettlement deploys it.
+    function _predictSwap(Roles memory r) internal view returns (address) {
+        address impl = DeployGuards.predictCreate2(
+            DeployGuards.saltFor("DeployAtomicSettlement:GyldAtomicSwap.impl"),
+            keccak256(type(GyldAtomicSwap).creationCode)
+        );
+        bytes memory initData = abi.encodeCall(
+            GyldAtomicSwap.initialize,
+            (
+                r.deployer,
+                r.ops,
+                r.quoteSigner,
+                r.treasurer,
+                USDT,
+                uint16(MAX_QUOTE_DEVIATION_BPS),
+                uint32(MAX_NAV_AGE_SECS)
+            )
+        );
+        return DeployGuards.predictCreate2(
+            DeployGuards.saltFor("DeployAtomicSettlement:GyldAtomicSwap.proxy"),
+            keccak256(abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(impl, initData)))
+        );
+    }
+
+    function _priced(KaleidoscopeNAVFeed feed) internal view returns (bool) {
+        try feed.latestRoundData() returns (uint80, int256, uint256, uint256 updatedAt, uint80) {
+            return updatedAt != 0;
+        } catch {
+            return false;
+        }
+    }
+
+    /// Step 0 proof (check-kms-addresses.sh): the KMS governance key signed (EIP-191) chain 97,
+    /// the full KMS address set and DEPLOY_SALT_TAG. Without it a mistyped KMS_GOVERNANCE
+    /// would become the timelock's only proposer, and governance would be lost for good.
+    function _requireGovernanceProof(Roles memory r) internal view {
+        bytes32 tag = keccak256(bytes(DeployGuards.saltTag()));
+        bytes32 h = keccak256(abi.encode(PROOF_TAG, block.chainid, keccak256(abi.encode(_addresses(r))), tag));
+        (address signer,,) =
+            ECDSA.tryRecover(MessageHashUtils.toEthSignedMessageHash(h), vm.envBytes("KMS_GOVERNANCE_SIG"));
+        if (signer != r.governance) revert GovernanceProofInvalid(signer);
+    }
+
+    /// Order is the proof's encoding: keep it in step with check-kms-addresses.sh.
+    function _addresses(Roles memory r) internal pure returns (address[14] memory) {
+        return [
+            r.deployer,
+            r.governance,
+            r.ops,
+            r.navOwner,
+            r.subscriber,
+            r.redeemer,
+            r.whitelistAdmin,
+            r.issuancePauser,
+            r.quoteSigner,
+            r.treasurer,
+            r.allowlistAdmin,
+            r.withdrawalWallet,
+            r.sanctionsOwner,
+            r.userWithdrawal
+        ];
+    }
+
     function _bond(uint256 i) internal pure returns (Bond memory) {
         if (i == 0) return Bond("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200, "CAT");
         if (i == 1) return Bond("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200, "C");
@@ -352,22 +433,7 @@ contract BscKmsStack is Script {
             sanctionsOwner: vm.envAddress("KMS_SANCTIONS_OWNER"),
             userWithdrawal: vm.envAddress("KMS_USER_WITHDRAWAL")
         });
-        address[14] memory a = [
-            r.deployer,
-            r.governance,
-            r.ops,
-            r.navOwner,
-            r.subscriber,
-            r.redeemer,
-            r.whitelistAdmin,
-            r.issuancePauser,
-            r.quoteSigner,
-            r.treasurer,
-            r.allowlistAdmin,
-            r.withdrawalWallet,
-            r.sanctionsOwner,
-            r.userWithdrawal
-        ];
+        address[14] memory a = _addresses(r);
         for (uint256 i; i < a.length; ++i) {
             require(a[i] != address(0), "BscKmsStack: a KMS_* address is zero");
             for (uint256 j = i + 1; j < a.length; ++j) {
