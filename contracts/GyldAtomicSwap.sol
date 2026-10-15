@@ -10,6 +10,7 @@ import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/crypt
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 
 /// @dev Read-only view of a NAVFeedForwarder (Chainlink AggregatorV3 shape, 8 decimals).
@@ -196,6 +197,8 @@ contract GyldAtomicSwap is
     uint64 public constant MAX_QUOTE_TTL_CEILING = 10 minutes;
 
     /// @notice Fallback per-series notional cap per NAV round, USDC 6dp (audit FIND-021).
+    ///         Always 6dp micro-USD, whatever the cash token's decimals (GLD-713): fills
+    ///         are normalised to 6dp before they are charged against the cap.
     /// @dev    Every guard in executeSwap is per-fill; this is the only one that relates
     ///         fills to each other. A fallback rather than a seed, for the reason on
     ///         DEFAULT_MAX_QUOTE_TTL. Read only via `_effectiveMaxNavRoundNotional`.
@@ -218,7 +221,7 @@ contract GyldAtomicSwap is
     /// @dev One slot: the NAV round a counter belongs to, and the notional spent on it.
     struct NavRoundDraw {
         uint64 round; // the feed's `updatedAt` these draws were validated against
-        uint192 drawn; // cumulative USDC (6dp) settled against `round`
+        uint192 drawn; // cumulative cash notional, normalised to 6dp (GLD-713), settled against `round`
     }
 
     /// @custom:storage-location erc7201:gyld.GyldAtomicSwap
@@ -227,7 +230,7 @@ contract GyldAtomicSwap is
         uint16 maxQuoteDeviationBps; // quote-vs-NAV sanity band, e.g. 200 = 2%
         uint32 maxNavAgeSecs; // max NAV feed age before StaleNav (fail-closed)
         address withdrawalWallet; // fixed treasury destination for withdraw()
-        address usdc; // cash leg discriminator (6 decimals)
+        address usdc; // cash leg discriminator (6 or 18 decimals — see cashDecimals)
         mapping(uint256 => uint256) usedQuoteWords; // quoteId >> 8 → 256-bit usage word
         address[] seriesList; // registered series; read via registeredSeriesList()
         mapping(address => bool) registeredSeries; // bond token → enabled
@@ -258,6 +261,11 @@ contract GyldAtomicSwap is
         // which is not guaranteed monotone across a forwarder repoint. Only a STRICTLY
         // NEWER round resets the counter — see _drawNavRoundNotional.
         mapping(address => NavRoundDraw) navRoundDrawOf;
+        // Cash token decimals, probed and stored by initialize (GLD-713, 6 or 18). ZERO
+        // MEANS UNSET — always read via _cashDecimals(), never directly. A proxy
+        // upgraded from a pre-GLD-713 implementation was initialized under the old
+        // `decimals() == 6` probe and never wrote this slot, so unset resolves to 6.
+        uint8 cashDecimals;
     }
 
     // keccak256(abi.encode(uint256(keccak256("gyld.GyldAtomicSwap")) - 1)) & ~bytes32(uint256(0xff))
@@ -304,6 +312,14 @@ contract GyldAtomicSwap is
         return cap == 0 ? DEFAULT_MAX_NAV_ROUND_NOTIONAL : cap;
     }
 
+    /// @dev The cash token's decimals (GLD-713). The ONLY permitted read path for
+    ///      `cashDecimals` — an unset slot (proxy upgraded across the field's addition,
+    ///      necessarily initialized against a 6dp cash token) resolves to 6.
+    function _cashDecimals(GyldAtomicSwapStorage storage $) private view returns (uint8) {
+        uint8 d = $.cashDecimals;
+        return d == 0 ? 6 : d;
+    }
+
     // ── Errors ────────────────────────────────────────────────────────────────
 
     error ZeroAddress();
@@ -342,8 +358,8 @@ contract GyldAtomicSwap is
     ///      NAVFeedForwarder's configuration-time probe — a future-dated feed is refused by
     ///      `_checkQuoteBand` outright, so admitting one registers an untradeable series.
     error NavFeedFutureDated(address forwarder, uint256 updatedAt);
-    // F-1: bond token must report 18dp and the cash token 6dp (the /1e20 ladder in
-    // _checkQuoteBand silently mis-scales otherwise). decimals == 0 signals "no usable
+    // F-1: bond token must report 18dp and the cash token 6dp or 18dp (GLD-713; the band
+    // divisor in _checkQuoteBand is derived from the stored cash decimals). decimals == 0 signals "no usable
     // decimals()". F-4: quote expiry beyond block.timestamp + maxQuoteTtl.
     error InvalidTokenDecimals(address token, uint8 decimals);
     error QuoteExpiryTooFar(uint64 expiry, uint64 maxAllowed);
@@ -402,8 +418,9 @@ contract GyldAtomicSwap is
     ///                               grant/revoke + bumpQuoteEpoch.
     /// @param treasurer              Kaleidoscope ops MPC wallet (TREASURER_ROLE); may
     ///                               withdraw() inventory out to the withdrawalWallet.
-    /// @param usdc_                  USDC token (6 decimals, probed on-chain — F-1) —
-    ///                               the cash leg every quote is priced against.
+    /// @param usdc_                  Cash token (USDC on Ethereum; 6 or 18 decimals, probed
+    ///                               on-chain — F-1, widened by GLD-713) — the cash leg
+    ///                               every quote is priced against.
     /// @param maxQuoteDeviationBps_  Quote-vs-NAV band width in basis points (e.g. 200 =
     ///                               2%). Must be at most MAX_QUOTE_DEVIATION_BPS_CEILING
     ///                               (1000 bps = 10%) — see GYL-1135; 0 is permitted and
@@ -439,13 +456,15 @@ contract GyldAtomicSwap is
         // _effectiveMaxQuoteTtl, which falls back to DEFAULT_MAX_QUOTE_TTL on an unset
         // slot. Seeding it would make a fresh deploy differ from an upgraded proxy —
         // the exact divergence that bricked executeSwap before this was a fallback.
-        // Probe-before-store (house idiom, F-1): the cash token must report 6 decimals —
-        // the /1e20 ladder in _checkQuoteBand assumes 18dp bond / 8dp NAV / 6dp USDC and
-        // mis-scales silently for any other cash token.
+        // Probe-before-store (house idiom, F-1): the cash token must report exactly 6
+        // (USDC on Ethereum) or 18 (BNB-chain stablecoins) decimals (GLD-713). The value
+        // is stored and the band divisor in _checkQuoteBand is derived from it. Only the
+        // two values with a real cash token behind them are admitted, so the audited
+        // surface is two tested points rather than a range.
         (bool usdcOk, bytes memory usdcData) = usdc_.staticcall(abi.encodeWithSignature("decimals()"));
         if (!usdcOk || usdcData.length != 32) revert InvalidTokenDecimals(usdc_, 0);
         uint8 usdcDecimals = abi.decode(usdcData, (uint8));
-        if (usdcDecimals != 6) revert InvalidTokenDecimals(usdc_, usdcDecimals);
+        if (usdcDecimals != 6 && usdcDecimals != 18) revert InvalidTokenDecimals(usdc_, usdcDecimals);
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
@@ -453,6 +472,7 @@ contract GyldAtomicSwap is
         __UUPSUpgradeable_init();
         GyldAtomicSwapStorage storage $ = _getStorage();
         $.usdc = usdc_;
+        $.cashDecimals = usdcDecimals;
         $.maxQuoteDeviationBps = maxQuoteDeviationBps_;
         $.maxNavAgeSecs = maxNavAgeSecs_;
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
@@ -468,9 +488,17 @@ contract GyldAtomicSwap is
         return _getStorage().quoteEpoch;
     }
 
-    /// @notice USDC token (6 decimals) — the cash leg every quote is priced against.
+    /// @notice Cash token (USDC on Ethereum) — the cash leg every quote is priced
+    ///         against. Its decimals are `cashDecimals()`, not necessarily 6 (GLD-713).
     function usdc() external view returns (address) {
         return _getStorage().usdc;
+    }
+
+    /// @notice Decimals of the cash token, 6 or 18 (GLD-713). `price` and every cash
+    ///         amount in a SwapMessage are in these units; the FIND-021 notional caps
+    ///         are NOT — they stay 6dp micro-USD on every chain.
+    function cashDecimals() external view returns (uint8) {
+        return _cashDecimals(_getStorage());
     }
 
     /// @notice Fixed treasury destination for withdraw(); address(0) until admin sets it.
@@ -675,8 +703,10 @@ contract GyldAtomicSwap is
     ///      USDC), read the series NAV, fail closed on non-positive, stale, or
     ///      future-dated NAV, and enforce the quoted USDC amount is within
     ///      maxQuoteDeviationBps of NAV value.
-    ///      Decimals: bond tokens 18dp, NAV 8dp, USDC 6dp → 1e18 * 1e8 / 1e20 = 1e6
-    ///      (bond/cash decimals enforced by the registerSeries/initialize probes, F-1).
+    ///      Decimals: bond tokens 18dp, NAV 8dp, cash d dp (6 or 18) → divisor
+    ///      10**(18 + 8 - d); for d = 6 that is the original 1e20, for d = 18 it is 1e8
+    ///      (bond/cash decimals enforced by the registerSeries/initialize probes, F-1,
+    ///      GLD-713). `usdcAmount` is returned in the cash token's native units.
     function _checkQuoteBand(
         GyldAtomicSwapStorage storage $,
         address tokenIn,
@@ -704,8 +734,10 @@ contract GyldAtomicSwap is
         if (updatedAt > block.timestamp) revert StaleNav(bondToken, updatedAt);
         if (block.timestamp > updatedAt + _effectiveMaxNavAge($, bondToken)) revert StaleNav(bondToken, updatedAt);
 
+        // 10**(18 bond + 8 NAV - cash dp): 1e20 at 6dp, 1e8 at 18dp (GLD-713).
+        uint256 bandDivisor = 10 ** (26 - uint256(_cashDecimals($)));
         // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 navValue = (tokenAmount * uint256(nav)) / 1e20; // nav > 0 checked above
+        uint256 navValue = (tokenAmount * uint256(nav)) / bandDivisor; // nav > 0 checked above
         uint256 band = (navValue * $.maxQuoteDeviationBps) / BPS_DENOMINATOR;
         if (usdcAmount > navValue + band || usdcAmount + band < navValue) {
             revert QuotePriceOutOfBand(usdcAmount, navValue);
@@ -718,12 +750,18 @@ contract GyldAtomicSwap is
 
     /// @dev Charge one fill against its NAV round's budget (audit FIND-021). The counter
     ///      resets whenever the round differs, so each NAV push opens a fresh budget.
+    ///      `cashAmount` arrives in the cash token's native units and is normalised to
+    ///      6dp micro-USD here (GLD-713), rounding UP, so the cap, the counter and the
+    ///      NavRoundNotionalExceeded args are 6dp on every chain and a sub-micro fill
+    ///      cannot settle uncharged.
     function _drawNavRoundNotional(
         GyldAtomicSwapStorage storage $,
         address bondToken,
-        uint256 usdcAmount,
+        uint256 cashAmount,
         uint64 navRound
     ) private {
+        uint8 dec = _cashDecimals($);
+        uint256 usdcAmount = dec == 6 ? cashAmount : Math.ceilDiv(cashAmount, 10 ** (uint256(dec) - 6));
         uint256 cap = _effectiveMaxNavRoundNotional($, bondToken);
         NavRoundDraw memory d = $.navRoundDrawOf[bondToken];
         // Reset only on a STRICTLY NEWER round. A plain inequality would let a feed whose
@@ -774,8 +812,8 @@ contract GyldAtomicSwap is
     /// @notice Register a bond series so this contract can hold, value, and serve it.
     /// @dev    Caller must hold DEFAULT_ADMIN_ROLE. Three probe-before-store checks (house
     ///         idiom): forwarder `decimals() == 8` (the NAV scaling in _checkQuoteBand
-    ///         assumes 8dp), bond token `decimals() == 18` (F-1 — the /1e20 ladder assumes
-    ///         18dp bond / 8dp NAV / 6dp USDC and mis-scales silently otherwise), and a
+    ///         assumes 8dp), bond token `decimals() == 18` (F-1 — the band divisor 10**(26 - cashDecimals)
+    ///         assumes 18dp bond / 8dp NAV and mis-scales silently otherwise), and a
     ///         `latestRoundData()` that is readable, positive and not future-dated
     ///         (FIND-002, D-32 — `updateAnswer()` must run first; that was a runbook step,
     ///         now enforced on-chain).
@@ -982,7 +1020,8 @@ contract GyldAtomicSwap is
     ///         series follows DEFAULT_MAX_NAV_ROUND_NOTIONAL. To halt swaps use `pause()`.
     ///         Bumps the quote epoch (FIND-014): outstanding quotes die, service re-issues.
     /// @param token  Registered series to bound.
-    /// @param newCap USDC (6dp) per NAV round. 0 clears; otherwise <= the ceiling.
+    /// @param newCap USDC 6dp micro-USD per NAV round on every chain, whatever the cash
+    ///               token's decimals (GLD-713). 0 clears; otherwise <= the ceiling.
     function setMaxNavRoundNotionalFor(address token, uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!_getStorage().registeredSeries[token]) revert UnregisteredSeries(token);
         if (newCap > MAX_NAV_ROUND_NOTIONAL_CEILING) revert InvalidNavRoundNotional(newCap);
@@ -1007,6 +1046,7 @@ contract GyldAtomicSwap is
     }
 
     /// @notice Notional already settled against `token`'s current NAV round (FIND-021).
+    ///         `drawn` is 6dp micro-USD, normalised from the cash token (GLD-713).
     /// @dev    `round` is the feed `updatedAt` the counter belongs to. Callers must
     ///         compare it against the feed's live `updatedAt`: a stale `round` means the
     ///         budget has since reset and `drawn` no longer applies.

@@ -13,6 +13,11 @@ remappings = [
     "forge-std/=lib/forge-std/src/",
 ]
 
+[rpc_endpoints]
+# BSC testnet (97) — production guards with a 5-min timelock floor (GLD-807). `--rpc-url bsc_testnet`.
+# Public endpoint, no key needed; pass `--rpc-url <url>` directly to use another provider.
+bsc_testnet = "https://bsc-testnet-rpc.publicnode.com"
+
 [etherscan]
 sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
 # BscScan is served by the Etherscan V2 unified API, so the SAME ETHERSCAN_API_KEY covers
