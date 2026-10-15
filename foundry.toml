@@ -14,7 +14,7 @@ remappings = [
 ]
 
 [rpc_endpoints]
-# BSC testnet (97) — the GLD-713 dev chain alongside Sepolia. `--rpc-url bsc_testnet`.
+# BSC testnet (97) — production guards with a 5-min timelock floor (GLD-807). `--rpc-url bsc_testnet`.
 # Public endpoint, no key needed; pass `--rpc-url <url>` directly to use another provider.
 bsc_testnet = "https://bsc-testnet-rpc.publicnode.com"
 

@@ -7,12 +7,11 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 
 /// @title DeployMockStablecoin
 /// @notice Dev-only: deploys a {GyldTestUSD} ("Gyld Test USD" / gUSD) as the cash leg
-///         of a public-testnet stack — primarily BSC testnet (97), whose stablecoins are
-///         18dp (GLD-713). Pass the printed address as `USDC_ADDRESS` to
-///         DeployAtomicSettlement. Runbook: docs/deploy/bsc-testnet.md.
+///         of a dev stack (GLD-713); BSC testnet (97) uses its real 18dp USDT instead
+///         (GLD-807). Pass the printed address as `USDC_ADDRESS` to DeployAtomicSettlement.
 ///
 /// Gated on the same dev ALLOWLIST as every other script ({DeployGuards.requireProdSafe}:
-/// Anvil 31337 / Sepolia 11155111 / BSC testnet 97). Any other chain — BSC mainnet (56)
+/// Anvil 31337 / Sepolia 11155111). Any other chain — BSC testnet (97) and mainnet (56)
 /// included — fails closed before any gas is spent. A minter-gated test stablecoin has
 /// no business on a production chain, where the cash leg must be the real token.
 ///
