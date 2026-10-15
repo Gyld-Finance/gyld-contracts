@@ -45,6 +45,23 @@ fi
 grep -q "Phase 2 executable in" "$WORK/early.log" || { tail -20 "$WORK/early.log"; die "runC: wrong early failure"; }
 cast rpc evm_increaseTime 300 --rpc-url "$RPC" >/dev/null
 cast rpc evm_mine --rpc-url "$RPC" >/dev/null
+
+# A run C that stopped right after the swap proxy: replay its dry-run journal up to the proxy
+# CREATE2, then run C must refuse (naming the missing step) and whitelist/mint nothing.
+forge script $SOL --sig 'runC()' --sender "$KMS_DEPLOYER" --rpc-url "$RPC" >"$WORK/dry.log" 2>&1 ||
+  { tail -20 "$WORK/dry.log"; die "runC dry run failed"; }
+SNAP="$(cast rpc evm_snapshot --rpc-url "$RPC" | tr -d '"')"
+jq -c '.transactions | (map(.contractName) | index("ERC1967Proxy")) as $k | .[:$k + 1][] | .transaction
+       | {from, to, data: .input, gas, value}' "$FOUNDRY_BROADCAST"/BscKmsStack.s.sol/97/dry-run/runC*-latest.json |
+  while read -r tx; do cast rpc eth_sendTransaction "$tx" --rpc-url "$RPC" >/dev/null; done
+forge script $SOL --sig 'runC()' --sender "$KMS_DEPLOYER" --rpc-url "$RPC" --unlocked --broadcast --slow --legacy \
+  --with-gas-price 0.1gwei >"$WORK/half.log" 2>&1 && die "runC accepted a half-deployed swap"
+grep -o "swap deploy stopped midway - missing [^.]*" "$WORK/half.log" | head -1 | sed 's/^/==> runC refuses: /' |
+  grep . || { tail -20 "$WORK/half.log"; die "runC: wrong failure on a half-deployed swap"; }
+[ "$(cast nonce "$KMS_WHITELIST_ADMIN" --rpc-url "$RPC")$(cast nonce "$KMS_SUBSCRIBER" --rpc-url "$RPC")" = 00 ] ||
+  die "runC whitelisted or minted into a half-deployed swap"
+cast rpc evm_revert "$SNAP" --rpc-url "$RPC" >/dev/null
+
 run 'runC()' "$KMS_DEPLOYER"
 SIGNERS="$KMS_DEPLOYER $KMS_GOVERNANCE $KMS_NAV_FEED_OWNER $KMS_WHITELIST_ADMIN $KMS_SUBSCRIBER"
 nonces() { for a in $SIGNERS; do cast nonce "$a" --rpc-url "$RPC"; done | paste -sd+ - | bc; }

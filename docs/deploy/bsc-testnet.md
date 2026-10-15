@@ -95,10 +95,10 @@ export EVM_ATOMIC_SWAP_ADDRESS=<@@ line>
 forge script $F --sig 'verify()' --rpc-url $RPC
 ```
 
-Interrupted mid-broadcast? Run C skips every step already on chain (Phase 2 executed, NAV
-priced, swap at its CREATE2 address, swap whitelisted, inventory minted), so re-running it
-finishes the job; a re-run of a finished C sends nothing. For A or B, finish with the same
-command plus `--resume`.
+Interrupted mid-broadcast? Re-running run C finishes it — each step is skipped once on
+chain, and a finished C sends nothing — unless the swap deploy stopped midway: then run C
+stops with the missing step and whitelists/mints nothing; finish it with `--resume`. For
+A or B, finish with the same command plus `--resume`.
 
 `verify` asserts: timelock `minDelay == 300`, governance sole proposer/canceller, executors
 open, deployer holds no role on the timelock, IssuanceManager, mirror, swap or tokens;

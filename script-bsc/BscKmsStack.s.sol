@@ -171,8 +171,10 @@ contract BscKmsStack is Script {
         }
         vm.stopBroadcast();
 
-        address swap = _predictSwap(r);
+        (address impl, address swap) = _predictSwap(r);
         if (swap.code.length == 0) {
+            // DeployAtomicSettlement's vacantSalt would revert on the impl forever: say why.
+            _requireSwapStep(impl.code.length == 0, "proxy deploy (impl is on chain, the proxy is not)");
             _setEnv("USDC_ADDRESS", USDT);
             _setEnv("EVM_ISSUANCE_MANAGER", address(im));
             _setEnv("EVM_FACTORY_ADDRESS", address(f));
@@ -190,6 +192,9 @@ contract BscKmsStack is Script {
             d.run(); // broadcasts as --sender (the deployer); admin ends at the timelock
             require(address(d.swap()) == swap, "BscKmsStack: swap landed off its predicted address");
         }
+        // Fail closed before any inventory moves: a swap deploy that stopped midway may still
+        // be administered by the deployer.
+        _requireSwapComplete(r, GyldAtomicSwap(swap), tokens, address(tl));
 
         if (!im.whitelisted(swap)) {
             vm.broadcast(r.whitelistAdmin); // the deployer holds no WHITELIST_ADMIN_ROLE
@@ -344,9 +349,9 @@ contract BscKmsStack is Script {
         }
     }
 
-    /// The swap proxy's CREATE2 address, derived exactly as DeployAtomicSettlement deploys it.
-    function _predictSwap(Roles memory r) internal view returns (address) {
-        address impl = DeployGuards.predictCreate2(
+    /// The swap's CREATE2 addresses, derived exactly as DeployAtomicSettlement deploys them.
+    function _predictSwap(Roles memory r) internal view returns (address impl, address proxy) {
+        impl = DeployGuards.predictCreate2(
             DeployGuards.saltFor("DeployAtomicSettlement:GyldAtomicSwap.impl"),
             keccak256(type(GyldAtomicSwap).creationCode)
         );
@@ -362,10 +367,40 @@ contract BscKmsStack is Script {
                 uint32(MAX_NAV_AGE_SECS)
             )
         );
-        return DeployGuards.predictCreate2(
+        proxy = DeployGuards.predictCreate2(
             DeployGuards.saltFor("DeployAtomicSettlement:GyldAtomicSwap.proxy"),
             keccak256(abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(impl, initData)))
         );
+    }
+
+    /// DeployAtomicSettlement's final topology, step by step, so a deploy that stopped midway
+    /// names what is missing.
+    function _requireSwapComplete(Roles memory r, GyldAtomicSwap w, address[N_SERIES] memory tokens, address tl)
+        internal
+        view
+    {
+        for (uint256 i; i < N_SERIES; ++i) {
+            _requireSwapStep(w.registeredSeries(tokens[i]), string.concat("registerSeries ", _bond(i).tag));
+        }
+        _requireSwapStep(w.withdrawalWallet() == r.withdrawalWallet, "setWithdrawalWallet");
+        _requireSwapStep(w.hasRole(w.ALLOWLIST_ADMIN_ROLE(), r.allowlistAdmin), "ALLOWLIST_ADMIN grant");
+        _requireSwapStep(w.hasRole(w.DEFAULT_ADMIN_ROLE(), tl), "DEFAULT_ADMIN handover to the timelock");
+        _requireSwapStep(
+            !w.hasRole(w.DEFAULT_ADMIN_ROLE(), r.deployer) && !w.hasRole(w.ALLOWLIST_ADMIN_ROLE(), r.deployer),
+            "deployer role revokes"
+        );
+    }
+
+    function _requireSwapStep(bool done, string memory step) internal pure {
+        if (!done) {
+            revert(
+                string.concat(
+                    "BscKmsStack: swap deploy stopped midway - missing ",
+                    step,
+                    ". Finish the run C broadcast with --resume; nothing was whitelisted or minted"
+                )
+            );
+        }
     }
 
     function _priced(KaleidoscopeNAVFeed feed) internal view returns (bool) {
