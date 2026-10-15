@@ -10,6 +10,7 @@ import {TokenFactory} from "../TokenFactory.sol";
 import {KaleidoscopeNAVFeed} from "../KaleidoscopeNAVFeed.sol";
 import {MockSanctionsList} from "../test/MockSanctionsList.sol";
 import {MockUSDC} from "../test/MockUSDC.sol";
+import {DeployGuards} from "./lib/DeployGuards.sol";
 
 /// @title DeployAtomicSettlementE2E
 /// @notice Self-contained Anvil deploy for the Rust M7 e2e golden
@@ -35,9 +36,18 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 ///                                           with USDC.
 ///   non-allowlisted taker  = account[3]  — funded, deliberately NOT allowlisted
 ///                                           (allowlist-revert proof).
+///   token operator/pauser  = account[4]  — MUST differ from the NAV feed owner
+///                                           (= the deployer): the feed's emergency
+///                                           path is a 2-of-2 and TokenFactory
+///                                           reverts NavFeedOwnerIsOperator if the
+///                                           guardian and the KMS signer collapse
+///                                           into one key.
 ///   withdrawalWallet       = account[5]  — a FIXED destination distinct from the
 ///                                           treasurer, so the withdraw proof shows
 ///                                           funds landing at the admin-fixed wallet.
+///   factory owner          = account[6]  — signs deployToken, so it is the feed's
+///                                           rangeGovernor: must differ from the NAV
+///                                           feed owner (account[0]).
 ///
 /// ── Run (start anvil --chain-id 31337 first) ────────────────────────────────
 ///   forge script contracts/script/DeployAtomicSettlementE2E.s.sol \
@@ -50,9 +60,14 @@ import {MockUSDC} from "../test/MockUSDC.sol";
 contract DeployAtomicSettlementE2E is Script {
     address constant TAKER = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8; // acct[1]
     address constant BOB = 0x90F79bf6EB2c4f870365E785982E1f101E93b906; // acct[3] (not allowlisted)
+    address constant OPERATOR = 0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65; // acct[4]
     address constant WITHDRAWAL_WALLET = 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc; // acct[5]
+    uint256 immutable FACTORY_OWNER_PK =
+        vm.deriveKey("test test test test test test test test test test test junk", 6); // acct[6]
 
-    int256 constant NAV = 100e8; // $100.00 per token, 8dp — matches the Rust market-data mid
+    // $1.00 per token, 8dp — the product's NAV-per-token standard, and the mid the Rust
+    // market-data fixture quotes against. 1e18 bond token <-> 1e6 USDC.
+    int256 constant NAV = 1e8;
     uint16 constant MAX_BPS = 200; // 2% NAV band
     uint32 constant MAX_NAV_AGE = 86400; // 1 day
 
@@ -77,19 +92,32 @@ contract DeployAtomicSettlementE2E is Script {
         );
         issuanceMgr.grantRole(issuanceMgr.WHITELIST_ADMIN_ROLE(), deployer);
 
-        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), deployer);
+        // ISSUANCE_PAUSER_ROLE (audit FIND-001). Anvil-only, so this is topology parity
+        // rather than a control: the deployer is already every other role here. Granted to
+        // acct[4] anyway, so a local stack has the same mint-brake shape as production —
+        // a pauser distinct from the SUBSCRIBER key — and pauseIssuance() is exercisable
+        // against this stack instead of reverting for want of a holder.
+        issuanceMgr.grantRole(issuanceMgr.ISSUANCE_PAUSER_ROLE(), OPERATOR);
+
+        TokenFactory factory = new TokenFactory(address(new GyldBondToken()), address(sanctions), vm.addr(FACTORY_OWNER_PK));
         issuanceMgr.grantRole(issuanceMgr.REGISTRAR_ROLE(), address(factory));
 
-        // CAT-style series — deployer is factory owner so deployToken is direct.
+        // CAT-style series — signed by the factory owner (acct[6]); see the role model.
+        // Audit FIND-012: a wrong claim is undone only by a 48 h releaseIsin — validate first.
+        DeployGuards.requireValidIsin("US14913UBF66");
+        DeployGuards.requireIsinVacant(address(factory), "US14913UBF66");
+        vm.stopBroadcast();
+        vm.broadcast(FACTORY_OWNER_PK);
         (address token_, address navFeed_, address forwarder_) = factory.deployToken(
             "Caterpillar Inc 3.7% 2028",
             "14913UBF6",
-            "US14913UBF62",
-            1_788_739_200,
-            deployer, // token operator / pauser
+            "US14913UBF66",
+            1_851_811_200,
+            OPERATOR, // token operator / pauser (acct[4]; must differ from the NAV feed owner)
             address(issuanceMgr),
-            deployer // NAV feed owner
+            deployer // NAV feed owner — the broadcaster, so it can push NAV below
         );
+        vm.startBroadcast();
         GyldBondToken token = GyldBondToken(token_);
         KaleidoscopeNAVFeed navFeed = KaleidoscopeNAVFeed(navFeed_);
 
@@ -118,6 +146,9 @@ contract DeployAtomicSettlementE2E is Script {
         swap.setAllowed(TAKER, true); // acct[1] may be an executeSwap taker
 
         // ── 4. Seed the swap's OWN inventory + USDC liquidity ─────────────────
+        // At NAV $1.00 the swap's 100-token inventory is only 100 USDC of notional; the
+        // USDC faucet amounts below are deliberate headroom for the Rust test, not a
+        // priced quantity, so they are left generous rather than rescaled with the NAV.
         issuanceMgr.subscribe(address(token), address(swap), 100e18); // 100 tokens minted DIRECTLY to the swap
         usdc.mint(address(swap), 100_000e6); // redeem-leg liquidity
         usdc.mint(TAKER, 1_000_000e6); // taker buys with this

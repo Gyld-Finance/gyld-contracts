@@ -31,6 +31,23 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///      and latestAnswer() (Aave V3 legacy AggregatorInterface). All calls are
 ///      pure delegations — no local state, no transformation, no caching.
 ///
+///      INTEGRATION PRECONDITION — the caller MUST age-check (audit FIND-022).
+///      "Pure delegation" includes staleness: this forwarder performs no age check
+///      of its own, and neither does KaleidoscopeNAVFeed upstream, which serves its
+///      last pushed answer forever rather than reverting (a deliberate choice — see
+///      KaleidoscopeNAVFeed.latestRoundData for why). Nothing in this read path will
+///      ever tell a caller the price is old. An integrator that does not compare
+///      `updatedAt` against its own maximum age will therefore price against a dead
+///      feed indefinitely, with no revert and no signal.
+///
+///      Every consumer must enforce its own bound on `block.timestamp - updatedAt`:
+///        - GyldAtomicSwap does, via maxNavAgeSecs -> StaleNav (fail-closed).
+///        - Euler V2's ChainlinkOracle adapter does, via its own maxStaleness.
+///        - Morpho Blue does NOT. Pointing a Morpho market here accepts that the
+///          market keeps quoting the last answer through a feed outage.
+///      For monitoring rather than enforcement, read KaleidoscopeNAVFeed's
+///      `stalenessSeconds()` directly on the upstream — it is not forwarded here.
+///
 
 contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     // ── State ─────────────────────────────────────────────────────────────────
@@ -60,6 +77,8 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     ///                         upgrades have a mandatory delay period.
     constructor(address initialUpstream, address initialOwner) Ownable(initialOwner) {
         if (initialUpstream == address(0)) revert UpstreamCannotBeZero();
+        // Written before the probes, same order as setUpstreamOracle (audit FIND-019).
+        _upstreamOracle = IUpstreamOracle(initialUpstream);
         (bool ok, bytes memory data) = initialUpstream.staticcall(abi.encodeWithSignature("decimals()"));
         if (!ok || data.length != 32 || uint8(data[31]) != 8) revert InvalidOracle(initialUpstream);
         // Also probe version() — pure constant on any AggregatorV3Interface implementation,
@@ -67,7 +86,6 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         (bool okV, bytes memory dataV) = initialUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(initialUpstream);
         _probeNotFutureDated(initialUpstream);
-        _upstreamOracle = IUpstreamOracle(initialUpstream);
         emit UpstreamOracleUpdated(address(0), initialUpstream);
     }
 
@@ -97,7 +115,11 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
     function setUpstreamOracle(address newUpstream) external onlyOwner {
         if (newUpstream == address(0)) revert UpstreamCannotBeZero();
         if (newUpstream == address(this)) revert InvalidOracle(newUpstream);
-        // Verify the address implements the oracle interface before storing.
+        // Write FIRST so the probes below read through the NEW pointer: a cycle then
+        // recurses, fails, and this revert rolls the write back (audit FIND-019, D-36).
+        address previous = address(_upstreamOracle);
+        _upstreamOracle = IUpstreamOracle(newUpstream);
+        // Verify the address implements the oracle interface.
         // Uses decimals() — a pure view that never reverts for business-logic
         // reasons (unlike latestRoundData which reverts when no price is set yet).
         // staticcall handles both EOAs (success=true, data="") and wrong contracts
@@ -108,8 +130,6 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         (bool okV, bytes memory dataV) = newUpstream.staticcall(abi.encodeWithSignature("version()"));
         if (!okV || dataV.length != 32) revert InvalidOracle(newUpstream);
         _probeNotFutureDated(newUpstream);
-        address previous = address(_upstreamOracle);
-        _upstreamOracle = IUpstreamOracle(newUpstream);
         emit UpstreamOracleUpdated(previous, newUpstream);
     }
 
@@ -178,6 +198,9 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         return _upstreamOracle.version();
     }
 
+    /// @notice Delegated verbatim to the upstream oracle.
+    /// @dev    No age check — see the INTEGRATION PRECONDITION on the contract.
+    ///         The caller must bound `block.timestamp - updatedAt` itself.
     function getRoundData(uint80 roundId) external view returns (
         uint80 rId,
         int256 answer,
@@ -188,6 +211,11 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
         return _upstreamOracle.getRoundData(roundId);
     }
 
+    /// @notice Delegated verbatim to the upstream oracle.
+    /// @dev    No age check — see the INTEGRATION PRECONDITION on the contract.
+    ///         `updatedAt` is returned unmodified and is the ONLY staleness signal
+    ///         on this path; this function never reverts on a stale price, however
+    ///         old it is. The caller must bound `block.timestamp - updatedAt`.
     function latestRoundData() external view returns (
         uint80 roundId,
         int256 answer,
@@ -200,6 +228,11 @@ contract NAVFeedForwarder is IUpstreamOracle, Ownable2Step {
 
     // ── Chainlink V2 compatibility (Aave V3 calls latestAnswer()) ─────────────
 
+    /// @notice Delegated verbatim to the upstream oracle.
+    /// @dev    Carries NO timestamp, so a caller cannot age-check this value at all
+    ///         — there is nothing in the return to check. Prefer latestRoundData()
+    ///         and bound its `updatedAt`. Retained only for Aave V3 compatibility.
+    ///         See the INTEGRATION PRECONDITION on the contract (audit FIND-022).
     function latestAnswer() external view returns (int256) {
         return _upstreamOracle.latestAnswer();
     }
