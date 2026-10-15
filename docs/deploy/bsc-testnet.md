@@ -100,6 +100,40 @@ cast send $TIMELOCK_ADDRESS "execute(address,uint256,bytes,bytes32,bytes32)" \
 # then the same for revokeRole(old signer) and bumpQuoteEpoch()
 ```
 
+### Rotating every role to AWS KMS (GLD-807)
+
+`script-bsc/BscKmsRoleRotation.s.sol` does the table above in one go; targets are in
+`script-bsc/kms-roles.bsc-testnet.env`. Rehearse first: `script-bsc/simulate-kms-rotation.sh`
+(Anvil fork, AWS creds). Fund the KMS NAV owner (~0.02 tBNB) before Phase C. Run each phase
+once without `--broadcast` (dry run), then with it.
+
+```bash
+set -a; . docs/deploy/bsc-testnet-addresses.env; . script-bsc/kms-roles.bsc-testnet.env; set +a
+RPC=https://bsc-testnet-rpc.publicnode.com; SOL=script-bsc/BscKmsRoleRotation.s.sol:BscKmsRoleRotation
+TX="--rpc-url $RPC --legacy --with-gas-price 0.1gwei --slow"   # append --broadcast after the dry run
+# 0 - keys derive the KMS_* addresses; KMS governance signs this rotation (exports KMS_GOVERNANCE_SIG)
+out=$(script-bsc/check-kms-addresses.sh) || exit 1; eval "$out"
+export QUOTE_EPOCH_BEFORE=$(cast call $EVM_ATOMIC_SWAP_ADDRESS 'quoteEpoch()(uint256)' --rpc-url $RPC)
+# A - old governance: one timelock batch (roles, withdrawal wallet, quote epoch, then PROPOSER + CANCELLER)
+( . ~/.gyld/bsc-testnet-derived-keys.env
+  forge script $SOL --sig 'rotateRoles()' --sender $GOVERNANCE_MULTISIG --private-key "$GOVERNANCE_PK" $TX )
+# B - old NAV owner: transferOwnership(KMS NAV owner) on the 3 feeds
+( . ~/.gyld/bsc-testnet-derived-keys.env
+  forge script $SOL --sig 'transferNavOwnership()' --sender $NAV_FEED_OWNER --private-key "$NAV_FEED_OWNER_PK" $TX )
+# C - KMS NAV owner: acceptOwnership() on the 3 feeds
+AWS_KMS_KEY_ID=$KMS_NAV_FEED_OWNER_KEY_ID forge script $SOL --sig 'acceptNavOwnership()' --sender $KMS_NAV_FEED_OWNER --aws $TX
+# V - read-only
+forge script $SOL --sig 'verify()' --rpc-url $RPC
+```
+
+Not rotatable:
+- each NAV feed's `emergencyUpdater` (immutable; stays the old ops key).
+- the gUSD `minter` (immutable; the deployer).
+- the `MockSanctionsList` owner (no setter; `KMS_SANCTIONS_OWNER` is for the next deploy).
+
+**Rollback:** only KMS governance can undo Phase A, through the same timelock `grantRole` /
+`revokeRole` calls; feeds go back by the same two-step `transferOwnership` / `acceptOwnership`.
+
 ## Providing the key
 
 Use a **temporary** MetaMask account holding only testnet BNB. Do not use one that holds
