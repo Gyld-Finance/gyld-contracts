@@ -16,8 +16,9 @@ floor is **5 minutes** instead of 48 h (`DeployGuards.isRehearsalTestnet()`). Th
 oracle is the production `SanctionsOracleMirror`; the swap stores the cash token's
 `cashDecimals()`.
 
-The raw-key Katana deploy from GLD-738 (PR #23: Bokuto as a dev chain, `script-katana/`)
-is superseded by this one.
+The raw-key Katana deploy from GLD-738 (Bokuto as a dev chain, `script-katana/`, now
+removed) is superseded by this one; its addresses are kept in
+`docs/deploy/katana-testnet-addresses.v1.env` (unused).
 
 | File | What |
 |---|---|
