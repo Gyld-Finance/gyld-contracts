@@ -46,9 +46,17 @@ library DeployGuards {
     uint256 internal constant ANVIL_CHAIN_ID = 31337;
     /// The single supported public testnet (docs/ARCHITECTURE.md).
     uint256 internal constant SEPOLIA_CHAIN_ID = 11155111;
+    /// BNB Smart Chain TESTNET. NOT a dev chain (GLD-807): it runs every production guard,
+    /// with only the timelock floor lowered to {MIN_TESTNET_TIMELOCK_DELAY}.
+    uint256 internal constant BSC_TESTNET_CHAIN_ID = 97;
+    /// Katana TESTNET "Bokuto". A rehearsal testnet like BSC testnet (GLD-850). Only the
+    /// testnet: Katana mainnet (747474) stays on the 48 h floor by omission.
+    uint256 internal constant KATANA_BOKUTO_CHAIN_ID = 737373;
 
     /// Minimum TimelockController delay on any production chain.
     uint256 internal constant MIN_PROD_TIMELOCK_DELAY = 48 hours;
+    /// Minimum delay on a rehearsal testnet, so governance rehearsals take minutes (GLD-807).
+    uint256 internal constant MIN_TESTNET_TIMELOCK_DELAY = 5 minutes;
 
     /// @notice Gas one `isSanctioned` read may consume in {requireSanctionsOracleAnswers}
     ///         before the oracle is refused. Audit FIND-006.
@@ -124,6 +132,22 @@ library DeployGuards {
         return block.chainid == ANVIL_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID;
     }
 
+    /// @notice True ONLY for the public testnets that run every production guard with the
+    ///         timelock floor lowered to {MIN_TESTNET_TIMELOCK_DELAY}. ALLOWLIST, like
+    ///         {isDevChain}: any other chain keeps the 48 h floor.
+    function isRehearsalTestnet() internal view returns (bool) {
+        return block.chainid == BSC_TESTNET_CHAIN_ID || block.chainid == KATANA_BOKUTO_CHAIN_ID;
+    }
+
+    /// @notice The timelock floor {requireProdMinDelay} and {assertTimelockSane} enforce.
+    function minTimelockDelay() internal view returns (uint256) {
+        return isRehearsalTestnet() ? MIN_TESTNET_TIMELOCK_DELAY : MIN_PROD_TIMELOCK_DELAY;
+    }
+
+    function _minDelayLabel() private view returns (string memory) {
+        return isRehearsalTestnet() ? "300s (5min)" : "172800s (48h)";
+    }
+
     /// @notice Reverts unless the current chain is a development chain.
     /// @param  what human-readable description of the dev-only action being attempted.
     function requireProdSafe(string memory what) internal view {
@@ -180,16 +204,18 @@ library DeployGuards {
         revert(string.concat("DeployGuards: env var ", key, " is required on chainId ", vm.toString(block.chainid)));
     }
 
-    /// @notice On production, a timelock delay below 48h is rejected before any gas is
-    ///         spent. `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the incident happened.
+    /// @notice On production, a timelock delay below {minTimelockDelay} (48h; 5 min on a
+    ///         {isRehearsalTestnet}) is rejected before any gas is spent. `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the incident happened.
     function requireProdMinDelay(uint256 delay) internal view {
         if (isDevChain()) return;
-        if (delay < MIN_PROD_TIMELOCK_DELAY) {
+        if (delay < minTimelockDelay()) {
             revert(
                 string.concat(
                     "DeployGuards: TIMELOCK_DELAY_SECONDS=",
                     vm.toString(delay),
-                    " is below the 172800s (48h) minimum on production chainId ",
+                    " is below the ",
+                    _minDelayLabel(),
+                    " minimum on production chainId ",
                     vm.toString(block.chainid)
                 )
             );
@@ -505,7 +531,7 @@ library DeployGuards {
     }
 
     /// @notice Asserts the timelock is a real governance gate and not a rubber stamp.
-    /// @dev    On production: `getMinDelay() >= 48h`, and the deployer holds NONE of
+    /// @dev    On production: `getMinDelay() >= minTimelockDelay()`, and the deployer holds NONE of
     ///         PROPOSER / CANCELLER / DEFAULT_ADMIN on the timelock itself. Without the
     ///         second half a handover can look perfect while the deployer remains the
     ///         sole proposer of a zero-delay timelock — i.e. still unilateral. No-op on dev.
@@ -514,14 +540,16 @@ library DeployGuards {
         ITimelockLike t = ITimelockLike(tl);
 
         uint256 delay = t.getMinDelay();
-        if (delay < MIN_PROD_TIMELOCK_DELAY) {
+        if (delay < minTimelockDelay()) {
             revert(
                 string.concat(
                     "DeployGuards: timelock ",
                     vm.toString(tl),
                     " minDelay is ",
                     vm.toString(delay),
-                    "s, below the 172800s (48h) production minimum on chainId ",
+                    "s, below the ",
+                    _minDelayLabel(),
+                    " production minimum on chainId ",
                     vm.toString(block.chainid)
                 )
             );
@@ -551,10 +579,23 @@ library DeployGuards {
     // ── Deterministic (CREATE2) bootstrap addresses ───────────────────────────
 
     /// @notice Namespaced, chain-scoped CREATE2 salt.
-    /// @dev    `keccak256("gyld.v1" ++ name ++ chainId)`. The chainId term is what stops
-    ///         the same logical contract from landing on the same address on two chains.
+    /// @dev    `keccak256("gyld.v1" ++ name ++ chainId ++ DEPLOY_SALT_TAG)`. The chainId term
+    ///         is what stops the same logical contract from landing on the same address on
+    ///         two chains. The optional `DEPLOY_SALT_TAG` env var gives a fresh stack on a
+    ///         chain that already has one (GLD-807); unset or empty, addresses are unchanged.
     function saltFor(string memory name) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked("gyld.v1", name, block.chainid));
+        return saltFor(name, saltTag());
+    }
+
+    /// @notice `DEPLOY_SALT_TAG`, or "" when unset or empty.
+    function saltTag() internal view returns (string memory tag) {
+        try vm.envString("DEPLOY_SALT_TAG") returns (string memory t) {
+            tag = t;
+        } catch {}
+    }
+
+    function saltFor(string memory name, string memory tag) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("gyld.v1", name, block.chainid, tag));
     }
 
     /// @notice CREATE2 address for `initCodeHash` deployed by the canonical proxy.

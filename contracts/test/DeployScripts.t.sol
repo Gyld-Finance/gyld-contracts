@@ -14,6 +14,7 @@ import {DeployAtomicSettlement} from "../script/DeployAtomicSettlement.s.sol";
 import {DeployNAVFeed} from "../script/DeployNAVFeed.s.sol";
 import {DeployMockSanctionsList} from "../script/DeployMockSanctionsList.s.sol";
 import {DeployMockUSDC} from "../script/DeployMockUSDC.s.sol";
+import {DeployMockStablecoin} from "../script/DeployMockStablecoin.s.sol";
 
 import {GyldBondToken} from "../GyldBondToken.sol";
 import {IssuanceManager} from "../IssuanceManager.sol";
@@ -25,6 +26,7 @@ import {SanctionsOracleMirror} from "../SanctionsOracleMirror.sol";
 // quietly stops griefing makes its test vacuous instead of failing it.
 import {GasGriefingOracle} from "./SanctionsOracleMirror.t.sol";
 import {MockUSDC} from "./MockUSDC.sol";
+import {GyldTestUSD} from "./GyldTestUSD.sol";
 
 /// @dev External wrapper around the library.
 ///
@@ -39,6 +41,14 @@ contract GuardsHarness {
 
     function saltFor(string memory name) external view returns (bytes32) {
         return DeployGuards.saltFor(name);
+    }
+
+    function saltFor(string memory name, string memory tag) external view returns (bytes32) {
+        return DeployGuards.saltFor(name, tag);
+    }
+
+    function requireProdMinDelay(uint256 delay) external view {
+        DeployGuards.requireProdMinDelay(delay);
     }
 
     /// The guard is `internal view` on a library, so a test can only reach it through a
@@ -109,6 +119,75 @@ contract DeployGuardsTest is ScriptRevertAsserts {
                 string.concat("chainId ", vm.toString(production[i]), " must be treated as production")
             );
         }
+    }
+
+    /// Catches (GLD-807): BSC testnet (97) slipping back onto the dev allowlist, where every
+    /// production guard is a no-op. It runs the production path, as do BSC mainnet (56),
+    /// opBNB (204) and the opBNB testnet (5611).
+    function test_isDevChain_bscFamilyIsProduction() public {
+        assertFalse(_isDev(97), "BSC testnet (97) must take the production path (GLD-807)");
+        assertFalse(_isDev(56), "BSC mainnet (56) must be treated as production");
+        assertFalse(_isDev(204), "opBNB mainnet (204) must be treated as production");
+        assertFalse(_isDev(5611), "opBNB testnet (5611) is not on the allowlist");
+    }
+
+    /// Catches (GLD-807): the 5-minute testnet floor leaking to another chain, or BSC
+    /// testnet accepting a delay below it.
+    function test_requireProdMinDelay_isFiveMinutesOnBscTestnetOnly() public {
+        vm.chainId(97);
+        harness.requireProdMinDelay(300);
+        vm.expectRevert(
+            bytes("DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s (5min) minimum on production chainId 97")
+        );
+        harness.requireProdMinDelay(299);
+
+        vm.chainId(8453);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 8453"
+            )
+        );
+        harness.requireProdMinDelay(300);
+        harness.requireProdMinDelay(48 hours);
+    }
+
+    /// Catches (GLD-850): Katana Bokuto (737373) missing the rehearsal floor or joining the
+    /// dev allowlist, the floor leaking to Katana mainnet (747474), or BSC testnet losing it.
+    function test_requireProdMinDelay_isFiveMinutesOnKatanaBokutoToo() public {
+        assertFalse(_isDev(737373), "Katana Bokuto (737373) must take the production path (GLD-850)");
+        vm.chainId(737373);
+        harness.requireProdMinDelay(300);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s (5min) minimum on production chainId 737373"
+            )
+        );
+        harness.requireProdMinDelay(299);
+
+        vm.chainId(97);
+        harness.requireProdMinDelay(300);
+
+        vm.chainId(747474);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 747474"
+            )
+        );
+        harness.requireProdMinDelay(300);
+        harness.requireProdMinDelay(48 hours);
+    }
+
+    /// Catches (GLD-807): DEPLOY_SALT_TAG moving the addresses of existing stacks (an empty
+    /// tag must reproduce the pre-tag salt) or failing to move a fresh one.
+    function test_saltFor_tagIsOptional_andScopesAFreshStack() public {
+        vm.chainId(97);
+        string memory name = "DeployDevNet:GyldBondToken.impl";
+        assertEq(
+            harness.saltFor(name, ""),
+            keccak256(abi.encodePacked("gyld.v1", name, uint256(97))),
+            "empty tag moved a salt"
+        );
+        assertTrue(harness.saltFor(name, "kms1") != harness.saltFor(name, ""), "tag did not change the salt");
     }
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
@@ -1296,5 +1375,73 @@ contract DeployMockUSDCTest is ScriptRevertAsserts {
         DeployMockUSDC script = new DeployMockUSDC();
         script.run();
         assertGt(address(script.usdc()).code.length, 0, "no MockUSDC deployed on Sepolia");
+    }
+}
+
+/// @title DeployMockStablecoinTest
+/// @notice GLD-713: the 18dp "Gyld Test USD" cash token for BSC testnet (97).
+///
+/// Every env-reading assertion lives in ONE test function: `vm.setEnv` mutates
+/// process-global state shared by every thread (see {DeployScriptsTest}), so a default
+/// check split from an override check would race. The chain-guard tests read no env —
+/// the guard fires before any `vm.env*` call — so they stay separate.
+contract DeployMockStablecoinTest is ScriptRevertAsserts {
+    string constant GUARD = "deploying the Gyld Test USD (gUSD) mock stablecoin is dev-only";
+
+    /// Catches: a public-chain-deployable test stablecoin escaping onto a production chain
+    /// — BSC mainnet (56) and opBNB (204) above all, the chains this token imitates.
+    function test_run_refusedOnEveryProductionChain() public {
+        uint256[7] memory production = [uint256(56), 97, 204, 1, 8453, 5611, 999_999_999];
+        for (uint256 i = 0; i < production.length; i++) {
+            vm.chainId(production[i]);
+            _expectRunRevert(
+                address(new DeployMockStablecoin()),
+                string.concat(GUARD, " and is NOT production-safe on chainId ", vm.toString(production[i]))
+            );
+        }
+    }
+
+    /// Defaults (18dp, 1,000,000 gUSD to the broadcaster, broadcaster is minter) on
+    /// Sepolia, then the MOCK_STABLE_DECIMALS override and its 6-or-18 rule.
+    function test_run_onSepolia_defaultsTo18dp_andHonoursTheDecimalsOverride() public {
+        vm.chainId(11155111);
+        vm.setEnv("MOCK_STABLE_DECIMALS", "");
+        vm.setEnv("MOCK_STABLE_MINT_TO", "");
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "");
+
+        DeployMockStablecoin script = new DeployMockStablecoin();
+        script.run();
+        GyldTestUSD gusd = script.stable();
+        address deployer = DeployGuards.broadcaster();
+        assertEq(gusd.decimals(), 18, "default must be 18dp (BNB-chain stablecoin shape)");
+        assertEq(gusd.symbol(), "gUSD");
+        assertEq(gusd.name(), "Gyld Test USD");
+        assertEq(gusd.minter(), deployer, "broadcaster must be the minter");
+        assertEq(gusd.balanceOf(deployer), 1_000_000e18, "initial supply not minted to broadcaster");
+
+        // Minting is gated: a public-chain test token must not be a free faucet.
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(abi.encodeWithSelector(GyldTestUSD.NotMinter.selector, address(0xBEEF)));
+        gusd.mint(address(0xBEEF), 1);
+
+        vm.setEnv("MOCK_STABLE_DECIMALS", "6");
+        vm.setEnv("MOCK_STABLE_MINT_TO", vm.toString(address(0xA11CE)));
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "5");
+        script = new DeployMockStablecoin();
+        script.run();
+        assertEq(script.stable().decimals(), 6, "MOCK_STABLE_DECIMALS override ignored");
+        assertEq(script.stable().balanceOf(address(0xA11CE)), 5e6, "MINT_TO / MINT_AMOUNT ignored");
+
+        // Not one of the swap's accepted cash decimals (6 or 18): refused before broadcast.
+        vm.setEnv("MOCK_STABLE_DECIMALS", "19");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=19 is not 6 or 18");
+        vm.setEnv("MOCK_STABLE_DECIMALS", "5");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=5 is not 6 or 18");
+        vm.setEnv("MOCK_STABLE_DECIMALS", "12");
+        _expectRunRevert(address(new DeployMockStablecoin()), "MOCK_STABLE_DECIMALS=12 is not 6 or 18");
+
+        vm.setEnv("MOCK_STABLE_DECIMALS", "");
+        vm.setEnv("MOCK_STABLE_MINT_TO", "");
+        vm.setEnv("MOCK_STABLE_MINT_AMOUNT", "");
     }
 }
