@@ -3,15 +3,15 @@
 # KMS_* address, and the KMS governance key signs (EIP-191) what run A will bind it to:
 # keccak256(abi.encode(TAG, 97, keccak256(abi.encode(address[14] roles)), keccak256(DEPLOY_SALT_TAG))).
 # runA() recovers the signature and refuses to deploy unless it is KMS_GOVERNANCE's.
-#   out=$(script-bsc/check-kms-addresses.sh) || exit 1; eval "$out"   # exports KMS_GOVERNANCE_SIG
+#   out=$(script-evm/check-kms-addresses.sh) || exit 1; eval "$out"   # exports KMS_GOVERNANCE_SIG
 set -euo pipefail
 cd "$(dirname "$0")/.."
-set -a; . script-bsc/kms-roles.bsc-testnet.env; set +a
+set -a; . script-evm/kms-roles.env; set +a
 export AWS_REGION="${AWS_REGION:-eu-west-2}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 roles=""
-# Same order as BscKmsStack._addresses().
+# Same order as KmsStack._addresses().
 for r in DEPLOYER GOVERNANCE OPS NAV_FEED_OWNER SUBSCRIBER REDEEMER WHITELIST_ADMIN ISSUANCE_PAUSER \
   QUOTE_SIGNER TREASURER ALLOWLIST_ADMIN WITHDRAWAL_WALLET SANCTIONS_OWNER USER_WITHDRAWAL; do
   want="KMS_$r" id="KMS_${r}_KEY_ID"

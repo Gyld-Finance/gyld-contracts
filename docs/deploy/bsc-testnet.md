@@ -11,10 +11,10 @@ exception — the timelock floor is **5 minutes** instead of 48 h
 
 | File | What |
 |---|---|
-| `script-bsc/kms-roles.bsc-testnet.env` | The 14 KMS addresses + key ids (public) |
-| `script-bsc/check-kms-addresses.sh` | Step 0: each key id derives its address |
-| `script-bsc/BscKmsStack.s.sol` | `runA` / `runB` / `runC` / `verify` |
-| `script-bsc/simulate-kms-stack.sh` | Full rehearsal on an Anvil fork (impersonated signers) |
+| `script-evm/kms-roles.env` | The 14 KMS addresses + key ids (public) |
+| `script-evm/check-kms-addresses.sh` | Step 0: each key id derives its address |
+| `script-evm/KmsStack.s.sol` | `runA` / `runB` / `runC` / `verify` |
+| `script-evm/simulate-kms-stack.sh` | Full rehearsal on an Anvil fork (impersonated signers) |
 | `docs/deploy/bsc-testnet-addresses.v1.env` | The retired GLD-713 stack (raw derived keys) |
 
 ## Roles
@@ -44,12 +44,12 @@ owner 1); the floats above are ~10× for later operations.
 
 ```bash
 cd lib/gyld-contracts
-set -a; . script-bsc/kms-roles.bsc-testnet.env; set +a
+set -a; . script-evm/kms-roles.env; set +a
 export AWS_REGION=eu-west-2 RPC=https://bsc-testnet-rpc.publicnode.com
 export DEPLOY_SALT_TAG=kms1          # fresh CREATE2 addresses; v1 used the same bytecode
 export NAV_ANSWER_8DP=100000000       # $1.00 — must sit inside the feeds' $0.10–$2.00 range
 export SANCTIONS_PROBE_FLAGGED=0x098B716B8Aaf21512996dC57EB0615e2383E2f96  # re-check: on the CURRENT SDN list
-F="script-bsc/BscKmsStack.s.sol:BscKmsStack"
+F="script-evm/KmsStack.s.sol:KmsStack"
 OPTS="--rpc-url $RPC --aws --slow --legacy --with-gas-price 0.1gwei"   # no --broadcast: dry run
 ```
 
@@ -60,7 +60,7 @@ timelock (`rangeGovernor`) can move it later, within $0.10–$5.00.
 
 ## Run it
 
-Rehearse first: `script-bsc/simulate-kms-stack.sh` (must end `SIMULATION GREEN`). Each
+Rehearse first: `script-evm/simulate-kms-stack.sh` (must end `SIMULATION GREEN`). Each
 on-chain step below is shown as its **dry run** (no `--broadcast`); read the output, then
 run the same command again with `--broadcast` appended. `AWS_KMS_KEY_IDS` lists the keys
 that sign in that step.
@@ -68,7 +68,7 @@ that sign in that step.
 ```bash
 # Step 0 — no transaction: every key id derives its address, and the governance key signs
 # chain 97 + all 14 addresses + DEPLOY_SALT_TAG. runA refuses to deploy without that proof.
-out=$(script-bsc/check-kms-addresses.sh) || exit 1; eval "$out"   # exports KMS_GOVERNANCE_SIG
+out=$(script-evm/check-kms-addresses.sh) || exit 1; eval "$out"   # exports KMS_GOVERNANCE_SIG
 
 # Run A — deployer + sanctions owner: mirror, SDN seed, DeployDevNet (delay 300 s)
 A="forge script $F --sig runA() --sender $KMS_DEPLOYER $OPTS"

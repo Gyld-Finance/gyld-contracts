@@ -17,10 +17,10 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
-/// @title BscKmsStack
+/// @title KmsStack
 /// @notice Fresh BSC testnet (97) stack, every role its own AWS KMS key, production guards on
 ///         (97 is not a dev chain; timelock floor 5 min). GLD-807. Runbook:
-///         docs/deploy/bsc-testnet.md; rehearsal: script-bsc/simulate-kms-stack.sh.
+///         docs/deploy/bsc-testnet.md; rehearsal: script-evm/simulate-kms-stack.sh.
 ///
 ///   runA()   --sender KMS_DEPLOYER   deployer + sanctions owner: SanctionsOracleMirror seeded
 ///                                    with a live SDN probe, then DeployDevNet (delay 300 s)
@@ -30,10 +30,10 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 ///                                    Every step skips what is done: re-run to finish a partial C
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
-/// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), KMS_GOVERNANCE_SIG (from
+/// Env: script-evm/kms-roles.env (KMS_*), KMS_GOVERNANCE_SIG (from
 /// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC).
-contract BscKmsStack is Script {
+contract KmsStack is Script {
     uint256 internal constant BSC_TESTNET = 97;
     uint256 internal constant TIMELOCK_DELAY = 5 minutes;
     /// Real BSC testnet USDT, 18 decimals.
