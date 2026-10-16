@@ -151,6 +151,32 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         harness.requireProdMinDelay(48 hours);
     }
 
+    /// Catches (GLD-850): Katana Bokuto (737373) missing the rehearsal floor or joining the
+    /// dev allowlist, the floor leaking to Katana mainnet (747474), or BSC testnet losing it.
+    function test_requireProdMinDelay_isFiveMinutesOnKatanaBokutoToo() public {
+        assertFalse(_isDev(737373), "Katana Bokuto (737373) must take the production path (GLD-850)");
+        vm.chainId(737373);
+        harness.requireProdMinDelay(300);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s (5min) minimum on production chainId 737373"
+            )
+        );
+        harness.requireProdMinDelay(299);
+
+        vm.chainId(97);
+        harness.requireProdMinDelay(300);
+
+        vm.chainId(747474);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 747474"
+            )
+        );
+        harness.requireProdMinDelay(300);
+        harness.requireProdMinDelay(48 hours);
+    }
+
     /// Catches (GLD-807): DEPLOY_SALT_TAG moving the addresses of existing stacks (an empty
     /// tag must reproduce the pre-tag salt) or failing to move a fresh one.
     function test_saltFor_tagIsOptional_andScopesAFreshStack() public {

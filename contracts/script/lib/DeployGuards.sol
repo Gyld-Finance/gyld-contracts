@@ -49,10 +49,13 @@ library DeployGuards {
     /// BNB Smart Chain TESTNET. NOT a dev chain (GLD-807): it runs every production guard,
     /// with only the timelock floor lowered to {MIN_TESTNET_TIMELOCK_DELAY}.
     uint256 internal constant BSC_TESTNET_CHAIN_ID = 97;
+    /// Katana TESTNET "Bokuto". A rehearsal testnet like BSC testnet (GLD-850). Only the
+    /// testnet: Katana mainnet (747474) stays on the 48 h floor by omission.
+    uint256 internal constant KATANA_BOKUTO_CHAIN_ID = 737373;
 
     /// Minimum TimelockController delay on any production chain.
     uint256 internal constant MIN_PROD_TIMELOCK_DELAY = 48 hours;
-    /// Minimum delay on BSC testnet, so governance rehearsals take minutes (GLD-807).
+    /// Minimum delay on a rehearsal testnet, so governance rehearsals take minutes (GLD-807).
     uint256 internal constant MIN_TESTNET_TIMELOCK_DELAY = 5 minutes;
 
     /// @notice Gas one `isSanctioned` read may consume in {requireSanctionsOracleAnswers}
@@ -129,13 +132,20 @@ library DeployGuards {
         return block.chainid == ANVIL_CHAIN_ID || block.chainid == SEPOLIA_CHAIN_ID;
     }
 
+    /// @notice True ONLY for the public testnets that run every production guard with the
+    ///         timelock floor lowered to {MIN_TESTNET_TIMELOCK_DELAY}. ALLOWLIST, like
+    ///         {isDevChain}: any other chain keeps the 48 h floor.
+    function isRehearsalTestnet() internal view returns (bool) {
+        return block.chainid == BSC_TESTNET_CHAIN_ID || block.chainid == KATANA_BOKUTO_CHAIN_ID;
+    }
+
     /// @notice The timelock floor {requireProdMinDelay} and {assertTimelockSane} enforce.
     function minTimelockDelay() internal view returns (uint256) {
-        return block.chainid == BSC_TESTNET_CHAIN_ID ? MIN_TESTNET_TIMELOCK_DELAY : MIN_PROD_TIMELOCK_DELAY;
+        return isRehearsalTestnet() ? MIN_TESTNET_TIMELOCK_DELAY : MIN_PROD_TIMELOCK_DELAY;
     }
 
     function _minDelayLabel() private view returns (string memory) {
-        return block.chainid == BSC_TESTNET_CHAIN_ID ? "300s (5min)" : "172800s (48h)";
+        return isRehearsalTestnet() ? "300s (5min)" : "172800s (48h)";
     }
 
     /// @notice Reverts unless the current chain is a development chain.
@@ -194,8 +204,8 @@ library DeployGuards {
         revert(string.concat("DeployGuards: env var ", key, " is required on chainId ", vm.toString(block.chainid)));
     }
 
-    /// @notice On production, a timelock delay below {minTimelockDelay} (48h; 5 min on BSC
-    ///         testnet) is rejected before any gas is spent. `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the incident happened.
+    /// @notice On production, a timelock delay below {minTimelockDelay} (48h; 5 min on a
+    ///         {isRehearsalTestnet}) is rejected before any gas is spent. `TIMELOCK_DELAY_SECONDS=0` on a production L2 is exactly how the incident happened.
     function requireProdMinDelay(uint256 delay) internal view {
         if (isDevChain()) return;
         if (delay < minTimelockDelay()) {

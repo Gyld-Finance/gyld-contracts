@@ -18,27 +18,24 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @title KmsStack
-/// @notice Fresh BSC testnet (97) stack, every role its own AWS KMS key, production guards on
-///         (97 is not a dev chain; timelock floor 5 min). GLD-807. Runbook:
-///         docs/deploy/bsc-testnet.md; rehearsal: script-evm/simulate-kms-stack.sh.
+/// @notice Fresh stack on a rehearsal testnet (BSC testnet 97, Katana Bokuto 737373), every
+///         role its own AWS KMS key, production guards on (not a dev chain; timelock floor
+///         5 min). GLD-807, GLD-850. Runbook: docs/deploy/kms-stack.md; rehearsal:
+///         script-evm/simulate-kms-stack.sh <chain>.
 ///
 ///   runA()   --sender KMS_DEPLOYER   deployer + sanctions owner: SanctionsOracleMirror seeded
-///                                    with a live SDN probe, then DeployDevNet (delay 300 s)
+///                                    with a live SDN probe, then DeployDevNet (TIMELOCK_DELAY_SECONDS)
 ///   runB()   --sender KMS_GOVERNANCE schedules ONE batch: factory accept + CAT/C/KO deployToken
 ///   runC()   --sender KMS_DEPLOYER   after the delay: governance executes, NAV owner pushes,
-///                                    DeployAtomicSettlement (USDT), whitelist + inventory.
+///                                    DeployAtomicSettlement (CASH_TOKEN), whitelist + inventory.
 ///                                    Every step skips what is done: re-run to finish a partial C
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
-/// Env: script-evm/kms-roles.env (KMS_*), KMS_GOVERNANCE_SIG (from
+/// Env: script-evm/chains/<chain>.env (CHAIN_ID, CASH_TOKEN, CASH_DECIMALS,
+/// TIMELOCK_DELAY_SECONDS), script-evm/kms-roles.env (KMS_*), KMS_GOVERNANCE_SIG (from
 /// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC).
 contract KmsStack is Script {
-    uint256 internal constant BSC_TESTNET = 97;
-    uint256 internal constant TIMELOCK_DELAY = 5 minutes;
-    /// Real BSC testnet USDT, 18 decimals.
-    address internal constant USDT = 0x337610d27c682E347C9cD60BD4b3b107C9d34dDd;
-    uint8 internal constant CASH_DECIMALS = 18;
     uint256 internal constant MAX_QUOTE_DEVIATION_BPS = 200;
     uint256 internal constant MAX_NAV_AGE_SECS = 86_400;
     uint256 internal constant INVENTORY_PER_SERIES = 1_000e18;
@@ -88,6 +85,7 @@ contract KmsStack is Script {
             type(SanctionsOracleMirror).creationCode, abi.encode(r.governance, r.sanctionsOwner, address(0))
         );
         vm.broadcast(r.deployer);
+        // Salt name kept from GLD-807 so the deployed BSC mirror's address stays reproducible.
         SanctionsOracleMirror mirror = new SanctionsOracleMirror{
             salt: DeployGuards.vacantSalt("BscKmsStack:SanctionsOracleMirror", init)
         }(
@@ -108,7 +106,6 @@ contract KmsStack is Script {
         _setEnv("NAV_FEED_OWNER", r.navOwner);
         _setEnv("SANCTIONS_LIST", address(mirror));
         _setEnv("SANCTIONS_PROBE_FLAGGED", probe);
-        vm.setEnv("TIMELOCK_DELAY_SECONDS", vm.toString(TIMELOCK_DELAY));
         DeployDevNet d = new DeployDevNet();
         d.run(); // broadcasts as --sender (the deployer); stops with the factory hand-off pending
 
@@ -126,7 +123,7 @@ contract KmsStack is Script {
         _requireSender(r.governance);
         TokenFactory f = _factory();
         TimelockController tl = TimelockController(payable(f.pendingOwner()));
-        require(address(tl) != address(0), "BscKmsStack: factory has no pending owner (run A missing or B done)");
+        require(address(tl) != address(0), "KmsStack: factory has no pending owner (run A missing or B done)");
         for (uint256 i; i < N_SERIES; ++i) {
             DeployGuards.requireValidIsin(_bond(i).isin);
             DeployGuards.requireIsinVacant(address(f), _bond(i).isin);
@@ -153,8 +150,8 @@ contract KmsStack is Script {
         if (!tl.isOperationDone(id)) {
             if (!tl.isOperationReady(id)) {
                 uint256 at = tl.getTimestamp(id);
-                require(at != 0, "BscKmsStack: Phase 2 is not scheduled (run B)");
-                revert(string.concat("BscKmsStack: Phase 2 executable in ", vm.toString(at - block.timestamp), " s"));
+                require(at != 0, "KmsStack: Phase 2 is not scheduled (run B)");
+                revert(string.concat("KmsStack: Phase 2 executable in ", vm.toString(at - block.timestamp), " s"));
             }
             vm.broadcast(r.governance);
             tl.executeBatch(targets, values, payloads, bytes32(0), PHASE2_SALT);
@@ -175,7 +172,7 @@ contract KmsStack is Script {
         if (swap.code.length == 0) {
             // DeployAtomicSettlement's vacantSalt would revert on the impl forever: say why.
             _requireSwapStep(impl.code.length == 0, "proxy deploy (impl is on chain, the proxy is not)");
-            _setEnv("USDC_ADDRESS", USDT);
+            _setEnv("USDC_ADDRESS", vm.envAddress("CASH_TOKEN"));
             _setEnv("EVM_ISSUANCE_MANAGER", address(im));
             _setEnv("EVM_FACTORY_ADDRESS", address(f));
             _setEnv("TIMELOCK_ADDRESS", address(tl));
@@ -190,7 +187,7 @@ contract KmsStack is Script {
             vm.setEnv("MAX_NAV_AGE_SECS", vm.toString(MAX_NAV_AGE_SECS));
             DeployAtomicSettlement d = new DeployAtomicSettlement();
             d.run(); // broadcasts as --sender (the deployer); admin ends at the timelock
-            require(address(d.swap()) == swap, "BscKmsStack: swap landed off its predicted address");
+            require(address(d.swap()) == swap, "KmsStack: swap landed off its predicted address");
         }
         // Fail closed before any inventory moves: a swap deploy that stopped midway may still
         // be administered by the deployer.
@@ -225,7 +222,8 @@ contract KmsStack is Script {
         TimelockController tl = TimelockController(payable(f.owner()));
         address dep = r.deployer;
 
-        _check(tl.getMinDelay() == TIMELOCK_DELAY, "timelock minDelay == 300 s");
+        uint256 delay = vm.envUint("TIMELOCK_DELAY_SECONDS");
+        _check(tl.getMinDelay() == delay, string.concat("timelock minDelay == ", vm.toString(delay), " s"));
         _check(
             tl.hasRole(tl.PROPOSER_ROLE(), r.governance) && tl.hasRole(tl.CANCELLER_ROLE(), r.governance),
             "timelock PROPOSER + CANCELLER = KMS governance"
@@ -277,7 +275,11 @@ contract KmsStack is Script {
                 && !w.hasRole(w.ALLOWLIST_ADMIN_ROLE(), dep),
             "deployer holds no swap role"
         );
-        _check(w.usdc() == USDT && w.cashDecimals() == CASH_DECIMALS && !w.paused(), "swap cash = USDT, 18dp, unpaused");
+        uint256 dp = vm.envUint("CASH_DECIMALS");
+        _check(
+            w.usdc() == vm.envAddress("CASH_TOKEN") && w.cashDecimals() == dp && !w.paused(),
+            string.concat("swap cash = CASH_TOKEN, ", vm.toString(dp), "dp, unpaused")
+        );
 
         for (uint256 i; i < N_SERIES; ++i) {
             _verifySeries(r, f, im, w, address(tl), i);
@@ -362,7 +364,7 @@ contract KmsStack is Script {
                 r.ops,
                 r.quoteSigner,
                 r.treasurer,
-                USDT,
+                vm.envAddress("CASH_TOKEN"),
                 uint16(MAX_QUOTE_DEVIATION_BPS),
                 uint32(MAX_NAV_AGE_SECS)
             )
@@ -395,7 +397,7 @@ contract KmsStack is Script {
         if (!done) {
             revert(
                 string.concat(
-                    "BscKmsStack: swap deploy stopped midway - missing ",
+                    "KmsStack: swap deploy stopped midway - missing ",
                     step,
                     ". Finish the run C broadcast with --resume; nothing was whitelisted or minted"
                 )
@@ -411,7 +413,7 @@ contract KmsStack is Script {
         }
     }
 
-    /// Step 0 proof (check-kms-addresses.sh): the KMS governance key signed (EIP-191) chain 97,
+    /// Step 0 proof (check-kms-addresses.sh): the KMS governance key signed (EIP-191) the chain id,
     /// the full KMS address set and DEPLOY_SALT_TAG. Without it a mistyped KMS_GOVERNANCE
     /// would become the timelock's only proposer, and governance would be lost for good.
     function _requireGovernanceProof(Roles memory r) internal view {
@@ -451,7 +453,7 @@ contract KmsStack is Script {
     /// Every role from the KMS env file, pairwise distinct (stricter than the guards, which
     /// only split the quorum pairs).
     function _roles() internal view returns (Roles memory r) {
-        require(block.chainid == BSC_TESTNET, "BscKmsStack: BSC testnet (97) only");
+        require(block.chainid == vm.envUint("CHAIN_ID"), "KmsStack: block.chainid != CHAIN_ID (chains/<chain>.env)");
         r = Roles({
             deployer: vm.envAddress("KMS_DEPLOYER"),
             governance: vm.envAddress("KMS_GOVERNANCE"),
@@ -470,21 +472,21 @@ contract KmsStack is Script {
         });
         address[14] memory a = _addresses(r);
         for (uint256 i; i < a.length; ++i) {
-            require(a[i] != address(0), "BscKmsStack: a KMS_* address is zero");
+            require(a[i] != address(0), "KmsStack: a KMS_* address is zero");
             for (uint256 j = i + 1; j < a.length; ++j) {
-                require(a[i] != a[j], "BscKmsStack: two KMS roles share an address");
+                require(a[i] != a[j], "KmsStack: two KMS roles share an address");
             }
         }
     }
 
     function _factory() internal view returns (TokenFactory f) {
         f = TokenFactory(vm.envAddress("EVM_FACTORY_ADDRESS"));
-        require(address(f).code.length != 0, "BscKmsStack: EVM_FACTORY_ADDRESS has no code");
+        require(address(f).code.length != 0, "KmsStack: EVM_FACTORY_ADDRESS has no code");
     }
 
     /// The nested deploy scripts read their deployer from tx.origin (DeployGuards.broadcaster).
     function _requireSender(address who) internal view {
-        require(tx.origin == who, string.concat("BscKmsStack: run with --sender ", vm.toString(who)));
+        require(tx.origin == who, string.concat("KmsStack: run with --sender ", vm.toString(who)));
     }
 
     function _check(bool ok, string memory what) internal {

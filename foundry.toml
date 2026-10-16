@@ -17,6 +17,8 @@ remappings = [
 # BSC testnet (97) — production guards with a 5-min timelock floor (GLD-807). `--rpc-url bsc_testnet`.
 # Public endpoint, no key needed; pass `--rpc-url <url>` directly to use another provider.
 bsc_testnet = "https://bsc-testnet-rpc.publicnode.com"
+# Katana testnet "Bokuto" (737373) — same production guards and 5-min floor (GLD-850).
+katana_testnet = "https://rpc-bokuto.katanarpc.com"
 
 [etherscan]
 sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
@@ -28,6 +30,9 @@ sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-s
 # `forge verify-contract` works on a free key. Use the HYPHENATED table key: `--chain
 # bsc_testnet` is rejected by the CLI, `--chain bsc-testnet` is not.
 bsc-testnet = { key = "${ETHERSCAN_API_KEY}", chain = 97 }
+# Katana testnet "Bokuto" (katanascan) on Etherscan V2, same ETHERSCAN_API_KEY; `url` is
+# explicit in case the Foundry release does not know chain 737373.
+katana-testnet = { key = "${ETHERSCAN_API_KEY}", chain = 737373, url = "https://api.etherscan.io/v2/api?chainid=737373" }
 
 [fuzz]
 runs = 10000
