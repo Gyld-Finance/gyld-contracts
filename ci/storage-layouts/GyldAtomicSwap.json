@@ -99,6 +99,13 @@
       "offset": 0,
       "slot": 11,
       "type": "mapping(address => struct GyldAtomicSwap.NavRoundDraw)"
+    },
+    {
+      "bytes": 1,
+      "name": "cashDecimals",
+      "offset": 0,
+      "slot": 12,
+      "type": "uint8"
     }
   ],
   "namespace": "gyld.GyldAtomicSwap",
