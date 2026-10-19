@@ -308,13 +308,65 @@ contract KaleidoscopeNAVFeedTest is Test {
     // at the default and only `rangeGovernor` can move it. Both write paths read it.
 
     function test_answerRange_startsAtTheDefaultAndIsEvented() public {
-        assertEq(feed.minAnswer(), 1e7, "$0.10");
+        assertEq(feed.minAnswer(), 5e7, "$0.50");
         assertEq(feed.maxAnswer(), 2e8, "$2.00");
         assertEq(feed.rangeGovernor(), governor);
 
         vm.expectEmit(false, false, false, true);
-        emit KaleidoscopeNAVFeed.AnswerRangeUpdated(1e7, 2e8);
+        emit KaleidoscopeNAVFeed.AnswerRangeUpdated(5e7, 2e8);
         new KaleidoscopeNAVFeed(owner, "defaults", guardian, governor);
+    }
+
+    /// The default floor is exactly $0.50 on the routine path, first push included: one
+    /// unit under it is refused by name, the floor itself is accepted. The absolute $0.10
+    /// floor is only reachable once the timelock lowers the range.
+    function test_answerRange_defaultFloorIsExactlyFiftyCents_routinePath() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(5e7 - 1)));
+        feed.updateAnswer(5e7 - 1);
+
+        vm.prank(owner);
+        feed.updateAnswer(5e7);
+        assertEq(feed.latestAnswer(), 5e7, "$0.50 exactly is accepted");
+    }
+
+    /// The same $0.50 default floor binds the emergency path: one unit under it is refused
+    /// by name with a fully valid 2-of-2, and nothing is written or consumed.
+    function test_answerRange_defaultFloorIsExactlyFiftyCents_emergencyPath() public {
+        vm.warp(T0);
+        _seedPrice();
+
+        bytes memory sig = _ownerSig(5e7 - 1, FAR_FUTURE);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, int256(5e7 - 1)));
+        feed.emergencyUpdateAnswer(5e7 - 1, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), ANSWER, "nothing moved");
+        assertEq(feed.emergencyNonce(), 0, "and nothing was consumed");
+
+        sig = _ownerSig(5e7, FAR_FUTURE);
+        vm.prank(guardian);
+        feed.emergencyUpdateAnswer(5e7, FAR_FUTURE, sig);
+        assertEq(feed.latestAnswer(), 5e7, "$0.50 exactly is accepted");
+    }
+
+    /// The timelock can lower the default $0.50 floor all the way to the absolute $0.10,
+    /// but not one unit further; after lowering it, $0.10 is publishable.
+    function test_setAnswerRange_lowersTheDefaultFloorToTenCentsButNoFurther() public {
+        vm.prank(governor);
+        vm.expectRevert(
+            abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(1e7 - 1), uint256(2e8))
+        );
+        feed.setAnswerRange(1e7 - 1, 2e8);
+        assertEq(feed.minAnswer(), 5e7, "still the $0.50 default");
+
+        vm.prank(governor);
+        feed.setAnswerRange(1e7, 2e8);
+        assertEq(feed.minAnswer(), 1e7, "lowered to $0.10");
+        assertEq(feed.maxAnswer(), 2e8);
+
+        vm.prank(owner);
+        feed.updateAnswer(1e7);
+        assertEq(feed.latestAnswer(), 1e7, "$0.10 is now publishable");
     }
 
     /// The case Halborn raised: a series that has accreted to the default ceiling can keep
@@ -436,7 +488,7 @@ contract KaleidoscopeNAVFeedTest is Test {
             abi.encodeWithSelector(KaleidoscopeNAVFeed.InvalidAnswerRange.selector, uint256(1e7 - 1), uint256(5e8))
         );
         feed.setAnswerRange(1e7 - 1, 5e8);
-        assertEq(feed.minAnswer(), 1e7, "range unchanged");
+        assertEq(feed.minAnswer(), 5e7, "range unchanged");
     }
 
     /// One unit over the absolute ceiling, paired with the exact floor: refused, so the
@@ -470,19 +522,23 @@ contract KaleidoscopeNAVFeedTest is Test {
                 "refused by name"
             );
             assertTrue(newMin < 1e7 || newMax > 5e8 || newMin >= newMax, "and only when invalid");
-            assertEq(feed.minAnswer(), 1e7, "range unchanged");
+            assertEq(feed.minAnswer(), 5e7, "range unchanged");
             assertEq(feed.maxAnswer(), 2e8, "range unchanged");
         }
     }
 
-    /// The floor is absolute: a defaulted series is followed down to $0.10 and no further.
-    /// The timelock cannot slide the range below it, so a sub-$0.10 recovery value is
+    /// The floor is absolute: once the timelock lowers the $0.50 default floor, a defaulted
+    /// series is followed down to $0.10 and no further. The timelock cannot slide the range
+    /// below it, so a sub-$0.10 recovery value is
     /// refused by both write paths and never published — pause the bond token instead
     /// (test_TEST55_outOfRangeTruePrice_isRefusedByBothPaths).
     function test_setAnswerRange_cannotSlideTheFloorBelowTenCents() public {
+        vm.prank(governor);
+        feed.setAnswerRange(1e7, 2e8); // lowered from the $0.50 default to the absolute floor
+
         vm.warp(T0);
         vm.prank(owner);
-        feed.updateAnswer(1e7); // $0.10, the default floor — and the absolute one
+        feed.updateAnswer(1e7); // $0.10, the absolute floor
 
         vm.prank(governor);
         vm.expectRevert(
@@ -1539,15 +1595,16 @@ contract KaleidoscopeNAVFeedTest is Test {
     /// share ONE range, so every price the feed can publish is one emergency correction
     /// away (no gap left to ramp through at 10%/h), and the guardian pair still buys
     /// LATENCY, not REACH — the owner key alone reaches the same range by chaining +/-10%
-    /// hourly pushes (test_chainedUpdates_escapeTheBand); worst case $0.10 -> $2.00 is 32
-    /// pushes, and $0.10 -> $5.00 (the widest range the timelock can set) is 42. That is
+    /// hourly pushes (test_chainedUpdates_escapeTheBand); worst case $0.50 -> $2.00 across
+    /// the default range is 15 pushes, and $0.10 -> $5.00 (the widest range the timelock
+    /// can set) is 42. That is
     /// what separates this path from the unbounded one deleted as D-19.
     ///
     /// The shipped values are asserted on purpose: widening the range grows the one-step
     /// reach of the key pair, so retuning it — or the absolute bounds that cap every range
     /// the timelock can set — must break this test and force the argument to be re-made.
     function test_emergencyPathSharesTheRoutineRange() public view {
-        assertEq(feed.minAnswer(), 1e7, "minAnswer = $0.10");
+        assertEq(feed.minAnswer(), 5e7, "minAnswer = $0.50");
         assertEq(feed.maxAnswer(), 2e8, "maxAnswer = $2.00");
         assertEq(feed.ABSOLUTE_MIN_ANSWER(), 1e7, "ABSOLUTE_MIN_ANSWER = $0.10");
         assertEq(feed.ABSOLUTE_MAX_ANSWER(), 5e8, "ABSOLUTE_MAX_ANSWER = $5.00");
@@ -1572,7 +1629,7 @@ contract KaleidoscopeNAVFeedTest is Test {
         bytes memory sigLo = _ownerSig(floor_, FAR_FUTURE);
         vm.prank(guardian);
         feed.emergencyUpdateAnswer(floor_, FAR_FUTURE, sigLo);
-        assertEq(feed.latestAnswer(), floor_, "$0.10 exactly is accepted");
+        assertEq(feed.latestAnswer(), floor_, "$0.50 exactly is accepted");
 
         vm.warp(T0 + feed.EMERGENCY_COOLDOWN());
         bytes memory sigHi = _ownerSig(ceiling, FAR_FUTURE);
@@ -1633,37 +1690,51 @@ contract KaleidoscopeNAVFeedTest is Test {
     // ── Halborn TEST-55 (FIND-003): a market gap beyond the step limit ────────
     //
     // TEST-55 (Fail) expects the feed to "either reflect a market move larger than its step
-    // limit or stop presenting the clamped price as current". A gap outside the old $0.50-$2.00
-    // emergency band could only be ramped at 10%/h, and swaps settled against every
-    // known-wrong price on the way. Both write paths now share ONE range, so a gap anywhere
-    // inside it is published in one transaction, and a true price outside it is refused by
-    // both paths — never clamped into range and stamped as current.
+    // limit or stop presenting the clamped price as current". Before the fix the 2-of-2 path
+    // had its own `constant` $0.50-$2.00 band (emergency path only, unchangeable), so a gap
+    // outside it could only be ramped at 10%/h, and swaps settled against every known-wrong
+    // price on the way. Both write paths now share ONE range: $0.50-$2.00 by default, which
+    // the timelock can move anywhere inside $0.10-$5.00. A gap anywhere inside the live range
+    // is published in one transaction, and a true price outside it is refused by both
+    // paths — never clamped into range and stamped as current.
 
     int256 constant TEST55_NAV = 100_000_000; // $1.00, the NAV standard
     /// A short-lived owner signature, per the operational rule on emergencyUpdateAnswer.
     uint256 constant TEST55_DEADLINE = T0 + ONE_HOUR + 10 minutes;
 
     /// TEST-55 itself, and the reason Halborn reopened FIND-003: $1.00 -> $0.30, a 70% gap.
-    /// $0.30 is under the old $0.50 emergency floor, so the old 2-of-2 refused it and the
-    /// only route down was the 10%/h ramp, publishing known-wrong prices on the way. It is
-    /// above the shared $0.10 floor, so the 2-of-2 now publishes the true price in one
-    /// step. Keep the target under $0.50: a gap inside the old $0.50-$2.00
-    /// band passes on the reopened code too, and would pin nothing.
+    /// $0.30 is under the old `constant` $0.50 emergency-only floor, so the old 2-of-2
+    /// refused it for good and the only route down was the 10%/h ramp, publishing
+    /// known-wrong prices on the way. It is also under the new $0.50 DEFAULT floor, but that
+    /// floor is timelock-settable down to $0.10: the 2-of-2 refuses $0.30 by name (never
+    /// clamps it), the timelock lowers the range, and the same signature then publishes the
+    /// true price in one step. Keep the target under $0.50: a gap inside $0.50-$2.00 passes
+    /// on the reopened code too, and would pin nothing.
     function test_TEST55_marketGapBeyondStepLimit_isPublishedInOneStep() public {
-        int256 gapped = 30_000_000; // $0.30, under the old $0.50 emergency floor
+        int256 gapped = 30_000_000; // $0.30, under the $0.50 floor (old constant, new default)
         vm.warp(T0);
         vm.prank(owner);
         feed.updateAnswer(TEST55_NAV);
 
-        // The routine path refuses the gap a full interval later, so the step limit — not
-        // the clock — is what stops it.
+        bytes memory sig = _ownerSig(gapped, TEST55_DEADLINE);
+
+        // At the $0.50 default floor the 2-of-2 refuses it by name, consuming nothing.
         vm.warp(T0 + ONE_HOUR);
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.AnswerOutOfRange.selector, gapped));
+        feed.emergencyUpdateAnswer(gapped, TEST55_DEADLINE, sig);
+
+        // The timelock lowers the floor to the absolute $0.10 so the range admits $0.30.
+        vm.prank(governor);
+        feed.setAnswerRange(1e7, 2e8);
+
+        // The routine path refuses the gap a full interval later, so the step limit — not
+        // the clock or the range — is what stops it.
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(KaleidoscopeNAVFeed.PriceDeviationTooLarge.selector, gapped, TEST55_NAV));
         feed.updateAnswer(gapped);
 
         // No ramp is forced: guardian submits, owner co-signs, one transaction.
-        bytes memory sig = _ownerSig(gapped, TEST55_DEADLINE);
         vm.expectEmit(true, true, false, true, address(feed));
         emit AnswerUpdated(gapped, 2, T0 + ONE_HOUR);
         vm.expectEmit(true, true, false, true, address(feed));
@@ -1683,7 +1754,8 @@ contract KaleidoscopeNAVFeedTest is Test {
     }
 
     /// The upward sibling: $1.00 -> $1.90, a 90% gap (a seven-push ramp), in one step.
-    /// Old code passes this too ($1.90 was inside its $0.50-$2.00 band): the down-gap test
+    /// Old code passes this too ($1.90 was inside its constant emergency-only $0.50-$2.00
+    /// band; it is also inside the new default range): the down-gap test
     /// above is what distinguishes old from new.
     function test_TEST55_upwardGapBeyondStepLimit_isPublishedInOneStep() public {
         int256 gapped = 190_000_000; // $1.90
@@ -1712,14 +1784,14 @@ contract KaleidoscopeNAVFeedTest is Test {
     }
 
     /// A true price OUTSIDE the range: $1.00 -> $0.05. Both write paths refuse it by name.
-    /// Neither clamps it to the $0.10 floor, and nothing is written — no round, no fresh
+    /// Neither clamps it to the floor, and nothing is written — no round, no fresh
     /// timestamp — so the feed never re-stamps a wrong price as current: the last answer
     /// keeps its own `updatedAt` and ages out for every consumer that age-checks (isFresh,
     /// GyldAtomicSwap's StaleNav). Until then it is still served, as Chainlink serves a last
     /// answer, so ops pause the bond token. The timelock cannot admit $0.05 either
     /// (test_setAnswerRange_cannotSlideTheFloorBelowTenCents).
     function test_TEST55_outOfRangeTruePrice_isRefusedByBothPaths() public {
-        int256 trueNav = 5_000_000; // $0.05, under the $0.10 floor
+        int256 trueNav = 5_000_000; // $0.05, under the $0.50 default floor and the $0.10 absolute one
         vm.warp(T0);
         vm.prank(owner);
         feed.updateAnswer(TEST55_NAV);
@@ -1750,8 +1822,8 @@ contract KaleidoscopeNAVFeedTest is Test {
 
     // ── Emergency path — cooldown and resulting state ─────────────────────────
 
-    /// Without the cooldown the two keys would hold a $0.10 <-> $2.00 oscillation
-    /// primitive every block. With it they hold one arbitrary in-band jump per hour.
+    /// Without the cooldown the two keys would hold a $0.50 <-> $2.00 oscillation
+    /// primitive every block (up to $0.10 <-> $5.00 if the timelock widens the range). With it they hold one arbitrary in-band jump per hour.
     function test_emergency_secondCorrectionWithinCooldownReverts() public {
         vm.warp(T0);
         _seedPrice();

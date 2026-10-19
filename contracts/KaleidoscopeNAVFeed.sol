@@ -31,7 +31,7 @@ import {IUpstreamOracle} from "./interfaces/AggregatorV3Interface.sol";
 ///      below is sized for it. A $95 instrument needs its own feed (audit FIND-003).
 ///
 ///      Safety constraints:
-///        - minAnswer / maxAnswer: $0.10-$2.00, on BOTH paths and EVERY push including
+///        - minAnswer / maxAnswer: $0.50-$2.00, on BOTH paths and EVERY push including
 ///          the first. Below 10 the deviation guard can never pass again and the feed is
 ///          permanently stuck; far above, its arithmetic overflows. See ABSOLUTE_MIN_ANSWER.
 ///          Default range; only `rangeGovernor` may move it, within $0.10-$5.00.
@@ -136,9 +136,9 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     /// reject every push (audit FIND-020).
     uint256 public constant ABSOLUTE_MAX_ANSWER = 5e8;
 
-    /// The answer range both write paths enforce: $0.10-$2.00 at deploy (audit FIND-003).
+    /// The answer range both write paths enforce: $0.50-$2.00 at deploy (audit FIND-003).
     /// Changed only by `rangeGovernor`, within ABSOLUTE_MIN_ANSWER..ABSOLUTE_MAX_ANSWER.
-    uint128 public minAnswer = 1e7;
+    uint128 public minAnswer = 5e7;
     uint128 public maxAnswer = 2e8;
 
     /// @notice The only address that may change the answer range: the timelock. `immutable`,
@@ -369,9 +369,9 @@ contract KaleidoscopeNAVFeed is IUpstreamOracle, Ownable2Step, EIP712 {
     // ── Answer range (Halborn, raised on the FIND-003 remediation) ─────────────
 
     /// @notice Change the answer range. `rangeGovernor` (the timelock) only.
-    /// @dev    For a series whose true NAV outgrows the $0.10-$2.00 default (accretion), or
-    ///         to narrow the range. Requires ABSOLUTE_MIN_ANSWER <= newMin < newMax <=
-    ///         ABSOLUTE_MAX_ANSWER — never below $0.10, never above $5.00 — and the current
+    /// @dev    For a series whose true NAV leaves the $0.50-$2.00 default (accretion above
+    ///         $2.00, or a fall below $0.50), or to narrow the range. Requires
+    ///         ABSOLUTE_MIN_ANSWER <= newMin < newMax <= ABSOLUTE_MAX_ANSWER — never below $0.10, never above $5.00 — and the current
     ///         answer inside the new range, so the feed is never stranded.
     function setAnswerRange(uint256 newMin, uint256 newMax) external {
         if (msg.sender != rangeGovernor) revert NotRangeGovernor(msg.sender);
