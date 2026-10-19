@@ -33,7 +33,7 @@ import {DeployGuards} from "./lib/DeployGuards.sol";
 ///                        market reads from carries a mandatory delay. An EOA here means
 ///                        one key can silently swap the price source under Morpho/Aave.
 ///                        Also the feed's `rangeGovernor`: the only address that may move
-///                        its answer range ($0.50-$2.00 default) within $0.10-$5.00.
+///                        its answer range ($0.30-$2.00 default) within $0.10-$5.00.
 ///
 /// ── Usage — Anvil (local) ──────────────────────────────────────────────────
 ///   anvil &
