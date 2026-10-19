@@ -41,6 +41,14 @@ contract GuardsHarness {
         return DeployGuards.saltFor(name);
     }
 
+    function saltFor(string memory name, string memory tag) external view returns (bytes32) {
+        return DeployGuards.saltFor(name, tag);
+    }
+
+    function requireProdMinDelay(uint256 delay) external view {
+        DeployGuards.requireProdMinDelay(delay);
+    }
+
     /// The guard is `internal view` on a library, so a test can only reach it through a
     /// wrapper — and it has to be an EXTERNAL one for the same CHAINID reason as above:
     /// {DeployGuards.requireSanctionsOracleAnswers} short-circuits on `isDevChain()`.
@@ -109,6 +117,51 @@ contract DeployGuardsTest is ScriptRevertAsserts {
                 string.concat("chainId ", vm.toString(production[i]), " must be treated as production")
             );
         }
+    }
+
+    /// Catches (GLD-850): Katana Bokuto (737373) missing the rehearsal floor or joining the
+    /// dev allowlist, or the floor leaking to Katana mainnet (747474), BSC testnet (97) or
+    /// any other chain.
+    function test_requireProdMinDelay_isFiveMinutesOnKatanaBokutoOnly() public {
+        assertFalse(_isDev(737373), "Katana Bokuto (737373) must take the production path (GLD-850)");
+        vm.chainId(737373);
+        harness.requireProdMinDelay(300);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s minimum on production chainId 737373"
+            )
+        );
+        harness.requireProdMinDelay(299);
+
+        vm.chainId(97);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s minimum on production chainId 97"
+            )
+        );
+        harness.requireProdMinDelay(300);
+
+        vm.chainId(747474);
+        vm.expectRevert(
+            bytes(
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s minimum on production chainId 747474"
+            )
+        );
+        harness.requireProdMinDelay(300);
+        harness.requireProdMinDelay(48 hours);
+    }
+
+    /// Catches (GLD-807): DEPLOY_SALT_TAG moving the addresses of existing stacks (an empty
+    /// tag must reproduce the pre-tag salt) or failing to move a fresh one.
+    function test_saltFor_tagIsOptional_andScopesAFreshStack() public {
+        vm.chainId(737373);
+        string memory name = "DeployDevNet:GyldBondToken.impl";
+        assertEq(
+            harness.saltFor(name, ""),
+            keccak256(abi.encodePacked("gyld.v1", name, uint256(737373))),
+            "empty tag moved a salt"
+        );
+        assertTrue(harness.saltFor(name, "kms1") != harness.saltFor(name, ""), "tag did not change the salt");
     }
 
     /// Catches: the same bootstrap contract landing on the SAME address on two chains.
@@ -594,7 +647,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
             address(new DeployDevNet()),
-            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s (48h) minimum on production chainId 8453"
+            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s minimum on production chainId 8453"
         );
     }
 
@@ -880,7 +933,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
             address(new DeployTimelock()),
-            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s (48h) minimum on production chainId 8453"
+            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s minimum on production chainId 8453"
         );
     }
 
@@ -941,7 +994,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _atomicProdEnv();
         _setAddr("TIMELOCK_ADDRESS", address(_timelock(0, DEFAULT_SENDER)));
         _expectRunRevert(
-            address(new DeployAtomicSettlement()), "minDelay is 0s, below the 172800s (48h) production minimum"
+            address(new DeployAtomicSettlement()), "minDelay is 0s, below the 172800s production minimum"
         );
     }
 
