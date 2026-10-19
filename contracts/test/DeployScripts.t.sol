@@ -128,7 +128,7 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         harness.requireProdMinDelay(300);
         vm.expectRevert(
             bytes(
-                "DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s (5min) minimum on production chainId 737373"
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=299 is below the 300s minimum on production chainId 737373"
             )
         );
         harness.requireProdMinDelay(299);
@@ -136,7 +136,7 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         vm.chainId(97);
         vm.expectRevert(
             bytes(
-                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 97"
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s minimum on production chainId 97"
             )
         );
         harness.requireProdMinDelay(300);
@@ -144,7 +144,7 @@ contract DeployGuardsTest is ScriptRevertAsserts {
         vm.chainId(747474);
         vm.expectRevert(
             bytes(
-                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s (48h) minimum on production chainId 747474"
+                "DeployGuards: TIMELOCK_DELAY_SECONDS=300 is below the 172800s minimum on production chainId 747474"
             )
         );
         harness.requireProdMinDelay(300);
@@ -647,7 +647,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
             address(new DeployDevNet()),
-            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s (48h) minimum on production chainId 8453"
+            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s minimum on production chainId 8453"
         );
     }
 
@@ -933,7 +933,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         vm.setEnv("TIMELOCK_DELAY_SECONDS", "0");
         _expectRunRevert(
             address(new DeployTimelock()),
-            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s (48h) minimum on production chainId 8453"
+            "TIMELOCK_DELAY_SECONDS=0 is below the 172800s minimum on production chainId 8453"
         );
     }
 
@@ -994,7 +994,7 @@ contract DeployScriptsTest is ScriptRevertAsserts {
         _atomicProdEnv();
         _setAddr("TIMELOCK_ADDRESS", address(_timelock(0, DEFAULT_SENDER)));
         _expectRunRevert(
-            address(new DeployAtomicSettlement()), "minDelay is 0s, below the 172800s (48h) production minimum"
+            address(new DeployAtomicSettlement()), "minDelay is 0s, below the 172800s production minimum"
         );
     }
 

@@ -143,7 +143,7 @@ library DeployGuards {
     }
 
     function _minDelayLabel() private view returns (string memory) {
-        return isRehearsalTestnet() ? "300s (5min)" : "172800s (48h)";
+        return string.concat(vm.toString(minTimelockDelay()), "s");
     }
 
     /// @notice Reverts unless the current chain is a development chain.
