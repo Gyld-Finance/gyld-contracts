@@ -108,3 +108,82 @@ three series registered with NAV in range, feed owner = KMS NAV owner, 1,000 tok
 inventory each; swap whitelisted.
 
 After the real deploy, write the `@@` addresses to `docs/deploy/bsc-testnet-addresses.env`.
+
+## Fordefi vaults (GLD-978)
+
+The same stack with every role on its own Fordefi vault **at deploy** ("Option 2"):
+`script-bsc/BscFordefiStack.s.sol`, vaults in `script-bsc/fordefi-roles.bsc-testnet.env`,
+rehearsal `script-bsc/simulate-fordefi-stack.sh` (must end `SIMULATION GREEN`). The **KMS
+deployer** (`STACK_DEPLOYER` = `KMS_DEPLOYER`) signs every deploy exactly as in the KMS flow and
+holds no role afterwards; Fordefi signs only what a role vault must (and nothing anyone may
+send: the timelock's `executeBatch` goes from the deployer). Layout differences from KMS:
+`FORDEFI_SWAP_PAUSE` = swap PAUSER **and** ISSUANCE_PAUSER; `FORDEFI_WHITELISTER` =
+WHITELIST_ADMIN **and** swap ALLOWLIST_ADMIN; `FORDEFI_FREEZE` = token PAUSER + DOCUMENT, NAV
+`emergencyUpdater`; no user-withdrawal role. All other addresses pairwise distinct.
+
+Each sub-phase has one signer kind; run them in order, each confirmed before the next starts:
+
+| # | Sub-phase | Signer | Txs | Fordefi approvals |
+|---|---|---|---|---|
+| 0 | `governanceProofMessage()` | Contract Admin `personal_sign` | 0 | 1 (3-of-4) |
+| 1 | `runA1()` mirror | KMS deployer | 1 | – |
+| 2 | `runA2()` seed SDN probe | Blocklist Updater | 1 | 1 |
+| 3 | `runA3()` DeployDevNet | KMS deployer | 14 | – |
+| 4 | `runB()` `scheduleBatch` | Contract Admin | 1 | 1 (3-of-4) |
+| – | wait ≥ 300 s after 4 is mined | | | |
+| 5 | `runC1()` `executeBatch` | KMS deployer | 1 | – |
+| 6 | `runC2()` NAV × 3 | NAV Feeder | 3 | auto-approve |
+| 7 | `runC3()` DeployAtomicSettlement | KMS deployer | 11 | – |
+| 8 | `runC4()` whitelist swap + mint × 3 | Whitelister 1, Subscriber 3 | 4 | 4 |
+
+```bash
+set -a; . script-bsc/kms-roles.bsc-testnet.env; . script-bsc/fordefi-roles.bsc-testnet.env
+. tools/fordefi-replay/roles.env; set +a                               # vaults, then API creds
+export AWS_REGION=eu-west-2 AWS_KMS_KEY_IDS=$KMS_DEPLOYER_KEY_ID RPC=https://bsc-testnet-rpc.publicnode.com
+export DEPLOY_SALT_TAG=<fresh tag> NAV_ANSWER_8DP=100000000
+export SANCTIONS_PROBE_FLAGGED=0x0000000000000000000000000000000000000BAD   # synthetic: Fordefi refuses real SDN addresses in calldata
+# Run this block in bash (`bash`), not zsh.
+F="script-bsc/BscFordefiStack.s.sol:BscFordefiStack" D=broadcast/BscFordefiStack.s.sol/97/dry-run
+KMS=(--sender "$STACK_DEPLOYER" --rpc-url "$RPC" --aws --slow --legacy --with-gas-price 0.1gwei)
+R="node tools/fordefi-replay/replay.mjs"
+kms() { forge script "$F" --sig "$1" "${KMS[@]}" "${@:2}"; }  # dry run; read it, then again with --broadcast
+fordefi() {  # a stale journal must never be shown as the plan to approve
+  local j="$D/${1%%(*}-latest.json"; rm -f "$j"
+  forge script "$F" --sig "$1" --sender "$2" --rpc-url "$RPC" || return
+  if [ -f "$j" ]; then $R "$j"; else echo "nothing to send"; fi
+}
+# fordefi = dry run (never --broadcast) + plan table and PLAN_SHA256; a second person approves the
+# hash, then: PLAN_SHA256=<hash> $R $D/<sig>-latest.json --execute   (sends through Fordefi)
+
+# 0 — the 32 bytes binding chain 97, every address (deployer included), the layout tag and
+# DEPLOY_SALT_TAG; Contract Admin personal_signs the RAW bytes. runA1/runA3 revert without it.
+forge script $F --sig 'governanceProofMessage()' --rpc-url $RPC
+export FORDEFI_GOVERNANCE_SIG=$(node tools/fordefi-replay/sign-message.mjs 0x<the 32 bytes>)
+
+kms 'runA1()'; kms 'runA1()' --broadcast                    # 1
+fordefi 'runA2()' $FORDEFI_BLOCKLIST_UPDATER                # 2, then --execute runA2
+kms 'runA3()'; kms 'runA3()' --broadcast                    # 3; export EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (@@)
+fordefi 'runB()' $FORDEFI_CONTRACT_ADMIN                    # 4, then --execute runB; wait >= 300 s
+kms 'runC1()'; kms 'runC1()' --broadcast                    # 5 (refuses with the seconds left if early)
+fordefi 'runC2()' $FORDEFI_NAV_FEEDER                       # 6, then --execute runC2
+kms 'runC3()'; kms 'runC3()' --broadcast                    # 7
+fordefi 'runC4()' $FORDEFI_WHITELISTER                      # 8, then --execute runC4; export EVM_ATOMIC_SWAP_ADDRESS (@@)
+forge script $F --sig 'verify()' --rpc-url $RPC
+```
+
+runA2 and runC1–runC4 skip what is on chain, so re-dry-running a finished one plans 0 tx;
+runA1, runA3 and runB refuse a re-run once done (occupied CREATE2 address, batch already
+scheduled) — a safe revert, not a failure. A KMS
+broadcast that stopped midway finishes with `--resume`, a replay by re-running `--execute`.
+The replay refuses any `from` that is not a mapped vault, so a deployer tx can never reach
+Fordefi; forge `--aws` holds only the deployer key, so a vault tx can never reach KMS. All-Fordefi
+instead (no KMS): set `STACK_DEPLOYER` and `FORDEFI_DEPLOYER_ADDRESS` to a Fordefi Deployer vault
+and run the KMS sub-phases as `fordefi` too.
+
+Fordefi: Contract Admin stays 3-of-4 (steps 0 and 4: line approvers up first); NAV Feeder
+auto-approves; Blocklist Updater, Whitelister and Subscriber approve per their vault policy.
+No Fordefi Deployer vault or temporary allow rule is needed.
+
+Rehearsal: 36 tx / 24.0 M gas — KMS deployer 27 (23.2 M), Contract Admin 1, NAV Feeder 3,
+Subscriber 3, Whitelister 1, Blocklist Updater 1. Fund the deployer and those five vaults as in
+the KMS table.
