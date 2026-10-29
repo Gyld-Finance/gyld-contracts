@@ -29,7 +29,8 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 ///                                    with a live SDN probe, then DeployDevNet (TIMELOCK_DELAY_SECONDS)
 ///   runB()   --sender KMS_GOVERNANCE schedules ONE batch: factory accept + CAT/C/KO deployToken
 ///   runC()   --sender KMS_DEPLOYER   after the delay: governance executes, NAV owner pushes,
-///                                    DeployAtomicSettlement (CASH_TOKEN), whitelist + inventory.
+///                                    DeployAtomicSettlement (CASH_TOKEN), swap whitelisted; no
+///                                    inventory (the platform's fund-inventory route mints it).
 ///                                    Every step skips what is done: re-run to finish a partial C
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
@@ -40,7 +41,6 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 contract KmsStack is Script {
     uint256 internal constant MAX_QUOTE_DEVIATION_BPS = 200;
     uint256 internal constant MAX_NAV_AGE_SECS = 86_400;
-    uint256 internal constant INVENTORY_PER_SERIES = 1_000e18;
     bytes32 internal constant PHASE2_SALT = keccak256("GLD-807.phase2");
     uint256 internal constant N_SERIES = 3;
     /// Step 0's proof that KMS_GOVERNANCE is a key we control (same tag as the rotation, PR #25).
@@ -137,7 +137,7 @@ contract KmsStack is Script {
         console.log("Phase 2 scheduled; executable after %d s", delay);
     }
 
-    // ══ Run C — execute, NAV, swap, inventory ════════════════════════════════
+    // ══ Run C — execute, NAV, swap, whitelist ════════════════════════════════
 
     function runC() external {
         Roles memory r = _roles();
@@ -191,19 +191,17 @@ contract KmsStack is Script {
             d.run(); // broadcasts as --sender (the deployer); admin ends at the timelock
             require(address(d.swap()) == swap, "KmsStack: swap landed off its predicted address");
         }
-        // Fail closed before any inventory moves: a swap deploy that stopped midway may still
+        // Fail closed before the swap is whitelisted: a swap deploy that stopped midway may still
         // be administered by the deployer.
         _requireSwapComplete(r, GyldAtomicSwap(swap), tokens, address(tl));
 
+        // Whitelisted so it can receive inventory. GLD-1054: the script mints NO inventory. A
+        // mint outside the platform never reaches its ledger, and supply reconciliation then
+        // halts every series; fund it through the platform's POST /admin/swap/fund-inventory.
         if (!im.whitelisted(swap)) {
             vm.broadcast(r.whitelistAdmin); // the deployer holds no WHITELIST_ADMIN_ROLE
             im.addToWhitelist(swap);
         }
-        vm.startBroadcast(r.subscriber);
-        for (uint256 i; i < N_SERIES; ++i) {
-            if (GyldBondToken(tokens[i]).balanceOf(swap) == 0) im.subscribe(tokens[i], swap, INVENTORY_PER_SERIES);
-        }
-        vm.stopBroadcast();
 
         console.log("=== run C done ===");
         _kv("EVM_ATOMIC_SWAP_ADDRESS", swap);
@@ -324,9 +322,8 @@ contract KmsStack is Script {
             )
         );
         _check(
-            w.registeredSeries(address(t)) && w.navForwarderOf(address(t)) == address(fw)
-                && t.balanceOf(address(w)) == INVENTORY_PER_SERIES,
-            string.concat(p, "registered on the swap; 1000 tokens inventory")
+            w.registeredSeries(address(t)) && w.navForwarderOf(address(t)) == address(fw),
+            string.concat(p, "registered on the swap")
         );
     }
 
