@@ -104,10 +104,10 @@ AWS_KMS_KEY_IDS=$KMS_GOVERNANCE_KEY_ID $B --broadcast   # send
 
 # Wait >= TIMELOCK_DELAY_SECONDS (run C fails fast with the remaining seconds if run early).
 # Run C — governance executes, NAV owner pushes NAV, deployer DeployAtomicSettlement
-# (CASH_TOKEN, no takers, admin -> timelock), whitelist admin whitelists the swap,
-# subscriber mints 1,000 tokens of inventory per series into it.
+# (CASH_TOKEN, no takers, admin -> timelock), whitelist admin whitelists the swap. No
+# inventory is minted here: fund it through the platform's fund-inventory route (GLD-1054).
 C="forge script $F --sig runC() --sender $KMS_DEPLOYER $OPTS"
-KEYS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID,$KMS_SUBSCRIBER_KEY_ID
+KEYS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID
 AWS_KMS_KEY_IDS=$KEYS $C               # dry run
 AWS_KMS_KEY_IDS=$KEYS $C --broadcast   # send
 export EVM_ATOMIC_SWAP_ADDRESS=<@@ line>
@@ -118,7 +118,7 @@ forge script $F --sig 'verify()' --rpc-url $RPC_URL
 
 Interrupted mid-broadcast? Re-running run C finishes it — each step is skipped once on
 chain, and a finished C sends nothing — unless the swap deploy stopped midway: then run C
-stops with the missing step and whitelists/mints nothing; finish it with `--resume`. For
+stops with the missing step and whitelists nothing; finish it with `--resume`. For
 A or B, finish with the same command plus `--resume`.
 
 `verify` asserts: timelock `minDelay == TIMELOCK_DELAY_SECONDS`, governance sole
@@ -126,7 +126,6 @@ proposer/canceller, executors open, deployer holds no role on the timelock,
 IssuanceManager, mirror, swap or tokens; factory owned by the timelock with nothing
 pending; `sanctionsList` is the mirror, which flags the probe and not the deployer; swap
 cash = `CASH_TOKEN`, whose `decimals()` is `CASH_DECIMALS`; every role on its KMS key; three series registered
-with NAV in range, feed owner = KMS NAV owner, 1,000 tokens of inventory each; swap
-whitelisted.
+with NAV in range, feed owner = KMS NAV owner; swap whitelisted.
 
 After the real deploy, write the `@@` addresses to `docs/deploy/$CHAIN-addresses.env`.
