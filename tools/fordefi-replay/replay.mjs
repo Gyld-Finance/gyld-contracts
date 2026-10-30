@@ -21,9 +21,8 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { CHAIN_ID, NotSent, assertCredentials, readProvider, signerLabel, vaultApi, vaultLabels } from "./fordefi.mjs";
+import { CHAIN_ID, EXPLORER, NotSent, assertCredentials, readProvider, signerLabel, vaultApi, vaultLabels } from "./fordefi.mjs";
 
-const EXPLORER = process.env.EXPLORER_TX_URL ?? "https://testnet.bscscan.com/tx/";
 const RECEIPT_TIMEOUT_MS = Number(process.env.RECEIPT_TIMEOUT_MS ?? 600_000);
 
 const [planPath, ...flags] = process.argv.slice(2);

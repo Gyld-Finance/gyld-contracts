@@ -16,6 +16,8 @@ import {SanctionsOracleMirror} from "../contracts/SanctionsOracleMirror.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {ISanctionsList} from "../contracts/interfaces/ISanctionsList.sol";
 
 /// @title BscKmsStack
 /// @notice Fresh BSC testnet (97) stack, every role its own AWS KMS key, production guards on
@@ -34,11 +36,21 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 /// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), KMS_GOVERNANCE_SIG (from
 /// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC). The same stack on Fordefi vaults: BscFordefiStack.
+///
+/// 97 uses the constants below. 56 (BscFordefiStack only) reads them from env, fail closed:
+/// CASH_TOKEN, TIMELOCK_DELAY_SECONDS (48 h..7 d), SANCTIONS_FORWARDING_ORACLE, a
+/// SANCTIONS_PROBE_FLAGGED it flags, NAV_ANSWER_8DP_<TAG>, BOND_<i>_* (see _envBond).
 contract BscKmsStack is Script {
     uint256 internal constant BSC_TESTNET = 97;
+    uint256 internal constant BSC_MAINNET = 56;
     uint256 internal constant TIMELOCK_DELAY = 5 minutes;
+    /// 56: sanity cap on TIMELOCK_DELAY_SECONDS (a typo such as 1728000 would freeze governance).
+    uint256 internal constant MAX_TIMELOCK_DELAY = 7 days;
     /// Real BSC testnet USDT, 18 decimals.
     address internal constant USDT = 0x337610d27c682E347C9cD60BD4b3b107C9d34dDd;
+    /// BSC mainnet cash legs, both 18 decimals; CASH_TOKEN must name one of them.
+    address internal constant USDT_BSC = 0x55d398326f99059fF775485246999027B3197955;
+    address internal constant USDC_BSC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
     uint8 internal constant CASH_DECIMALS = 18;
     uint256 internal constant MAX_QUOTE_DEVIATION_BPS = 200;
     uint256 internal constant MAX_NAV_AGE_SECS = 86_400;
@@ -92,7 +104,7 @@ contract BscKmsStack is Script {
     function _deployMirror(Roles memory r) internal {
         vm.broadcast(r.deployer);
         new SanctionsOracleMirror{salt: DeployGuards.vacantSalt("BscKmsStack:SanctionsOracleMirror", _mirrorInit(r))}(
-            r.governance, r.sanctionsOwner, address(0)
+            r.governance, r.sanctionsOwner, _forwardingOracle()
         );
     }
 
@@ -101,7 +113,7 @@ contract BscKmsStack is Script {
     function _seedMirror(Roles memory r) internal {
         SanctionsOracleMirror mirror = _mirror(r);
         address[] memory seed = new address[](1);
-        seed[0] = vm.envAddress("SANCTIONS_PROBE_FLAGGED");
+        seed[0] = _probe();
         if (mirror.isSanctioned(seed[0])) return;
         vm.broadcast(r.sanctionsOwner);
         mirror.addToSanctionsList(seed);
@@ -118,8 +130,8 @@ contract BscKmsStack is Script {
         _setEnv("ISSUANCE_PAUSER", r.issuancePauser);
         _setEnv("NAV_FEED_OWNER", r.navOwner);
         _setEnv("SANCTIONS_LIST", mirror);
-        _setEnv("SANCTIONS_PROBE_FLAGGED", vm.envAddress("SANCTIONS_PROBE_FLAGGED"));
-        vm.setEnv("TIMELOCK_DELAY_SECONDS", vm.toString(TIMELOCK_DELAY));
+        _setEnv("SANCTIONS_PROBE_FLAGGED", _probe());
+        vm.setEnv("TIMELOCK_DELAY_SECONDS", vm.toString(_timelockDelay()));
         DeployDevNet d = new DeployDevNet();
         d.run();
 
@@ -130,9 +142,9 @@ contract BscKmsStack is Script {
         _kv("EVM_ISSUANCE_MANAGER", address(d.issuanceMgr()));
     }
 
-    function _mirrorInit(Roles memory r) internal pure returns (bytes memory) {
+    function _mirrorInit(Roles memory r) internal view returns (bytes memory) {
         return abi.encodePacked(
-            type(SanctionsOracleMirror).creationCode, abi.encode(r.governance, r.sanctionsOwner, address(0))
+            type(SanctionsOracleMirror).creationCode, abi.encode(r.governance, r.sanctionsOwner, _forwardingOracle())
         );
     }
 
@@ -157,6 +169,13 @@ contract BscKmsStack is Script {
         for (uint256 i; i < N_SERIES; ++i) {
             DeployGuards.requireValidIsin(_bond(i).isin);
             DeployGuards.requireIsinVacant(address(f), _bond(i).isin);
+            for (uint256 j = i + 1; _isMainnet() && j < N_SERIES; ++j) { // 56: env bonds, a duplicate reverts only at execute
+                require(
+                    keccak256(bytes(_bond(i).isin)) != keccak256(bytes(_bond(j).isin))
+                        && keccak256(bytes(_bond(i).tag)) != keccak256(bytes(_bond(j).tag)),
+                    "BscKmsStack: two bonds share an ISIN or tag"
+                );
+            }
         }
         (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _phase2(f, r);
         uint256 delay = tl.getMinDelay();
@@ -195,13 +214,12 @@ contract BscKmsStack is Script {
 
     /// First NAV push per series: registerSeries refuses an unpriced feed.
     function _pushNav(Roles memory r) internal {
-        int256 nav = int256(vm.envUint("NAV_ANSWER_8DP"));
         TokenFactory f = _factory();
         address[N_SERIES] memory tokens = _tokens(f);
         vm.startBroadcast(r.navOwner);
         for (uint256 i; i < N_SERIES; ++i) {
             KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(f.navFeedOf(tokens[i]));
-            if (!_priced(feed)) feed.updateAnswer(nav);
+            if (!_priced(feed)) feed.updateAnswer(_nav(i));
         }
         vm.stopBroadcast();
     }
@@ -218,7 +236,7 @@ contract BscKmsStack is Script {
         for (uint256 i; i < N_SERIES; ++i) {
             series = string.concat(series, i == 0 ? "" : ",", vm.toString(tokens[i]));
         }
-        _setEnv("USDC_ADDRESS", USDT);
+        _setEnv("USDC_ADDRESS", _cash());
         _setEnv("EVM_ISSUANCE_MANAGER", vm.envAddress("EVM_ISSUANCE_MANAGER"));
         _setEnv("EVM_FACTORY_ADDRESS", address(f));
         _setEnv("TIMELOCK_ADDRESS", f.owner());
@@ -279,7 +297,10 @@ contract BscKmsStack is Script {
         TimelockController tl = TimelockController(payable(f.owner()));
         address dep = r.deployer;
 
-        _check(tl.getMinDelay() == TIMELOCK_DELAY, "timelock minDelay == 300 s");
+        _check(
+            tl.getMinDelay() == _timelockDelay(),
+            string.concat("timelock minDelay == ", vm.toString(_timelockDelay()), " s")
+        );
         _check(
             tl.hasRole(tl.PROPOSER_ROLE(), r.governance) && tl.hasRole(tl.CANCELLER_ROLE(), r.governance),
             "timelock PROPOSER + CANCELLER = governance"
@@ -295,11 +316,11 @@ contract BscKmsStack is Script {
         SanctionsOracleMirror m = SanctionsOracleMirror(f.sanctionsList());
         _check(
             m.hasRole(m.DEFAULT_ADMIN_ROLE(), r.governance) && m.hasRole(m.SANCTIONS_UPDATER_ROLE(), r.sanctionsOwner)
-                && address(m.forwardingOracle()) == address(0),
-            "sanctionsList = SanctionsOracleMirror (admin governance, updater sanctions owner, no forwarding)"
+                && address(m.forwardingOracle()) == _forwardingOracle(),
+            "sanctionsList = SanctionsOracleMirror (admin governance, updater sanctions owner, forwarding as configured)"
         );
         _check(
-            m.isSanctioned(vm.envAddress("SANCTIONS_PROBE_FLAGGED")) && !m.isSanctioned(dep)
+            m.isSanctioned(_probe()) && !m.isSanctioned(dep)
                 && !m.hasRole(m.DEFAULT_ADMIN_ROLE(), dep) && !m.hasRole(m.SANCTIONS_UPDATER_ROLE(), dep),
             "mirror flags the SDN probe, not the deployer; deployer holds no mirror role"
         );
@@ -331,7 +352,10 @@ contract BscKmsStack is Script {
                 && !w.hasRole(w.ALLOWLIST_ADMIN_ROLE(), dep),
             "deployer holds no swap role"
         );
-        _check(w.usdc() == USDT && w.cashDecimals() == CASH_DECIMALS && !w.paused(), "swap cash = USDT, 18dp, unpaused");
+        _check(
+            w.usdc() == _cash() && w.cashDecimals() == CASH_DECIMALS && !w.paused(),
+            "swap cash = configured cash token, 18dp, unpaused"
+        );
 
         for (uint256 i; i < N_SERIES; ++i) {
             _verifySeries(r, f, im, w, address(tl), i);
@@ -342,8 +366,9 @@ contract BscKmsStack is Script {
     function _verifySeries(Roles memory r, TokenFactory f, IssuanceManager im, GyldAtomicSwap w, address tl, uint256 i)
         internal
     {
-        string memory p = string.concat(_bond(i).tag, ": ");
-        GyldBondToken t = GyldBondToken(f.tokenByIsin(_bond(i).isin));
+        Bond memory b = _bond(i);
+        string memory p = string.concat(b.tag, ": ");
+        GyldBondToken t = GyldBondToken(f.tokenByIsin(b.isin));
         KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(f.navFeedOf(address(t)));
         NAVFeedForwarder fw = NAVFeedForwarder(f.forwarderOf(address(t)));
         address dep = r.deployer;
@@ -355,12 +380,24 @@ contract BscKmsStack is Script {
                 && !t.hasRole(t.DOCUMENT_ROLE(), dep),
             string.concat(p, "token admin timelock, minter IssuanceManager, pauser + document ops, deployer none")
         );
+        if (_isMainnet()) _check(
+            keccak256(bytes(t.name())) == keccak256(bytes(b.name)) && keccak256(bytes(t.symbol())) == keccak256(bytes(b.cusip))
+                && keccak256(bytes(t.isin())) == keccak256(bytes(b.isin)) && t.maturityTimestamp() == b.maturity,
+            string.concat(p, "token \"", b.name, "\" / ", b.cusip, " / ", b.isin, " / maturity ", vm.toString(b.maturity))
+        );
         _check(
             feed.owner() == r.navOwner && feed.pendingOwner() == address(0) && feed.emergencyUpdater() == r.ops
                 && feed.rangeGovernor() == tl && fw.owner() == tl && fw.upstreamOracle() == address(feed),
             string.concat(p, "feed owner NAV owner, guardian ops, range governor + forwarder owner timelock")
         );
         (, int256 answer,, uint256 updatedAt,) = fw.latestRoundData();
+        if (_isMainnet()) {
+            (, int256 feedAnswer,,,) = feed.latestRoundData();
+            _check(
+                answer == _nav(i) && feedAnswer == answer,
+                string.concat(p, "NAV feed + forwarder answer == configured first NAV ", vm.toString(_nav(i)))
+            );
+        }
         _check(
             updatedAt != 0 && answer >= int256(uint256(feed.minAnswer()))
                 && answer <= int256(uint256(feed.maxAnswer())),
@@ -416,7 +453,7 @@ contract BscKmsStack is Script {
                 r.swapPauser,
                 r.quoteSigner,
                 r.treasurer,
-                USDT,
+                _cash(),
                 uint16(MAX_QUOTE_DEVIATION_BPS),
                 uint32(MAX_NAV_AGE_SECS)
             )
@@ -515,10 +552,94 @@ contract BscKmsStack is Script {
         ];
     }
 
-    function _bond(uint256 i) internal pure returns (Bond memory) {
+    function _bond(uint256 i) internal view returns (Bond memory) {
+        if (_isMainnet()) return _envBond(i);
         if (i == 0) return Bond("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200, "CAT");
         if (i == 1) return Bond("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200, "C");
         return Bond("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP21", 1_977_609_600, "KO");
+    }
+
+    /// 56: bond i (0..2) from BOND_<i>_NAME, _SYMBOL (the token symbol; the CUSIP on testnet),
+    /// _CUSIP, _ISIN, _MATURITY (unix s), _COUPON (as written in the name, e.g. "3.7%") and _TAG
+    /// (gateway env suffix). Every field is required; the CUSIP must be the ISIN's body and the
+    /// name must carry the coupon.
+    function _envBond(uint256 i) internal view returns (Bond memory b) {
+        string memory k = string.concat("BOND_", vm.toString(i), "_");
+        string memory cusip = vm.envString(string.concat(k, "CUSIP"));
+        string memory coupon = vm.envString(string.concat(k, "COUPON"));
+        b = Bond(
+            vm.envString(string.concat(k, "NAME")),
+            vm.envString(string.concat(k, "SYMBOL")),
+            vm.envString(string.concat(k, "ISIN")),
+            vm.envUint(string.concat(k, "MATURITY")),
+            vm.envString(string.concat(k, "TAG"))
+        );
+        DeployGuards.requireValidIsin(b.isin);
+        bytes memory isin = bytes(b.isin);
+        bytes memory body = new bytes(9);
+        for (uint256 j; j < 9; ++j) {
+            body[j] = isin[j + 2];
+        }
+        require(keccak256(body) == keccak256(bytes(cusip)), string.concat("BscKmsStack: ", k, "CUSIP is not the ISIN's body"));
+        require(
+            bytes(coupon).length != 0 && vm.contains(b.name, coupon),
+            string.concat("BscKmsStack: ", k, "NAME does not carry ", k, "COUPON")
+        );
+        require(
+            bytes(b.cusip).length != 0 && bytes(b.tag).length != 0 && b.maturity > block.timestamp,
+            string.concat("BscKmsStack: ", k, "SYMBOL/TAG empty or MATURITY not in the future")
+        );
+    }
+
+    // ══ Per-chain config (97: the constants; 56: env, fail closed) ═══════════
+
+    function _isMainnet() internal view returns (bool) {
+        return block.chainid == BSC_MAINNET;
+    }
+
+    /// 56: CASH_TOKEN, BSC USDT or USDC, read back at 18 decimals.
+    function _cash() internal view returns (address c) {
+        if (!_isMainnet()) return USDT;
+        c = vm.envAddress("CASH_TOKEN");
+        require(c == USDT_BSC || c == USDC_BSC, "BscKmsStack: CASH_TOKEN must be BSC USDT or USDC");
+        require(IERC20Metadata(c).decimals() == CASH_DECIMALS, "BscKmsStack: CASH_TOKEN is not 18 decimals");
+    }
+
+    /// 56: TIMELOCK_DELAY_SECONDS, default and floor DeployGuards.MIN_PROD_TIMELOCK_DELAY (48 h),
+    /// cap MAX_TIMELOCK_DELAY (7 d).
+    function _timelockDelay() internal view returns (uint256 d) {
+        if (!_isMainnet()) return TIMELOCK_DELAY;
+        d = vm.envOr("TIMELOCK_DELAY_SECONDS", DeployGuards.MIN_PROD_TIMELOCK_DELAY);
+        require(d >= DeployGuards.MIN_PROD_TIMELOCK_DELAY, "BscKmsStack: TIMELOCK_DELAY_SECONDS below 48 h (172800)");
+        require(
+            d <= MAX_TIMELOCK_DELAY,
+            "BscKmsStack: TIMELOCK_DELAY_SECONDS above 7 days (604800) - a typo? Phase 2 would wait that long"
+        );
+    }
+
+    /// The mirror's forwarding oracle: none on 97; 56: SANCTIONS_FORWARDING_ORACLE (Chainalysis).
+    function _forwardingOracle() internal view returns (address o) {
+        if (!_isMainnet()) return address(0);
+        o = vm.envAddress("SANCTIONS_FORWARDING_ORACLE");
+        require(o.code.length != 0, "BscKmsStack: SANCTIONS_FORWARDING_ORACLE has no code");
+    }
+
+    /// SANCTIONS_PROBE_FLAGGED. 56: a real SDN address the forwarding oracle already flags, so
+    /// runA2 plans no tx (and no SDN address reaches Fordefi calldata).
+    function _probe() internal view returns (address p) {
+        p = vm.envAddress("SANCTIONS_PROBE_FLAGGED");
+        if (!_isMainnet()) return p;
+        require(
+            ISanctionsList(_forwardingOracle()).isSanctioned(p),
+            "BscKmsStack: SANCTIONS_FORWARDING_ORACLE does not flag SANCTIONS_PROBE_FLAGGED"
+        );
+    }
+
+    /// First NAV of series i (8 dp). 97: NAV_ANSWER_8DP for all; 56: NAV_ANSWER_8DP_<TAG>, no default.
+    function _nav(uint256 i) internal view returns (int256 nav) {
+        if (!_isMainnet()) return int256(vm.envUint("NAV_ANSWER_8DP"));
+        nav = int256(vm.envUint(string.concat("NAV_ANSWER_8DP_", _bond(i).tag)));
+        require(nav > 0, "BscKmsStack: NAV_ANSWER_8DP_<TAG> must be positive");
     }
 
     /// Every role from the KMS env file, pairwise distinct (stricter than the guards, which

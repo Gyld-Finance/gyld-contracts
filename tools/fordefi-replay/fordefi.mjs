@@ -14,6 +14,13 @@ import { FordefiWeb3Provider } from "@fordefi/web3-provider";
 import { JsonRpcProvider, toQuantity } from "ethers";
 
 export const CHAIN_ID = Number(process.env.CHAIN_ID ?? 97);
+// The chains this tool may send on (EXPLORER_TX_URL in env overrides the explorer).
+const CHAINS = {
+  97: { explorer: "https://testnet.bscscan.com/tx/" },
+  56: { explorer: "https://bscscan.com/tx/" },
+};
+if (!CHAINS[CHAIN_ID]) throw new Error(`CHAIN_ID ${CHAIN_ID} is not supported (${Object.keys(CHAINS).join(", ")})`);
+export const EXPLORER = process.env.EXPLORER_TX_URL ?? CHAINS[CHAIN_ID].explorer;
 // Rehearsal only (script-bsc/simulate-fordefi-stack.sh): vaults are anvil-impersonated
 // accounts and txs go through the node's eth_sendTransaction. Refused on anything but a
 // local anvil node, so it cannot send on a real chain.

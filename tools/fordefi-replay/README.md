@@ -11,7 +11,8 @@ step), and is polled with `GET /api/v1/transactions/{id}` — the Fordefi Web3 p
 cannot pin a nonce, so it is used only by `sign-message.mjs` (`personal_sign`).
 
 **Runbook (phase commands, signers, governance proof): [`docs/deploy/bsc-testnet.md`](../../docs/deploy/bsc-testnet.md#fordefi-vaults-gld-978).**
-Rehearsal on an Anvil fork, through this tool: `script-bsc/simulate-fordefi-stack.sh`.
+BSC mainnet (56, `CHAIN_ID=56`): [`docs/deploy/bsc-mainnet.md`](../../docs/deploy/bsc-mainnet.md).
+Rehearsal on an Anvil fork, through this tool: `script-bsc/simulate-fordefi-stack.sh` (`CHAIN=56` for mainnet).
 
 | File | Purpose |
 |---|---|
@@ -19,6 +20,7 @@ Rehearsal on an Anvil fork, through this tool: `script-bsc/simulate-fordefi-stac
 | `sign-message.mjs` | `personal_sign` via the Contract Admin vault, for `FORDEFI_GOVERNANCE_SIG` |
 | `fordefi.mjs` | Vault/credential loading shared by both |
 | `roles.example.env` | Every env var name; copy to `roles.env` (git-ignored) |
+| `roles.bsc-mainnet.example.env` | The same for BSC mainnet (`CHAIN_ID=56`) |
 
 ## Prerequisites
 

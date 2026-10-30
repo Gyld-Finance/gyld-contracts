@@ -181,7 +181,7 @@ broadcast that stopped midway finishes with `--resume`, a replay by re-running `
 The replay refuses any `from` that is not a mapped vault, so a deployer tx can never reach
 Fordefi; forge `--aws` holds only the deployer key, so a vault tx can never reach KMS. All-Fordefi
 instead (no KMS): set `STACK_DEPLOYER` and `FORDEFI_DEPLOYER_ADDRESS` to a Fordefi Deployer vault
-and run the KMS sub-phases as `fordefi` too.
+and run the KMS sub-phases as `fordefi` too. BSC mainnet (56): [`bsc-mainnet.md`](bsc-mainnet.md).
 
 Fordefi: Contract Admin stays 3-of-4 (steps 0 and 4: line approvers up first); NAV Feeder
 auto-approves; Blocklist Updater, Whitelister and Subscriber approve per their vault policy.

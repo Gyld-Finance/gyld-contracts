@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.24;
 
+import {VmSafe} from "forge-std/Vm.sol";
 import {BscKmsStack} from "./BscKmsStack.s.sol";
 
 /// @title BscFordefiStack
@@ -30,12 +31,21 @@ import {BscKmsStack} from "./BscKmsStack.s.sol";
 /// FORDEFI_GOVERNANCE_SIG (the Contract Admin vault's personal_sign of
 /// governanceProofMessage()), plus BscKmsStack's inputs. All-Fordefi instead: point
 /// STACK_DEPLOYER at a Fordefi Deployer vault and dry-run + replay the KMS sub-phases too.
+///
+/// BSC mainnet (56): this hybrid only. STACK_DEPLOYER (the PROD KMS key, never the PROD Fordefi
+/// gas vault) is the only sender that may --broadcast; role sub-phases go through the replay.
+/// Env: script-bsc/fordefi-roles.bsc-mainnet.example.env; runbook docs/deploy/bsc-mainnet.md.
 contract BscFordefiStack is BscKmsStack {
     /// Its own tag: the proof also binds this layout (swap PAUSER on Swap Pause, not Freeze).
     bytes32 internal constant FORDEFI_PROOF_TAG = keccak256("GLD-978.fordefi-governance-proof");
+    /// The PROD Fordefi "Deployer" vault: only a gas wallet that forwards BNB to the KMS
+    /// deployer on 56; it must never be STACK_DEPLOYER.
+    address internal constant FORDEFI_PROD_GAS_VAULT = 0xb242Bf9fa856B70365FB43EE780d110f6B9DDAb3;
 
     function _roles() internal view override returns (Roles memory r) {
-        require(block.chainid == BSC_TESTNET, "BscFordefiStack: BSC testnet (97) only");
+        require(
+            block.chainid == BSC_TESTNET || block.chainid == BSC_MAINNET, "BscFordefiStack: BSC testnet (97) or mainnet (56) only"
+        );
         address whitelister = vm.envAddress("FORDEFI_WHITELISTER");
         address swapPause = vm.envAddress("FORDEFI_SWAP_PAUSE");
         r = Roles({
@@ -76,6 +86,30 @@ contract BscFordefiStack is BscKmsStack {
                 require(a[i] != a[j], "BscFordefiStack: two roles share an address");
             }
         }
+        if (_isMainnet()) {
+            require(
+                r.deployer != FORDEFI_PROD_GAS_VAULT,
+                "BscFordefiStack: STACK_DEPLOYER is the PROD Fordefi Deployer (gas) vault - set it to the KMS deployer key"
+            );
+            // Only the KMS deployer broadcasts on 56 (forge --aws holds no other key).
+            require(
+                !_broadcasting() || tx.origin == r.deployer,
+                "BscFordefiStack: on BSC mainnet only STACK_DEPLOYER (the KMS key) may --broadcast"
+            );
+        }
+    }
+
+    /// A role sub-phase: on 56 a dry run only, its plan sent by tools/fordefi-replay.
+    function _roleStep() internal view returns (Roles memory r) {
+        r = _roles();
+        require(
+            !_isMainnet() || !_broadcasting(),
+            "BscFordefiStack: BSC mainnet role sub-phase - dry-run only (no --broadcast), send with tools/fordefi-replay"
+        );
+    }
+
+    function _broadcasting() internal view returns (bool) {
+        return vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) || vm.isContext(VmSafe.ForgeContext.ScriptResume);
     }
 
     function runA1() external {
@@ -84,7 +118,7 @@ contract BscFordefiStack is BscKmsStack {
     }
 
     function runA2() external {
-        _seedMirror(_roles());
+        _seedMirror(_roleStep());
     }
 
     function runA3() external {
@@ -98,7 +132,7 @@ contract BscFordefiStack is BscKmsStack {
     }
 
     function runC2() external {
-        _pushNav(_roles());
+        _pushNav(_roleStep());
     }
 
     function runC3() external {
@@ -107,7 +141,7 @@ contract BscFordefiStack is BscKmsStack {
     }
 
     function runC4() external {
-        _whitelistSwap(_roles());
+        _whitelistSwap(_roleStep());
     }
 
     /// A deployer sub-phase: --sender is the deployer (the nested scripts read tx.origin), and
