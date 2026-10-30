@@ -22,7 +22,8 @@ import {BscKmsStack} from "./BscKmsStack.s.sol";
 ///   runC1()  KMS      after 300 s: executes the Phase 2 batch (executors are open)
 ///   runC2()  Fordefi  NAV Feeder prices the three feeds
 ///   runC3()  KMS      DeployAtomicSettlement
-///   runC4()  Fordefi  Whitelister whitelists the swap, Subscriber mints its inventory
+///   runC4()  Fordefi  Whitelister whitelists the swap (no inventory: the platform's
+///                     fund-inventory route mints it, GLD-1054)
 ///   verify() any sender
 ///
 /// Env: script-bsc/fordefi-roles.bsc-testnet.env (STACK_DEPLOYER, FORDEFI_*),
@@ -106,7 +107,7 @@ contract BscFordefiStack is BscKmsStack {
     }
 
     function runC4() external {
-        _fillInventory(_roles());
+        _whitelistSwap(_roles());
     }
 
     /// A deployer sub-phase: --sender is the deployer (the nested scripts read tx.origin), and

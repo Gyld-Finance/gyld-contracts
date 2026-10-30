@@ -83,10 +83,10 @@ AWS_KMS_KEY_IDS=$KMS_GOVERNANCE_KEY_ID $B --broadcast   # send
 
 # Wait >= 300 s (run C fails fast with the remaining seconds if run early).
 # Run C — governance executes, NAV owner pushes NAV, deployer DeployAtomicSettlement (USDT,
-# no takers, admin -> timelock), whitelist admin whitelists the swap, subscriber mints
-# 1,000 tokens of inventory per series into it.
+# no takers, admin -> timelock), whitelist admin whitelists the swap. No inventory is
+# minted here: fund it through the platform's fund-inventory route (GLD-1054).
 C="forge script $F --sig runC() --sender $KMS_DEPLOYER $OPTS"
-KEYS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID,$KMS_SUBSCRIBER_KEY_ID
+KEYS=$KMS_DEPLOYER_KEY_ID,$KMS_GOVERNANCE_KEY_ID,$KMS_NAV_FEED_OWNER_KEY_ID,$KMS_WHITELIST_ADMIN_KEY_ID
 AWS_KMS_KEY_IDS=$KEYS $C               # dry run
 AWS_KMS_KEY_IDS=$KEYS $C --broadcast   # send
 export EVM_ATOMIC_SWAP_ADDRESS=<@@ line>
@@ -97,15 +97,14 @@ forge script $F --sig 'verify()' --rpc-url $RPC
 
 Interrupted mid-broadcast? Re-running run C finishes it — each step is skipped once on
 chain, and a finished C sends nothing — unless the swap deploy stopped midway: then run C
-stops with the missing step and whitelists/mints nothing; finish it with `--resume`. For
+stops with the missing step and whitelists nothing; finish it with `--resume`. For
 A or B, finish with the same command plus `--resume`.
 
 `verify` asserts: timelock `minDelay == 300`, governance sole proposer/canceller, executors
 open, deployer holds no role on the timelock, IssuanceManager, mirror, swap or tokens;
 factory owned by the timelock with nothing pending; `sanctionsList` is the mirror, which
 flags the probe and not the deployer; swap cash = USDT at 18 dp; every role on its KMS key;
-three series registered with NAV in range, feed owner = KMS NAV owner, 1,000 tokens of
-inventory each; swap whitelisted.
+three series registered with NAV in range, feed owner = KMS NAV owner; swap whitelisted.
 
 After the real deploy, write the `@@` addresses to `docs/deploy/bsc-testnet-addresses.env`.
 
@@ -134,7 +133,11 @@ Each sub-phase has one signer kind; run them in order, each confirmed before the
 | 5 | `runC1()` `executeBatch` | KMS deployer | 1 | – |
 | 6 | `runC2()` NAV × 3 | NAV Feeder | 3 | auto-approve |
 | 7 | `runC3()` DeployAtomicSettlement | KMS deployer | 11 | – |
-| 8 | `runC4()` whitelist swap + mint × 3 | Whitelister 1, Subscriber 3 | 4 | 4 |
+| 8 | `runC4()` whitelist swap | Whitelister | 1 | 1 |
+
+No step mints inventory (GLD-1054): a mint outside the platform never reaches its ledger and
+supply reconciliation halts every series. Fund the swap afterwards through the platform's
+`POST /admin/swap/fund-inventory?chain=<chain>` (the operator console's Atomic Swap page).
 
 ```bash
 set -a; . script-bsc/kms-roles.bsc-testnet.env; . script-bsc/fordefi-roles.bsc-testnet.env
