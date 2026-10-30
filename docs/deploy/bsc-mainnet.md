@@ -52,7 +52,12 @@ symbol, ISIN and maturity, and the feed and forwarder answer == `NAV_ANSWER_8DP_
   Record its alias/ARN (`AWS_KMS_KEY_IDS`) and its address (`STACK_DEPLOYER`, from
   `cast wallet address --aws`, confirmed by a second person). Its nonce must be 0.
 - **AWS credentials** on the deploy host with `kms:Sign` and `kms:GetPublicKey` on that key
-  (nothing else needed); `AWS_REGION` set.
+  (nothing else needed); `AWS_REGION` set. The key policy (kaleidoscope
+  `terraform/foundation/kms.tf`, GLD-1052) lets only the named operator sign, and only with
+  MFA session credentials: `aws sts get-session-token --serial-number <MFA device ARN>
+  --token-code <code> --duration-seconds 129600`, then export its `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. A session lasts at most 36 h, so the 48 h
+  timelock wait needs a fresh one before runC1.
 - **BNB**: fund the KMS deployer **~0.03 BNB** by a transfer from the PROD Fordefi **Deployer**
   vault (gas wallet); Contract Admin, NAV Feeder, Whitelister **~0.005 BNB** each (Blocklist
   Updater only if A2 plans a tx, which it must not).
@@ -118,7 +123,7 @@ kms 'runA1()'; kms 'runA1()' --broadcast          # 1
 fordefi 'runA2()' $FORDEFI_BLOCKLIST_UPDATER     # 2: must print "nothing to send"
 kms 'runA3()'; kms 'runA3()' --broadcast          # 3; export EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (@@)
 fordefi 'runB()'  $FORDEFI_CONTRACT_ADMIN        # 4, then --execute; note the block time
-# ... wait >= 48 h. runC1 refuses with the seconds left if early.
+# ... wait >= 48 h. runC1 refuses with the seconds left if early. New MFA session first (Prerequisites).
 kms 'runC1()'; kms 'runC1()' --broadcast          # 5
 fordefi 'runC2()' $FORDEFI_NAV_FEEDER            # 6, then --execute
 kms 'runC3()'; kms 'runC3()' --broadcast          # 7
@@ -145,5 +150,8 @@ During the 48 h window the Contract Admin can `cancel` the batch if anything is 
    Cross-check against the created addresses in `broadcast/BscFordefiStack.s.sol/56/run{A1,A3,C1,C3}-latest.json`.
 5. Sweep the KMS deployer's leftover BNB back to the PROD Fordefi Deployer vault
    (`cast send --aws --legacy 0xb242Bf9fa856B70365FB43EE780d110f6B9DDAb3 --value <balance - fee>`),
-   then disable the KMS key (schedule its deletion once the addresses file is merged).
+   then, once the addresses file is merged, retire the KMS key by removing its `prod_deployer`
+   entry from kaleidoscope `terraform/foundation/kms.tf` and applying foundation (Terraform
+   schedules the deletion). Never disable or delete it from the CLI: the next foundation apply
+   undoes that.
 6. Disable / delete the temporary Fordefi API users; revert any temporary vault policy.
