@@ -99,6 +99,27 @@ script is not in the tree — the source is preserved by the tag
 
 ---
 
+## BSC mainnet (chainId 56)
+
+Deployed 2026-11-02 (GLD-1048, `script-bsc/BscKmsStack.s.sol` + `BscFordefiStack.s.sol`,
+`DEPLOY_SALT_TAG=bsc-mainnet-v1`) from branch `feat/GLD-978-bsc-fordefi-deploy` @ `4aa0ea3`,
+whose `contracts/` is identical to audited `origin/main` @ `82c2b79` (runtime bytecode and metadata hash match for all 17 contracts). A single-use AWS KMS key
+(`0xa731…4896`) deployed; it holds no role. Every role is on a Fordefi PROD vault or the
+timelock. `verify()`: ALL 31 CHECKS PASSED. Full list: `docs/deploy/bsc-mainnet-addresses.env`.
+
+| Contract | Address | Privileged roles | Explorer verified | Status |
+|---|---|---|---|---|
+| TimelockController | `0x975708016715385C692bCDE122b5E61E6d5f7892` | minDelay 48 h; proposer + canceller = Fordefi Contract Admin; open executor; self-administered | Yes (BscScan) | **live (prod)** |
+| TokenFactory | `0x30d8c1773F1F3e7b5a23BeA435f69D37368f3901` | owner = timelock | Yes (BscScan) | **live (prod)** |
+| IssuanceManager (ERC1967 proxy) | `0x5D82C902ab805f8c408a63683c8A009B82932D08` | admin = timelock; subscriber / redeemer / whitelist / pauser = Fordefi vaults | Yes (BscScan) | **live (prod)** |
+| GyldAtomicSwap (ERC1967 proxy) | `0x26b20d4D85E811e848A7A0C3Ca4c9aAB79080a29` | admin = timelock; pauser / quote signer / treasurer / allowlist admin / withdrawal = Fordefi vaults; cash = BSC USDT (18 dp) | Yes (BscScan) | **live (prod)** |
+| SanctionsOracleMirror | `0xAf7b855ADD2A4aFf9D8db476402962B7860fd900` | admin = Fordefi Contract Admin; updater = Fordefi Blocklist Updater; forwards to Chainalysis `0x40C5…c8fb` | Yes (BscScan) | **live (prod)** |
+| gKO-2.25-05JAN32 (proxy) / NAV feed / forwarder | `0xFd06dc5A6d2ebcEfCA37B748779516B9Ac755F0C` / `0x15Cd01CDd5C93CC8Cc0793EF00bCc2bFa7608Ff7` / `0x5D40201d9e254dFB47cC7eDA68b4B2ba74D6677B` | token admin = timelock; feed owner = NAV Feeder, guardian = Freeze | Yes (BscScan) | **live (prod)**, first NAV 0.88435250 |
+| gAAPL-4.3-10MAY33 (proxy) / NAV feed / forwarder | `0x7a2a1d9B8cf4a32b40C757821606e8ef5ec08f59` / `0x4d5591d7805885B06018726CF646C59CE9F87798` / `0x41c3f82ce9A7677ddf33Ed915828cA4EA79e25e2` | same | Yes (BscScan) | **live (prod)**, first NAV 0.97476389 |
+| gCAT-3.7-10JAN28 (proxy) / NAV feed / forwarder | `0x825d072e92A753E5B6fC7814B075b4e0F56d7B81` / `0x02B41Ac16F486ADD568Dbc59109b4fd573c83B05` / `0x33735b2a95F275786B807888c70b328B373CFb60` | same | Yes (BscScan) | **live (prod)**, first NAV 1.00046611 |
+
+---
+
 ## Source-commit preservation — resolved 2026-08-05
 
 - **`6349ec5`** (Sepolia gen-1): on `main` and `origin/main`. Safe.
