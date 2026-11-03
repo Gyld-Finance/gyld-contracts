@@ -2,12 +2,14 @@
 # Rehearse the GLD-807 fresh KMS deploy on an Anvil fork of BSC testnet (97): signers are
 # impersonated, nothing reaches BSC. Step 0 (KMS address check) is real: AWS creds, eu-west-2.
 #   NAV_ANSWER_8DP=100000000 SANCTIONS_PROBE_FLAGGED=0x... script-bsc/simulate-kms-stack.sh
+# NAV_ANSWER_8DP is the rehearsal's NAV_ANSWER_8DP_<TAG> for any bond without one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${NAV_ANSWER_8DP:?set NAV_ANSWER_8DP (8dp, inside the feed range 1e7..2e8)}"
 : "${SANCTIONS_PROBE_FLAGGED:?set SANCTIONS_PROBE_FLAGGED (an address on the current SDN list)}"
 set -a; . script-bsc/kms-roles.bsc-testnet.env; set +a
-export DEPLOY_SALT_TAG="${DEPLOY_SALT_TAG:-kms1}" NAV_ANSWER_8DP SANCTIONS_PROBE_FLAGGED
+export DEPLOY_SALT_TAG="${DEPLOY_SALT_TAG:-kms1}" SANCTIONS_PROBE_FLAGGED
+for t in CAT C KO; do n="NAV_ANSWER_8DP_$t"; export "$n=${!n:-$NAV_ANSWER_8DP}"; done
 PORT="${PORT:-8548}" RPC="http://127.0.0.1:$PORT"
 SOL=script-bsc/BscKmsStack.s.sol:BscKmsStack
 WORK="$(mktemp -d)"

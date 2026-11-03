@@ -34,12 +34,12 @@ import {ISanctionsList} from "../contracts/interfaces/ISanctionsList.sol";
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
 /// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), KMS_GOVERNANCE_SIG (from
-/// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
+/// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP_<TAG>, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC). The same stack on Fordefi vaults: BscFordefiStack.
 ///
 /// 97 uses the constants below. 56 (BscFordefiStack only) reads them from env, fail closed:
 /// CASH_TOKEN, TIMELOCK_DELAY_SECONDS (48 h..7 d), SANCTIONS_FORWARDING_ORACLE, a
-/// SANCTIONS_PROBE_FLAGGED it flags, NAV_ANSWER_8DP_<TAG>, BOND_<i>_* (see _envBond).
+/// SANCTIONS_PROBE_FLAGGED it flags, BOND_<i>_* (see _envBond).
 contract BscKmsStack is Script {
     uint256 internal constant BSC_TESTNET = 97;
     uint256 internal constant BSC_MAINNET = 56;
@@ -635,9 +635,10 @@ contract BscKmsStack is Script {
         );
     }
 
-    /// First NAV of series i (8 dp). 97: NAV_ANSWER_8DP for all; 56: NAV_ANSWER_8DP_<TAG>, no default.
+    /// First NAV of series i (8 dp): NAV_ANSWER_8DP_<TAG>, the bond's own NAV, no default, on
+    /// every chain. Seeded more than 10% from the bond's NAV, the feed refuses every ordinary
+    /// update after it (deviation breaker) until a two-key emergencyUpdateAnswer.
     function _nav(uint256 i) internal view returns (int256 nav) {
-        if (!_isMainnet()) return int256(vm.envUint("NAV_ANSWER_8DP"));
         nav = int256(vm.envUint(string.concat("NAV_ANSWER_8DP_", _bond(i).tag)));
         require(nav > 0, "BscKmsStack: NAV_ANSWER_8DP_<TAG> must be positive");
     }
