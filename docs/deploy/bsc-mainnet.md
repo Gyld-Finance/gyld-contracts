@@ -24,7 +24,7 @@ when unset:
 | Timelock delay | 300 s | `TIMELOCK_DELAY_SECONDS`, default and floor 172800 (48 h), cap 604800 (7 d) |
 | Sanctions | local-list mirror, synthetic probe `0x…0BAD` seeded by run A2 | mirror forwarding to `SANCTIONS_FORWARDING_ORACLE`; `SANCTIONS_PROBE_FLAGGED` must be real and flagged by that oracle, so A2 plans 0 tx |
 | Bonds | CAT / C / KO | `BOND_<0..2>_{NAME,SYMBOL,CUSIP,ISIN,MATURITY,COUPON,TAG}`; ISIN checksum, CUSIP = ISIN body, NAME contains COUPON, maturity in the future, ISINs/tags distinct |
-| First NAV | `NAV_ANSWER_8DP` for all three | `NAV_ANSWER_8DP_<TAG>` per bond, no default |
+| First NAV | `NAV_ANSWER_8DP_<TAG>` per bond, no default | the same |
 | Deployer | `STACK_DEPLOYER` (testnet KMS key) | `STACK_DEPLOYER` (PROD KMS key; never the Fordefi gas vault) |
 
 `verify()` checks each against the same per-chain values, including per bond the token name,
