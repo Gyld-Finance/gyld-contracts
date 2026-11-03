@@ -1,0 +1,7 @@
+node_modules/
+*.pem
+.env
+*.env
+!*.example.env
+*.progress.json
+*.progress.json.tmp
