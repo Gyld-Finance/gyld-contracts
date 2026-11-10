@@ -47,7 +47,10 @@ cd lib/gyld-contracts
 set -a; . script-bsc/kms-roles.bsc-testnet.env; set +a
 export AWS_REGION=eu-west-2 RPC=https://bsc-testnet-rpc.publicnode.com
 export DEPLOY_SALT_TAG=kms1          # fresh CREATE2 addresses; v1 used the same bytecode
-export NAV_ANSWER_8DP=100000000       # $1.00 — must sit inside the feeds' $0.10–$2.00 range
+# First NAV per bond (8 dp): the bond's current NAV, read from the gateway (admin NAV page,
+# "Computed NAV / token") on the day. Never one value for all: a feed seeded >10% from its
+# bond's NAV refuses every later update until a two-key emergencyUpdateAnswer.
+export NAV_ANSWER_8DP_CAT=<8dp> NAV_ANSWER_8DP_C=<8dp> NAV_ANSWER_8DP_KO=<8dp>
 export SANCTIONS_PROBE_FLAGGED=0x098B716B8Aaf21512996dC57EB0615e2383E2f96  # re-check: on the CURRENT SDN list
 F="script-bsc/BscKmsStack.s.sol:BscKmsStack"
 OPTS="--rpc-url $RPC --aws --slow --legacy --with-gas-price 0.1gwei"   # no --broadcast: dry run

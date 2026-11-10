@@ -31,7 +31,7 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 ///   verify() any sender              reads every role holder back; reverts on drift
 ///
 /// Env: script-bsc/kms-roles.bsc-testnet.env (KMS_*), KMS_GOVERNANCE_SIG (from
-/// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
+/// check-kms-addresses.sh), SANCTIONS_PROBE_FLAGGED, NAV_ANSWER_8DP_<TAG>, DEPLOY_SALT_TAG; then EVM_FACTORY_ADDRESS + EVM_ISSUANCE_MANAGER (printed by runA) and
 /// EVM_ATOMIC_SWAP_ADDRESS (printed by runC).
 contract BscKmsStack is Script {
     uint256 internal constant BSC_TESTNET = 97;
@@ -143,7 +143,6 @@ contract BscKmsStack is Script {
     function runC() external {
         Roles memory r = _roles();
         _requireSender(r.deployer);
-        int256 nav = int256(vm.envUint("NAV_ANSWER_8DP"));
         TokenFactory f = _factory();
         IssuanceManager im = IssuanceManager(vm.envAddress("EVM_ISSUANCE_MANAGER"));
         address pending = f.pendingOwner(); // zero once Phase 2 has executed
@@ -166,7 +165,7 @@ contract BscKmsStack is Script {
         for (uint256 i; i < N_SERIES; ++i) {
             tokens[i] = f.tokenByIsin(_bond(i).isin);
             KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(f.navFeedOf(tokens[i]));
-            if (!_priced(feed)) feed.updateAnswer(nav);
+            if (!_priced(feed)) feed.updateAnswer(_nav(i));
             series = string.concat(series, i == 0 ? "" : ",", vm.toString(tokens[i]));
         }
         vm.stopBroadcast();
@@ -446,6 +445,14 @@ contract BscKmsStack is Script {
         if (i == 0) return Bond("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200, "CAT");
         if (i == 1) return Bond("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200, "C");
         return Bond("Coca-Cola Co 2.25% 2032", "191216DP2", "US191216DP21", 1_977_609_600, "KO");
+    }
+
+    /// First NAV of series i (8 dp): NAV_ANSWER_8DP_<TAG>, the bond's own NAV, no default.
+    /// Seeded more than 10% from the bond's NAV, the feed refuses every ordinary update after
+    /// it (deviation breaker) until a two-key emergencyUpdateAnswer.
+    function _nav(uint256 i) internal view returns (int256 nav) {
+        nav = int256(vm.envUint(string.concat("NAV_ANSWER_8DP_", _bond(i).tag)));
+        require(nav > 0, "BscKmsStack: NAV_ANSWER_8DP_<TAG> must be positive");
     }
 
     /// Every role from the KMS env file, pairwise distinct (stricter than the guards, which
