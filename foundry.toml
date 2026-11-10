@@ -17,6 +17,9 @@ remappings = [
 # BSC testnet (97) — production guards with a 5-min timelock floor (GLD-807). `--rpc-url bsc_testnet`.
 # Public endpoint, no key needed; pass `--rpc-url <url>` directly to use another provider.
 bsc_testnet = "https://bsc-testnet-rpc.publicnode.com"
+# BSC MAINNET (56) — KMS deployer + Fordefi role vaults, 48 h timelock floor (docs/deploy/bsc-mainnet.md). `--rpc-url bsc`.
+# Set BSC_RPC_URL to your provider (public: https://bsc-dataseed.bnbchain.org). No key in this file.
+bsc = "${BSC_RPC_URL}"
 
 [etherscan]
 sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
@@ -28,6 +31,7 @@ sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-s
 # `forge verify-contract` works on a free key. Use the HYPHENATED table key: `--chain
 # bsc_testnet` is rejected by the CLI, `--chain bsc-testnet` is not.
 bsc-testnet = { key = "${ETHERSCAN_API_KEY}", chain = 97 }
+bsc = { key = "${ETHERSCAN_API_KEY}", chain = 56 }
 
 [fuzz]
 runs = 10000

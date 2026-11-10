@@ -32,6 +32,12 @@ crytic-export/
 docs/book/
 node_modules/
 
+# Fordefi replay: credentials and per-run request state stay local even if a tool's own .gitignore is lost.
+tools/**/*.env
+!tools/**/*.example.env
+*.progress.json
+*.progress.json.tmp
+
 # foundry.toml sets `src = "contracts"`, so a stray .sol or .json dropped in
 # the repo root is invisible to `forge build` while remaining fully stageable
 # by `git add -A`. That is how third-party source can end up committed into
