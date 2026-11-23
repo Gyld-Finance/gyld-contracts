@@ -166,10 +166,10 @@ contract BscKmsStack is Script {
         TokenFactory f = _factory();
         TimelockController tl = TimelockController(payable(f.pendingOwner()));
         require(address(tl) != address(0), "BscKmsStack: factory has no pending owner (run A missing or B done)");
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             DeployGuards.requireValidIsin(_bond(i).isin);
             DeployGuards.requireIsinVacant(address(f), _bond(i).isin);
-            for (uint256 j = i + 1; _isMainnet() && j < N_SERIES; ++j) { // 56: env bonds, a duplicate reverts only at execute
+            for (uint256 j = i + 1; _envConfig() && j < _nSeries(); ++j) { // env bonds: a duplicate reverts only at execute
                 require(
                     keccak256(bytes(_bond(i).isin)) != keccak256(bytes(_bond(j).isin))
                         && keccak256(bytes(_bond(i).tag)) != keccak256(bytes(_bond(j).tag)),
@@ -215,9 +215,9 @@ contract BscKmsStack is Script {
     /// First NAV push per series: registerSeries refuses an unpriced feed.
     function _pushNav(Roles memory r) internal {
         TokenFactory f = _factory();
-        address[N_SERIES] memory tokens = _tokens(f);
+        address[] memory tokens = _tokens(f);
         vm.startBroadcast(r.navOwner);
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             KaleidoscopeNAVFeed feed = KaleidoscopeNAVFeed(f.navFeedOf(tokens[i]));
             if (!_priced(feed)) feed.updateAnswer(_nav(i));
         }
@@ -227,13 +227,13 @@ contract BscKmsStack is Script {
     /// DeployAtomicSettlement (USDT, no takers, admin -> timelock) as --sender (the deployer).
     function _deploySwap(Roles memory r) internal {
         TokenFactory f = _factory();
-        address[N_SERIES] memory tokens = _tokens(f);
+        address[] memory tokens = _tokens(f);
         (address impl, address swap) = _predictSwap(r);
         if (swap.code.length != 0) return;
         // DeployAtomicSettlement's vacantSalt would revert on the impl forever: say why.
         _requireSwapStep(impl.code.length == 0, "proxy deploy (impl is on chain, the proxy is not)");
         string memory series;
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             series = string.concat(series, i == 0 ? "" : ",", vm.toString(tokens[i]));
         }
         _setEnv("USDC_ADDRESS", _cash());
@@ -261,7 +261,7 @@ contract BscKmsStack is Script {
     function _whitelistSwap(Roles memory r) internal {
         TokenFactory f = _factory();
         IssuanceManager im = IssuanceManager(vm.envAddress("EVM_ISSUANCE_MANAGER"));
-        address[N_SERIES] memory tokens = _tokens(f);
+        address[] memory tokens = _tokens(f);
         (, address swap) = _predictSwap(r);
         // Fail closed before the swap is whitelisted: a swap deploy that stopped midway may still
         // be administered by the deployer.
@@ -271,18 +271,20 @@ contract BscKmsStack is Script {
             vm.broadcast(r.whitelistAdmin); // the deployer holds no WHITELIST_ADMIN_ROLE
             im.addToWhitelist(swap);
         }
+        _afterWhitelistSwap(r, im);
 
         console.log("=== run C done ===");
         _kv("EVM_ATOMIC_SWAP_ADDRESS", swap);
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             _kv(string.concat("TOKEN_", _bond(i).tag), tokens[i]);
             _kv(string.concat("NAVFEED_", _bond(i).tag), f.navFeedOf(tokens[i]));
             _kv(string.concat("FORWARDER_", _bond(i).tag), f.forwarderOf(tokens[i]));
         }
     }
 
-    function _tokens(TokenFactory f) internal view returns (address[N_SERIES] memory tokens) {
-        for (uint256 i; i < N_SERIES; ++i) {
+    function _tokens(TokenFactory f) internal view returns (address[] memory tokens) {
+        tokens = new address[](_nSeries());
+        for (uint256 i; i < _nSeries(); ++i) {
             tokens[i] = f.tokenByIsin(_bond(i).isin);
         }
     }
@@ -353,13 +355,14 @@ contract BscKmsStack is Script {
             "deployer holds no swap role"
         );
         _check(
-            w.usdc() == _cash() && w.cashDecimals() == CASH_DECIMALS && !w.paused(),
-            "swap cash = configured cash token, 18dp, unpaused"
+            w.usdc() == _cash() && w.cashDecimals() == _cashDecimals() && !w.paused(),
+            string.concat("swap cash = configured cash token, ", vm.toString(_cashDecimals()), "dp, unpaused")
         );
 
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             _verifySeries(r, f, im, w, address(tl), i);
         }
+        _verifyExtra(im);
         console.log("=== ALL %d CHECKS PASSED ===", _checks);
     }
 
@@ -380,7 +383,7 @@ contract BscKmsStack is Script {
                 && !t.hasRole(t.DOCUMENT_ROLE(), dep),
             string.concat(p, "token admin timelock, minter IssuanceManager, pauser + document ops, deployer none")
         );
-        if (_isMainnet()) _check(
+        if (_envConfig()) _check(
             keccak256(bytes(t.name())) == keccak256(bytes(b.name)) && keccak256(bytes(t.symbol())) == keccak256(bytes(b.cusip))
                 && keccak256(bytes(t.isin())) == keccak256(bytes(b.isin)) && t.maturityTimestamp() == b.maturity,
             string.concat(p, "token \"", b.name, "\" / ", b.cusip, " / ", b.isin, " / maturity ", vm.toString(b.maturity))
@@ -391,7 +394,7 @@ contract BscKmsStack is Script {
             string.concat(p, "feed owner NAV owner, guardian ops, range governor + forwarder owner timelock")
         );
         (, int256 answer,, uint256 updatedAt,) = fw.latestRoundData();
-        if (_isMainnet()) {
+        if (_envConfig()) {
             (, int256 feedAnswer,,,) = feed.latestRoundData();
             _check(
                 answer == _nav(i) && feedAnswer == answer,
@@ -427,12 +430,12 @@ contract BscKmsStack is Script {
         returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
     {
         address im = vm.envAddress("EVM_ISSUANCE_MANAGER");
-        targets = new address[](N_SERIES + 1);
-        values = new uint256[](N_SERIES + 1);
-        payloads = new bytes[](N_SERIES + 1);
+        targets = new address[](_nSeries() + 1);
+        values = new uint256[](_nSeries() + 1);
+        payloads = new bytes[](_nSeries() + 1);
         targets[0] = address(f);
         payloads[0] = abi.encodeCall(f.acceptOwnership, ());
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             Bond memory b = _bond(i);
             targets[i + 1] = address(f);
             payloads[i + 1] =
@@ -466,11 +469,11 @@ contract BscKmsStack is Script {
 
     /// DeployAtomicSettlement's final topology, step by step, so a deploy that stopped midway
     /// names what is missing.
-    function _requireSwapComplete(Roles memory r, GyldAtomicSwap w, address[N_SERIES] memory tokens, address tl)
+    function _requireSwapComplete(Roles memory r, GyldAtomicSwap w, address[] memory tokens, address tl)
         internal
         view
     {
-        for (uint256 i; i < N_SERIES; ++i) {
+        for (uint256 i; i < _nSeries(); ++i) {
             _requireSwapStep(w.registeredSeries(tokens[i]), string.concat("registerSeries ", _bond(i).tag));
         }
         _requireSwapStep(w.withdrawalWallet() == r.withdrawalWallet, "setWithdrawalWallet");
@@ -552,7 +555,7 @@ contract BscKmsStack is Script {
         ];
     }
 
-    function _bond(uint256 i) internal view returns (Bond memory) {
+    function _bond(uint256 i) internal view virtual returns (Bond memory) {
         if (_isMainnet()) return _envBond(i);
         if (i == 0) return Bond("Caterpillar Inc 3.7% 2028", "14913UBF6", "US14913UBF66", 1_851_811_200, "CAT");
         if (i == 1) return Bond("Citigroup Inc 3.887% 2028", "172967LD1", "US172967LD18", 1_831_075_200, "C");
@@ -597,17 +600,39 @@ contract BscKmsStack is Script {
         return block.chainid == BSC_MAINNET;
     }
 
+    /// Bonds and first NAVs come from env and verify() checks them field by field: 56 here;
+    /// SepoliaFordefiStack overrides.
+    function _envConfig() internal view virtual returns (bool) {
+        return _isMainnet();
+    }
+
+    /// How many series the stack deploys: N_SERIES here; SepoliaFordefiStack overrides.
+    function _nSeries() internal view virtual returns (uint256) {
+        return N_SERIES;
+    }
+
+    /// The swap cash leg's decimals: 18 on BSC; SepoliaFordefiStack overrides.
+    function _cashDecimals() internal view virtual returns (uint8) {
+        return CASH_DECIMALS;
+    }
+
+    /// Run C4's extra role txs after the swap is whitelisted (none on BSC).
+    function _afterWhitelistSwap(Roles memory r, IssuanceManager im) internal virtual {}
+
+    /// verify()'s extra checks (none on BSC).
+    function _verifyExtra(IssuanceManager im) internal virtual {}
+
     /// 56: CASH_TOKEN, BSC USDT or USDC, read back at 18 decimals.
-    function _cash() internal view returns (address c) {
+    function _cash() internal view virtual returns (address c) {
         if (!_isMainnet()) return USDT;
         c = vm.envAddress("CASH_TOKEN");
         require(c == USDT_BSC || c == USDC_BSC, "BscKmsStack: CASH_TOKEN must be BSC USDT or USDC");
-        require(IERC20Metadata(c).decimals() == CASH_DECIMALS, "BscKmsStack: CASH_TOKEN is not 18 decimals");
+        require(IERC20Metadata(c).decimals() == _cashDecimals(), "BscKmsStack: CASH_TOKEN is not 18 decimals");
     }
 
     /// 56: TIMELOCK_DELAY_SECONDS, default and floor DeployGuards.MIN_PROD_TIMELOCK_DELAY (48 h),
     /// cap MAX_TIMELOCK_DELAY (7 d).
-    function _timelockDelay() internal view returns (uint256 d) {
+    function _timelockDelay() internal view virtual returns (uint256 d) {
         if (!_isMainnet()) return TIMELOCK_DELAY;
         d = vm.envOr("TIMELOCK_DELAY_SECONDS", DeployGuards.MIN_PROD_TIMELOCK_DELAY);
         require(d >= DeployGuards.MIN_PROD_TIMELOCK_DELAY, "BscKmsStack: TIMELOCK_DELAY_SECONDS below 48 h (172800)");

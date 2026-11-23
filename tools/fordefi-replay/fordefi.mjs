@@ -18,6 +18,7 @@ export const CHAIN_ID = Number(process.env.CHAIN_ID ?? 97);
 const CHAINS = {
   97: { explorer: "https://testnet.bscscan.com/tx/" },
   56: { explorer: "https://bscscan.com/tx/" },
+  11155111: { explorer: "https://sepolia.etherscan.io/tx/" }, // UAT (SepoliaFordefiStack)
 };
 if (!CHAINS[CHAIN_ID]) throw new Error(`CHAIN_ID ${CHAIN_ID} is not supported (${Object.keys(CHAINS).join(", ")})`);
 export const EXPLORER = process.env.EXPLORER_TX_URL ?? CHAINS[CHAIN_ID].explorer;

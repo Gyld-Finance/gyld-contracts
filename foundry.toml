@@ -20,9 +20,13 @@ bsc_testnet = "https://bsc-testnet-rpc.publicnode.com"
 # BSC MAINNET (56) — KMS deployer + Fordefi role vaults, 48 h timelock floor (docs/deploy/bsc-mainnet.md). `--rpc-url bsc`.
 # Set BSC_RPC_URL to your provider (public: https://bsc-dataseed.bnbchain.org). No key in this file.
 bsc = "${BSC_RPC_URL}"
+# Ethereum Sepolia (11155111) — UAT, KMS deployer + Fordefi role vaults (docs/deploy/sepolia-uat.md). `--rpc-url sepolia`.
+# Set SEPOLIA_RPC_URL to a keyed provider (public backup: https://ethereum-sepolia-rpc.publicnode.com).
+sepolia = "${SEPOLIA_RPC_URL}"
 
 [etherscan]
-sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111, url = "https://api-sepolia.etherscan.io/api" }
+# No `url`: the old api-sepolia.etherscan.io V1 endpoint was shut down; Foundry resolves V2 itself.
+sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111 }
 # BscScan is served by the Etherscan V2 unified API, so the SAME ETHERSCAN_API_KEY covers
 # it — there is no separate BSCSCAN_API_KEY. `url` is deliberately omitted: Foundry 1.5.1
 # already resolves bsc/bsc-testnet to https://api.etherscan.io/v2/api?chainid=<id>.

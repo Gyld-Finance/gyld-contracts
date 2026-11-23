@@ -43,9 +43,7 @@ contract BscFordefiStack is BscKmsStack {
     address internal constant FORDEFI_PROD_GAS_VAULT = 0xb242Bf9fa856B70365FB43EE780d110f6B9DDAb3;
 
     function _roles() internal view override returns (Roles memory r) {
-        require(
-            block.chainid == BSC_TESTNET || block.chainid == BSC_MAINNET, "BscFordefiStack: BSC testnet (97) or mainnet (56) only"
-        );
+        _requireChain();
         address whitelister = vm.envAddress("FORDEFI_WHITELISTER");
         address swapPause = vm.envAddress("FORDEFI_SWAP_PAUSE");
         r = Roles({
@@ -97,6 +95,13 @@ contract BscFordefiStack is BscKmsStack {
                 "BscFordefiStack: on BSC mainnet only STACK_DEPLOYER (the KMS key) may --broadcast"
             );
         }
+    }
+
+    /// The chains this layout deploys on; SepoliaFordefiStack overrides.
+    function _requireChain() internal view virtual {
+        require(
+            block.chainid == BSC_TESTNET || block.chainid == BSC_MAINNET, "BscFordefiStack: BSC testnet (97) or mainnet (56) only"
+        );
     }
 
     /// A role sub-phase: on 56 a dry run only, its plan sent by tools/fordefi-replay.

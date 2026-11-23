@@ -18,17 +18,26 @@
 # REHEARSAL ONLY.
 #   CHAIN=56 CASH_TOKEN=0x55d3... SANCTIONS_FORWARDING_ORACLE=0x... SANCTIONS_PROBE_FLAGGED=0x... \
 #     script-bsc/simulate-fordefi-stack.sh
+#
+# CHAIN=11155111: the UAT stack (SepoliaFordefiStack) on an Anvil fork of Ethereum Sepolia
+# (FORK_RPC_URL, else SEPOLIA_RPC_URL, else publicnode). Same split as 97, plus run A0 (the
+# MockUSDC cash leg). Delay TIMELOCK_DELAY_SECONDS (default 300 s); a delay below 300 s and an
+# empty DEPLOY_SALT_TAG must be refused. BOND_0_* / NAV_ANSWER_8DP_CAT default to the CAT starter
+# series FOR THE REHEARSAL ONLY.
+#   CHAIN=11155111 SANCTIONS_PROBE_FLAGGED=0x0000000000000000000000000000000000000BAD \
+#     script-bsc/simulate-fordefi-stack.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CHAIN="${CHAIN:-97}"
-[ "$CHAIN" = 97 ] || [ "$CHAIN" = 56 ] || { echo "CHAIN must be 97 or 56" >&2; exit 1; }
+[ "$CHAIN" = 97 ] || [ "$CHAIN" = 56 ] || [ "$CHAIN" = 11155111 ] || { echo "CHAIN must be 97, 56 or 11155111" >&2; exit 1; }
 : "${SANCTIONS_PROBE_FLAGGED:?set SANCTIONS_PROBE_FLAGGED (an address on the current SDN list)}"
 export DEPLOY_SALT_TAG="${DEPLOY_SALT_TAG:-fordefi-sim}" NAV_ANSWER_8DP="${NAV_ANSWER_8DP:-100000000}" SANCTIONS_PROBE_FLAGGED
 PORT="${PORT:-8549}" RPC="http://127.0.0.1:$PORT"
-SOL=script-bsc/BscFordefiStack.s.sol:BscFordefiStack
+NAME=BscFordefiStack; [ "$CHAIN" = 11155111 ] && NAME=SepoliaFordefiStack
+SOL="script-bsc/$NAME.s.sol:$NAME"
 WORK="$(mktemp -d)"
 export FOUNDRY_BROADCAST="$WORK/broadcast" # the fork is chain 97 too: keep its journals out of broadcast/
-J="$FOUNDRY_BROADCAST/BscFordefiStack.s.sol/$CHAIN/dry-run"
+J="$FOUNDRY_BROADCAST/$NAME.s.sol/$CHAIN/dry-run"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 ROLES="CONTRACT_ADMIN FREEZE SWAP_PAUSE NAV_FEEDER SUBSCRIBER BURN_ROLE WHITELISTER SWAP_TREASURER
@@ -41,6 +50,13 @@ done
 if [ "$CHAIN" = 97 ]; then
   export STACK_DEPLOYER="${STACK_DEPLOYER:-$(sed -n 's/^KMS_DEPLOYER=//p' script-bsc/kms-roles.bsc-testnet.env)}"
   DELAY=300 UNIT=tBNB FORK="${FORK_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}"
+elif [ "$CHAIN" = 11155111 ]; then
+  export STACK_DEPLOYER="${STACK_DEPLOYER:-$(sed -n 's/^STACK_DEPLOYER=\([^ ]*\).*/\1/p' script-bsc/fordefi-roles.sepolia-uat.env)}"
+  DELAY="${TIMELOCK_DELAY_SECONDS:-300}" UNIT=ETH FORK="${FORK_RPC_URL:-${SEPOLIA_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}}"
+  for f in "NAME=Caterpillar Inc 3.7% 2028" SYMBOL=14913UBF6 CUSIP=14913UBF6 ISIN=US14913UBF66 MATURITY=1851811200 COUPON=3.7% TAG=CAT; do
+    v="BOND_0_${f%%=*}"; [ -n "${!v:-}" ] || export "$v=${f#*=}"
+  done
+  n="NAV_ANSWER_8DP_$BOND_0_TAG"; [ -n "${!n:-}" ] || export "$n=$NAV_ANSWER_8DP"
 else
   : "${CASH_TOKEN:?set CASH_TOKEN}" "${SANCTIONS_FORWARDING_ORACLE:?set SANCTIONS_FORWARDING_ORACLE}"
   export STACK_DEPLOYER="${STACK_DEPLOYER:-$(cast wallet address --private-key "$(key KMS_DEPLOYER)")}" CASH_TOKEN SANCTIONS_FORWARDING_ORACLE
@@ -63,7 +79,7 @@ REPLAY=tools/fordefi-replay/replay.mjs
 [ -d tools/fordefi-replay/node_modules ] || npm --prefix tools/fordefi-replay install --no-audit --no-fund >/dev/null
 export CHAIN_ID="$CHAIN" RPC_URL="$RPC" REPLAY_TEST_RPC_SIGNER=1 # the replay's test signer: refuses anything but a local anvil
 
-forge build script-bsc/BscFordefiStack.s.sol >/dev/null # before forking: a pruning RPC drops old state
+forge build "${SOL%%:*}" >/dev/null # before forking: a pruning RPC drops old state
 anvil --fork-url "$FORK" --chain-id "$CHAIN" --port "$PORT" --silent &
 ANVIL=$!
 trap 'kill $ANVIL 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -71,7 +87,7 @@ until cast chain-id --rpc-url "$RPC" >/dev/null 2>&1; do kill -0 $ANVIL || die "
 for r in $ROLES; do a="FORDEFI_$r"; cast rpc anvil_setBalance "${!a}" 0xde0b6b3a7640000 --rpc-url "$RPC" >/dev/null; done
 cast rpc anvil_setBalance "$STACK_DEPLOYER" 0xde0b6b3a7640000 --rpc-url "$RPC" >/dev/null
 cast rpc anvil_impersonateAccount "$STACK_DEPLOYER" --rpc-url "$RPC" >/dev/null
-JK="$FOUNDRY_BROADCAST/BscFordefiStack.s.sol/$CHAIN"
+JK="$FOUNDRY_BROADCAST/$NAME.s.sol/$CHAIN"
 
 kms() { # <sig>: the KMS sub-phase, broadcast as the deployer (--aws for real); only its txs
   echo "==> KMS $1 (sender STACK_DEPLOYER)"
@@ -135,7 +151,27 @@ if [ "$CHAIN" = 56 ]; then
   grep -q "only STACK_DEPLOYER (the KMS key) may --broadcast" "$WORK/bcast.log" || { tail -20 "$WORK/bcast.log"; die "runB --broadcast: wrong failure"; }
   echo "==> 56 refuses --broadcast for every role sub-phase (A2, B, C2, C4): those go through the replay"
 fi
+if [ "$CHAIN" = 11155111 ]; then
+  DEPLOY_SALT_TAG= forge script $SOL --sig 'governanceProofMessage()' --rpc-url "$RPC" >"$WORK/tag.log" 2>&1 &&
+    die "Sepolia accepted an empty DEPLOY_SALT_TAG (DEV's stack uses none)"
+  grep -q "set DEPLOY_SALT_TAG" "$WORK/tag.log" || { tail -20 "$WORK/tag.log"; die "salt tag: wrong failure"; }
+  echo "==> Sepolia refuses an empty DEPLOY_SALT_TAG"
+  kms 'runA0()'
+  ANYONE=0x000000000000000000000000000000000000dEaD # an account with no role: the mint must be open
+  cast rpc anvil_setBalance "$ANYONE" 0xde0b6b3a7640000 --rpc-url "$RPC" >/dev/null
+  cast rpc anvil_impersonateAccount "$ANYONE" --rpc-url "$RPC" >/dev/null
+  cast send "$CASH_TOKEN" 'mint(address,uint256)' "$FORDEFI_SWAP_TREASURER" 1000000 --from "$ANYONE" --unlocked \
+    --rpc-url "$RPC" >/dev/null || die "MockUSDC mint is not open to anyone"
+  [ "$(cast call "$CASH_TOKEN" 'decimals()(uint8)' --rpc-url "$RPC")" = 6 ] || die "MockUSDC is not 6 decimals"
+  echo "==> MockUSDC $CASH_TOKEN: 6 dp, an unrelated account minted 1 USDC"
+fi
 kms 'runA1()'
+if [ "$CHAIN" = 11155111 ]; then # the 300 s floor (DeployGuards has none on a dev chain)
+  TIMELOCK_DELAY_SECONDS=0 forge script $SOL --sig 'runA3()' --sender "$STACK_DEPLOYER" --rpc-url "$RPC" \
+    >"$WORK/floor.log" 2>&1 && die "runA3 accepted TIMELOCK_DELAY_SECONDS=0"
+  grep -q "TIMELOCK_DELAY_SECONDS below 300 s" "$WORK/floor.log" || { tail -20 "$WORK/floor.log"; die "delay floor: wrong failure"; }
+  echo "==> Sepolia refuses a timelock delay below 300 s"
+fi
 if [ "$CHAIN" = 56 ]; then # the 7-day sanity cap on the timelock delay (checked when runA3 builds DeployDevNet's env)
   TIMELOCK_DELAY_SECONDS=604801 forge script $SOL --sig 'runA3()' --sender "$STACK_DEPLOYER" --rpc-url "$RPC" \
     >"$WORK/cap.log" 2>&1 && die "runA3 accepted TIMELOCK_DELAY_SECONDS above 7 days"
