@@ -12,6 +12,7 @@ cannot pin a nonce, so it is used only by `sign-message.mjs` (`personal_sign`).
 
 **Runbook (phase commands, signers, governance proof): [`docs/deploy/bsc-testnet.md`](../../docs/deploy/bsc-testnet.md#fordefi-vaults-gld-978).**
 BSC mainnet (56, `CHAIN_ID=56`): [`docs/deploy/bsc-mainnet.md`](../../docs/deploy/bsc-mainnet.md).
+UAT on Ethereum Sepolia (`CHAIN_ID=11155111`): [`docs/deploy/sepolia-uat.md`](../../docs/deploy/sepolia-uat.md).
 Rehearsal on an Anvil fork, through this tool: `script-bsc/simulate-fordefi-stack.sh` (`CHAIN=56` for mainnet).
 
 | File | Purpose |
@@ -21,6 +22,7 @@ Rehearsal on an Anvil fork, through this tool: `script-bsc/simulate-fordefi-stac
 | `fordefi.mjs` | Vault/credential loading shared by both |
 | `roles.example.env` | Every env var name; copy to `roles.env` (git-ignored) |
 | `roles.bsc-mainnet.example.env` | The same for BSC mainnet (`CHAIN_ID=56`) |
+| `roles.sepolia-uat.example.env` | The same for UAT on Sepolia (`CHAIN_ID=11155111`) |
 
 ## Prerequisites
 
